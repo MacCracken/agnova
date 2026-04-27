@@ -1,10 +1,1531 @@
-# agnova test suite
+# tests/agnova.tcyr — agnova test suite
+#
+# Ported from rust-old/src/tests.rs (104 #[test] functions).
+# Run: cyrius test tests/agnova.tcyr
+#
+# Tests are pure planner assertions: they build configs, call planners,
+# and check shape/content of the resulting PhaseOps + SystemOp values.
+# NEVER call execute_op or anything that touches disk from here.
 
+include "src/types.cyr"
+include "src/helpers.cyr"
+include "src/validation.cyr"
+include "src/partitioning.cyr"
+include "src/rootfs.cyr"
+include "src/orchestrator.cyr"
+# executor.cyr deliberately NOT included — tests are pure-planner.
+# cli.cyr also not included — tests exercise the library directly.
+
+# ============================================================
+# Test fixtures + predicate helpers
+# ============================================================
+
+# A valid InstallConfig matching the Rust test_config() helper:
+# Desktop mode, /dev/sda, default ESP+root, testuser, defaults everywhere.
+fn _test_config() {
+    var cfg = install_config_default();
+    var disk = agnova_default_disk_layout(str_from("/dev/sda"), 0);
+    InstallConfig_set_disk(cfg, disk);
+    UserConfig_set_username(InstallConfig_user(cfg), str_from("testuser"));
+    return cfg;
+}
+
+# True if any element of a vec<Str> equals the cstr.
+fn _vec_str_any_eq(v, cstr) {
+    var n = vec_len(v);
+    var i = 0;
+    while (i < n) {
+        if (str_eq_cstr(vec_get(v, i), cstr) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# True if any element of a vec<Str> contains the cstr substring.
+fn _vec_str_any_contains(v, cstr) {
+    var n = vec_len(v);
+    var i = 0;
+    while (i < n) {
+        if (str_contains_cstr(vec_get(v, i), cstr) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# True if any op in the vec is a Command with the given binary.
+fn _ops_has_command_binary(ops, binary_cstr) {
+    var n = vec_len(ops);
+    var i = 0;
+    while (i < n) {
+        var op = vec_get(ops, i);
+        if (tag(op) == OP_COMMAND) {
+            if (str_eq_cstr(SystemOp_Command_binary(payload(op)), binary_cstr) == 1) {
+                return 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# True if any op is a Command whose args contain the given cstr literally.
+fn _ops_has_command_arg(ops, needle_cstr) {
+    var n = vec_len(ops);
+    var i = 0;
+    while (i < n) {
+        var op = vec_get(ops, i);
+        if (tag(op) == OP_COMMAND) {
+            if (_vec_str_any_eq(SystemOp_Command_args(payload(op)), needle_cstr) == 1) {
+                return 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# True if any op is a WriteFile with path containing the substring.
+fn _ops_has_write_path(ops, needle_cstr) {
+    var n = vec_len(ops);
+    var i = 0;
+    while (i < n) {
+        var op = vec_get(ops, i);
+        if (tag(op) == OP_WRITE_FILE) {
+            if (str_contains_cstr(SystemOp_WriteFile_path(payload(op)), needle_cstr) == 1) {
+                return 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# True if any op is a WriteFile whose path contains needle1 AND content contains needle2.
+fn _ops_has_write_path_content(ops, path_needle, content_needle) {
+    var n = vec_len(ops);
+    var i = 0;
+    while (i < n) {
+        var op = vec_get(ops, i);
+        if (tag(op) == OP_WRITE_FILE) {
+            var p = payload(op);
+            if (str_contains_cstr(SystemOp_WriteFile_path(p), path_needle) == 1) {
+                if (str_contains_cstr(SystemOp_WriteFile_content(p), content_needle) == 1) {
+                    return 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# True if any op is an Unmount.
+fn _ops_has_unmount(ops) {
+    var n = vec_len(ops);
+    var i = 0;
+    while (i < n) {
+        if (tag(vec_get(ops, i)) == OP_UNMOUNT) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# True if any op is a Mount.
+fn _ops_has_mount(ops) {
+    var n = vec_len(ops);
+    var i = 0;
+    while (i < n) {
+        if (tag(vec_get(ops, i)) == OP_MOUNT) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Find the first WriteFile op whose path contains the substring;
+# return WriteFile payload ptr or 0 if not found.
+fn _find_write(ops, needle_cstr) {
+    var n = vec_len(ops);
+    var i = 0;
+    while (i < n) {
+        var op = vec_get(ops, i);
+        if (tag(op) == OP_WRITE_FILE) {
+            if (str_contains_cstr(SystemOp_WriteFile_path(payload(op)), needle_cstr) == 1) {
+                return payload(op);
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Find the first Mount op; return SystemOp_Mount payload or 0.
+fn _find_mount(ops) {
+    var n = vec_len(ops);
+    var i = 0;
+    while (i < n) {
+        var op = vec_get(ops, i);
+        if (tag(op) == OP_MOUNT) { return payload(op); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Find the first Symlink op; return payload or 0.
+fn _find_symlink(ops) {
+    var n = vec_len(ops);
+    var i = 0;
+    while (i < n) {
+        var op = vec_get(ops, i);
+        if (tag(op) == OP_SYMLINK) { return payload(op); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# True if every byte of Str s is an ASCII hex digit (0-9 a-f A-F).
+fn _all_hex(s) {
+    var data = str_data(s);
+    var n = str_len(s);
+    var i = 0;
+    while (i < n) {
+        var c = load8(data + i);
+        var ok = 0;
+        if (c >= 48) { if (c <= 57) { ok = 1; } }
+        if (c >= 97) { if (c <= 102) { ok = 1; } }
+        if (c >= 65) { if (c <= 70) { ok = 1; } }
+        if (ok == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# ============================================================
+# Display / stringify tests (4)
+# ============================================================
+fn t_install_mode_display() {
+    test_group("install_mode_display");
+    assert(streq(mode_str(MODE_SERVER), "Server"), "Server");
+    assert(streq(mode_str(MODE_DESKTOP), "Desktop"), "Desktop");
+    assert(streq(mode_str(MODE_MINIMAL), "Minimal"), "Minimal");
+    assert(streq(mode_str(MODE_CUSTOM), "Custom"), "Custom");
+    return 0;
+}
+
+fn t_filesystem_display() {
+    test_group("filesystem_display");
+    assert(streq(fs_str(FS_EXT4), "ext4"), "ext4");
+    assert(streq(fs_str(FS_BTRFS), "btrfs"), "btrfs");
+    assert(streq(fs_str(FS_XFS), "xfs"), "xfs");
+    assert(streq(fs_str(FS_VFAT), "vfat"), "vfat");
+    assert(streq(fs_str(FS_SWAP), "swap"), "swap");
+    return 0;
+}
+
+fn t_bootloader_type_display() {
+    test_group("bootloader_type_display");
+    assert(streq(bt_str(BOOT_SYSTEMD), "systemd-boot"), "systemd-boot");
+    assert(streq(bt_str(BOOT_GRUB2), "GRUB 2"), "GRUB 2");
+    return 0;
+}
+
+fn t_partition_flag_variants() {
+    test_group("partition_flag_variants");
+    # 4 distinct values
+    assert_neq(PFLAG_BOOT, PFLAG_ESP, "boot != esp");
+    assert_neq(PFLAG_BOOT, PFLAG_LVM, "boot != lvm");
+    assert_neq(PFLAG_BOOT, PFLAG_RAID, "boot != raid");
+    assert_neq(PFLAG_ESP, PFLAG_LVM, "esp != lvm");
+    return 0;
+}
+
+fn t_trust_enforcement_mode_display() {
+    test_group("trust_enforcement_mode_display");
+    assert(streq(trust_str(TRUST_STRICT), "strict"), "strict");
+    assert(streq(trust_str(TRUST_PERMISSIVE), "permissive"), "permissive");
+    assert(streq(trust_str(TRUST_AUDIT_ONLY), "audit-only"), "audit-only");
+    return 0;
+}
+
+fn t_firewall_default_display() {
+    test_group("firewall_default_display");
+    assert(streq(fw_str(FW_DENY), "deny"), "deny");
+    assert(streq(fw_str(FW_ALLOW), "allow"), "allow");
+    return 0;
+}
+
+# ============================================================
+# InstallPhase tests
+# ============================================================
+fn t_install_phase_ordering() {
+    test_group("install_phase_ordering");
+    assert(PHASE_VALIDATE_CONFIG < PHASE_PARTITION_DISK, "validate < partition");
+    assert(PHASE_INSTALL_BASE < PHASE_INSTALL_PACKAGES, "base < packages");
+    assert(PHASE_CLEANUP < PHASE_COMPLETE, "cleanup < complete");
+    assert_eq(PHASE_COMPLETE, PHASE_COUNT - 1, "complete == count-1");
+    return 0;
+}
+
+fn t_install_phase_display() {
+    test_group("install_phase_display");
+    assert(streq(phase_str(PHASE_VALIDATE_CONFIG), "Validating configuration"), "validate");
+    assert(streq(phase_str(PHASE_COMPLETE), "Installation complete"), "complete");
+    return 0;
+}
+
+fn t_install_phase_next() {
+    test_group("install_phase_next");
+    assert_eq(phase_next(PHASE_VALIDATE_CONFIG), PHASE_PARTITION_DISK, "validate.next == partition");
+    assert_eq(phase_next(PHASE_COMPLETE), 0 - 1, "complete.next == -1");
+    return 0;
+}
+
+fn t_phase_ordering_encryption_before_format() {
+    test_group("phase_ordering_encryption_before_format");
+    assert(PHASE_SETUP_ENCRYPTION < PHASE_FORMAT_FILESYSTEMS,
+        "SetupEncryption must come before FormatFilesystems");
+    return 0;
+}
+
+# ============================================================
+# DiskLayout tests
+# ============================================================
+fn t_default_disk_layout_structure() {
+    test_group("default_disk_layout_structure");
+    var l = agnova_default_disk_layout(str_from("/dev/sda"), 0);
+    assert(str_eq_cstr(DiskLayout_target_device(l), "/dev/sda"), "device");
+    assert_eq(DiskLayout_use_gpt(l), 1, "use_gpt");
+    assert_eq(DiskLayout_encrypt(l), 0, "encrypt off");
+    var parts = DiskLayout_partitions(l);
+    assert_eq(vec_len(parts), 2, "2 partitions");
+    var p0 = vec_get(parts, 0);
+    var p1 = vec_get(parts, 1);
+    assert(str_eq_cstr(PartitionSpec_label(p0), "ESP"), "ESP label");
+    assert_eq(PartitionSpec_size_mb(p0), 512, "ESP 512MB");
+    assert_eq(PartitionSpec_has_size(p0), 1, "ESP has size");
+    assert(str_eq_cstr(PartitionSpec_mount_point(p1), "/"), "p1 mount=/");
+    assert_eq(PartitionSpec_has_size(p1), 0, "p1 fill remaining");
+    return 0;
+}
+
+fn t_default_disk_layout_with_encryption() {
+    test_group("default_disk_layout_with_encryption");
+    var l = agnova_default_disk_layout(str_from("/dev/nvme0n1"), 1);
+    assert_eq(DiskLayout_encrypt(l), 1, "encrypted");
+    assert(str_eq_cstr(DiskLayout_target_device(l), "/dev/nvme0n1"), "nvme device");
+    return 0;
+}
+
+fn t_disk_layout_gpt_default() {
+    test_group("disk_layout_gpt_default");
+    var l = disk_layout_default();
+    assert_eq(DiskLayout_use_gpt(l), 1, "use_gpt default true");
+    return 0;
+}
+
+# ============================================================
+# PackageSelection tests
+# ============================================================
+fn t_default_packages_server() {
+    test_group("default_packages_server");
+    var p = default_packages(MODE_SERVER);
+    assert(vec_len(PackageSelection_base_packages(p)) > 0, "base nonempty");
+    assert(vec_len(PackageSelection_mode_packages(p)) > 0, "mode nonempty");
+    assert(_vec_str_any_eq(PackageSelection_base_packages(p), "linux-kernel"), "has kernel");
+    assert(_vec_str_any_eq(PackageSelection_mode_packages(p), "daimon-server"), "has daimon-server");
+    return 0;
+}
+
+fn t_default_packages_desktop_more_than_server() {
+    test_group("default_packages_desktop_more_than_server");
+    var d = default_packages(MODE_DESKTOP);
+    var s = default_packages(MODE_SERVER);
+    assert(vec_len(PackageSelection_mode_packages(d)) > vec_len(PackageSelection_mode_packages(s)),
+        "desktop > server mode pkgs");
+    assert(PackageSelection_total_size_mb(d) > PackageSelection_total_size_mb(s),
+        "desktop > server total size");
+    return 0;
+}
+
+fn t_default_packages_minimal_fewest() {
+    test_group("default_packages_minimal_fewest");
+    var m = default_packages(MODE_MINIMAL);
+    assert_eq(vec_len(PackageSelection_mode_packages(m)), 0, "minimal mode pkgs empty");
+    assert(PackageSelection_total_size_mb(m) < 1000, "minimal < 1000MB");
+    return 0;
+}
+
+fn t_package_selection_total_count() {
+    test_group("package_selection_total_count");
+    var base = vec_new();
+    vec_push(base, str_from("a"));
+    vec_push(base, str_from("b"));
+    var mode = vec_new();
+    vec_push(mode, str_from("c"));
+    var extra = vec_new();
+    vec_push(extra, str_from("d"));
+    vec_push(extra, str_from("e"));
+    vec_push(extra, str_from("f"));
+    var p = package_selection_new(base, mode, extra, 100);
+    assert_eq(package_selection_total_count(p), 6, "2+1+3 = 6");
+    return 0;
+}
+
+# ============================================================
+# validate_config tests
+# ============================================================
+fn t_validate_config_valid() {
+    test_group("validate_config_valid");
+    var r = validate_config(_test_config());
+    assert(is_ok(r), "valid config");
+    return 0;
+}
+
+fn t_validate_config_missing_device() {
+    test_group("validate_config_missing_device");
+    var c = _test_config();
+    DiskLayout_set_target_device(InstallConfig_disk(c), str_from(""));
+    var r = validate_config(c);
+    assert(is_err_result(r), "missing device fails");
+    return 0;
+}
+
+fn t_validate_config_empty_username() {
+    test_group("validate_config_empty_username");
+    var c = _test_config();
+    UserConfig_set_username(InstallConfig_user(c), str_from(""));
+    var r = validate_config(c);
+    assert(is_err_result(r), "empty username fails");
+    return 0;
+}
+
+fn t_validate_config_no_partitions() {
+    test_group("validate_config_no_partitions");
+    var c = _test_config();
+    DiskLayout_set_partitions(InstallConfig_disk(c), vec_new());
+    var r = validate_config(c);
+    assert(is_err_result(r), "no partitions fails");
+    return 0;
+}
+
+fn t_validate_config_warns_luks_mismatch() {
+    test_group("validate_config_warns_luks_mismatch");
+    var c = _test_config();
+    SecurityConfig_set_enable_luks(InstallConfig_security(c), 1);
+    DiskLayout_set_encrypt(InstallConfig_disk(c), 0);
+    var r = validate_config(c);
+    assert(is_ok(r), "still ok with warning");
+    var warns = payload(r);
+    assert(_vec_str_any_contains(warns, "enable_luks"), "warning mentions enable_luks");
+    return 0;
+}
+
+fn t_validate_rejects_dangerous_kernel_param_init() {
+    test_group("validate_rejects_dangerous_kernel_param_init");
+    var c = _test_config();
+    var kp = vec_new();
+    vec_push(kp, str_from("init=/bin/sh"));
+    BootloaderConfig_set_kernel_params(InstallConfig_bootloader(c), kp);
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects init=");
+    assert(str_contains_cstr(payload(r), "dangerous kernel parameter"), "msg");
+    return 0;
+}
+
+fn t_validate_accepts_safe_kernel_params() {
+    test_group("validate_accepts_safe_kernel_params");
+    var c = _test_config();
+    var kp = vec_new();
+    vec_push(kp, str_from("quiet"));
+    vec_push(kp, str_from("loglevel=3"));
+    BootloaderConfig_set_kernel_params(InstallConfig_bootloader(c), kp);
+    var r = validate_config(c);
+    assert(is_ok(r), "accepts safe params");
+    return 0;
+}
+
+fn t_validate_rejects_device_path_with_dotdot() {
+    test_group("validate_rejects_device_path_with_dotdot");
+    var c = _test_config();
+    DiskLayout_set_target_device(InstallConfig_disk(c), str_from("/dev/../etc/passwd"));
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects ..");
+    return 0;
+}
+
+fn t_validate_rejects_device_path_with_semicolon() {
+    test_group("validate_rejects_device_path_with_semicolon");
+    var c = _test_config();
+    DiskLayout_set_target_device(InstallConfig_disk(c), str_from("/dev/sda;rm -rf /"));
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects ;");
+    return 0;
+}
+
+fn t_validate_accepts_valid_device_path() {
+    test_group("validate_accepts_valid_device_path");
+    var r = validate_config(_test_config());
+    assert(is_ok(r), "accepts /dev/sda");
+    return 0;
+}
+
+fn t_validate_rejects_hostname_with_spaces() {
+    test_group("validate_rejects_hostname_with_spaces");
+    var c = _test_config();
+    NetworkConfig_set_hostname(InstallConfig_network(c), str_from("my host"));
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects space in hostname");
+    return 0;
+}
+
+fn t_validate_accepts_valid_hostname() {
+    test_group("validate_accepts_valid_hostname");
+    var c = _test_config();
+    NetworkConfig_set_hostname(InstallConfig_network(c), str_from("my-server-01"));
+    var r = validate_config(c);
+    assert(is_ok(r), "accepts my-server-01");
+    return 0;
+}
+
+fn t_validate_rejects_username_root() {
+    test_group("validate_rejects_username_root");
+    var c = _test_config();
+    UserConfig_set_username(InstallConfig_user(c), str_from("root"));
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects root");
+    assert(str_contains_cstr(payload(r), "root"), "msg mentions root");
+    return 0;
+}
+
+fn t_validate_rejects_username_with_special_chars() {
+    test_group("validate_rejects_username_with_special_chars");
+    var c = _test_config();
+    UserConfig_set_username(InstallConfig_user(c), str_from("user!name"));
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects !");
+    return 0;
+}
+
+fn t_validate_rejects_no_dhcp_without_static_ip() {
+    test_group("validate_rejects_no_dhcp_without_static_ip");
+    var c = _test_config();
+    NetworkConfig_set_use_dhcp(InstallConfig_network(c), 0);
+    NetworkConfig_set_static_ip(InstallConfig_network(c), str_from(""));
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects no_dhcp + no static_ip");
+    assert(str_contains_cstr(payload(r), "static_ip"), "msg mentions static_ip");
+    return 0;
+}
+
+fn t_validate_rejects_partition_label_with_spaces() {
+    test_group("validate_rejects_partition_label_with_spaces");
+    var c = _test_config();
+    var p0 = vec_get(DiskLayout_partitions(InstallConfig_disk(c)), 0);
+    PartitionSpec_set_label(p0, str_from("my label"));
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects space");
+    assert(str_contains_cstr(payload(r), "invalid characters"), "msg");
+    return 0;
+}
+
+fn t_validate_rejects_partition_label_with_shell_chars() {
+    test_group("validate_rejects_partition_label_with_shell_chars");
+    var c = _test_config();
+    var p0 = vec_get(DiskLayout_partitions(InstallConfig_disk(c)), 0);
+    PartitionSpec_set_label(p0, str_from("root;rm"));
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects ;");
+    return 0;
+}
+
+fn t_validate_rejects_empty_partition_label() {
+    test_group("validate_rejects_empty_partition_label");
+    var c = _test_config();
+    var p0 = vec_get(DiskLayout_partitions(InstallConfig_disk(c)), 0);
+    PartitionSpec_set_label(p0, str_from(""));
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects empty");
+    assert(str_contains_cstr(payload(r), "empty label"), "msg mentions empty label");
+    return 0;
+}
+
+fn t_validate_rejects_fill_remaining_not_last() {
+    test_group("validate_rejects_fill_remaining_not_last");
+    var c = _test_config();
+    # First partition: clear has_size so it claims fill-remaining
+    var p0 = vec_get(DiskLayout_partitions(InstallConfig_disk(c)), 0);
+    PartitionSpec_set_has_size(p0, 0);
+    PartitionSpec_set_size_mb(p0, 0);
+    # Add a third partition so first is no longer last
+    var extra = partition_spec_new(
+        str_from("extra"), str_from("/data"), FS_EXT4, 1024, 1, vec_new());
+    vec_push(DiskLayout_partitions(InstallConfig_disk(c)), extra);
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects fill-remaining-not-last");
+    assert(str_contains_cstr(payload(r), "non-last"), "msg mentions non-last");
+    return 0;
+}
+
+fn t_validate_rejects_full_name_with_colon() {
+    test_group("validate_rejects_full_name_with_colon");
+    var c = _test_config();
+    UserConfig_set_full_name(InstallConfig_user(c), str_from("user:name"));
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects colon in full_name");
+    assert(str_contains_cstr(payload(r), "full_name"), "msg");
+    return 0;
+}
+
+fn t_validate_rejects_group_with_special_chars() {
+    test_group("validate_rejects_group_with_special_chars");
+    var c = _test_config();
+    var groups = vec_new();
+    vec_push(groups, str_from("valid"));
+    vec_push(groups, str_from("bad group!"));
+    UserConfig_set_groups(InstallConfig_user(c), groups);
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects bad group name");
+    return 0;
+}
+
+fn t_validate_accepts_valid_partition_labels() {
+    test_group("validate_accepts_valid_partition_labels");
+    var r = validate_config(_test_config());
+    assert(is_ok(r), "default labels valid");
+    return 0;
+}
+
+fn t_validate_rejects_mbr_with_more_than_four_partitions() {
+    test_group("validate_rejects_mbr_with_more_than_four_partitions");
+    var c = _test_config();
+    var disk = InstallConfig_disk(c);
+    DiskLayout_set_use_gpt(disk, 0);
+    var parts = vec_new();
+    var i = 1;
+    while (i <= 5) {
+        var label_sb = str_builder_new();
+        str_builder_add_cstr(label_sb, "part");
+        str_builder_add_int(label_sb, i);
+        var mp_sb = str_builder_new();
+        if (i == 5) {
+            str_builder_add_cstr(mp_sb, "/");
+        } else {
+            str_builder_add_cstr(mp_sb, "/mnt/");
+            str_builder_add_int(mp_sb, i);
+        }
+        var has_size = 1;
+        var size = 1024;
+        if (i == 5) { has_size = 0; size = 0; }
+        vec_push(parts, partition_spec_new(
+            str_builder_build(label_sb), str_builder_build(mp_sb),
+            FS_EXT4, size, has_size, vec_new()));
+        i = i + 1;
+    }
+    DiskLayout_set_partitions(disk, parts);
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects MBR > 4");
+    assert(str_contains_cstr(payload(r), "MBR"), "msg mentions MBR");
+    return 0;
+}
+
+fn t_validate_accepts_mbr_with_four_partitions() {
+    test_group("validate_accepts_mbr_with_four_partitions");
+    var c = _test_config();
+    var disk = InstallConfig_disk(c);
+    DiskLayout_set_use_gpt(disk, 0);
+    var parts = vec_new();
+    var i = 1;
+    while (i <= 4) {
+        var label_sb = str_builder_new();
+        str_builder_add_cstr(label_sb, "part");
+        str_builder_add_int(label_sb, i);
+        var mp_sb = str_builder_new();
+        if (i == 4) {
+            str_builder_add_cstr(mp_sb, "/");
+        } else {
+            str_builder_add_cstr(mp_sb, "/mnt/");
+            str_builder_add_int(mp_sb, i);
+        }
+        var has_size = 1;
+        var size = 1024;
+        if (i == 4) { has_size = 0; size = 0; }
+        vec_push(parts, partition_spec_new(
+            str_builder_build(label_sb), str_builder_build(mp_sb),
+            FS_EXT4, size, has_size, vec_new()));
+        i = i + 1;
+    }
+    DiskLayout_set_partitions(disk, parts);
+    var r = validate_config(c);
+    assert(is_ok(r), "accepts MBR with 4 partitions");
+    return 0;
+}
+
+# ============================================================
+# Phase advancement tests
+# ============================================================
+fn t_phase_advancement_sequence() {
+    test_group("phase_advancement_sequence");
+    var inst = agnova_installer_new(_test_config(), str_from(""));
+    assert_eq(agnova_current_phase(inst), PHASE_VALIDATE_CONFIG, "starts at validate");
+    assert_eq(agnova_advance_phase(inst), 1, "advance ok");
+    assert_eq(agnova_current_phase(inst), PHASE_PARTITION_DISK, "now at partition");
+    return 0;
+}
+
+fn t_phase_advancement_past_complete_returns_false() {
+    test_group("phase_advancement_past_complete_returns_false");
+    var inst = agnova_installer_new(_test_config(), str_from(""));
+    while (agnova_advance_phase(inst) == 1) { }
+    assert_eq(agnova_is_complete(inst), 1, "is complete");
+    assert_eq(agnova_advance_phase(inst), 0, "past complete returns 0");
+    return 0;
+}
+
+fn t_fail_phase_records_error() {
+    test_group("fail_phase_records_error");
+    var inst = agnova_installer_new(_test_config(), str_from(""));
+    agnova_fail_phase(inst, str_from("disk I/O error"));
+    var errs = AgnovaInstaller_errors(inst);
+    assert_eq(vec_len(errs), 1, "1 error");
+    var e = vec_get(errs, 0);
+    assert_eq(InstallError_phase(e), PHASE_VALIDATE_CONFIG, "phase = validate");
+    assert(str_eq_cstr(InstallError_message(e), "disk I/O error"), "message preserved");
+    return 0;
+}
+
+fn t_advance_phase_blocked_after_non_recoverable_failure() {
+    test_group("advance_phase_blocked_after_non_recoverable_failure");
+    var inst = agnova_installer_new(_test_config(), str_from(""));
+    agnova_advance_phase(inst);
+    assert_eq(agnova_current_phase(inst), PHASE_PARTITION_DISK, "at partition");
+    agnova_fail_phase(inst, str_from("disk not found"));
+    var errs = AgnovaInstaller_errors(inst);
+    var last = vec_get(errs, vec_len(errs) - 1);
+    assert_eq(InstallError_recoverable(last), 0, "non-recoverable");
+    assert_eq(agnova_advance_phase(inst), 0, "blocked");
+    assert_eq(agnova_current_phase(inst), PHASE_PARTITION_DISK, "still at partition");
+    return 0;
+}
+
+# ============================================================
+# Result tests
+# ============================================================
+fn t_result_after_completion() {
+    test_group("result_after_completion");
+    var inst = agnova_installer_new(_test_config(), str_from(""));
+    while (agnova_advance_phase(inst) == 1) { }
+    var r = agnova_result(inst);
+    assert_eq(InstallResult_success(r), 1, "success");
+    assert_eq(vec_len(InstallResult_errors(r)), 0, "no errors");
+    assert(vec_len(InstallResult_phases_completed(r)) > 0, "phases completed");
+    return 0;
+}
+
+fn t_result_with_errors() {
+    test_group("result_with_errors");
+    var inst = agnova_installer_new(_test_config(), str_from(""));
+    agnova_fail_phase(inst, str_from("something broke"));
+    var r = agnova_result(inst);
+    assert_eq(InstallResult_success(r), 0, "not success");
+    assert_eq(vec_len(InstallResult_errors(r)), 1, "1 error");
+    return 0;
+}
+
+# ============================================================
+# Helper-fn tests (machine_id, hostname, fstab, kernel_params)
+# ============================================================
+fn t_generate_machine_id_format() {
+    test_group("generate_machine_id_format");
+    var id = generate_machine_id();
+    assert_eq(str_len(id), 32, "32 hex chars");
+    assert_eq(_all_hex(id), 1, "all hex");
+    return 0;
+}
+
+fn t_generate_hostname_config_content() {
+    test_group("generate_hostname_config_content");
+    var c = generate_hostname_config(str_from("myhost"));
+    assert(str_eq_cstr(c, "myhost\n"), "myhost\\n");
+    return 0;
+}
+
+fn t_generate_fstab_basic() {
+    test_group("generate_fstab_basic");
+    var parts = vec_new();
+    vec_push(parts, partition_spec_new(
+        str_from("ESP"), str_from("/boot/efi"), FS_VFAT, 512, 1,
+        vec_new()));
+    vec_push(parts, partition_spec_new(
+        str_from("agnos-root"), str_from("/"), FS_EXT4, 0, 0, vec_new()));
+    var fstab = generate_fstab(parts, 0);
+    assert(str_contains_cstr(fstab, "LABEL=ESP"), "has LABEL=ESP");
+    assert(str_contains_cstr(fstab, "LABEL=agnos-root"), "has LABEL=agnos-root");
+    assert(str_contains_cstr(fstab, "vfat"), "has vfat");
+    assert(str_contains_cstr(fstab, "ext4"), "has ext4");
+    return 0;
+}
+
+fn t_generate_fstab_with_encryption() {
+    test_group("generate_fstab_with_encryption");
+    var parts = vec_new();
+    vec_push(parts, partition_spec_new(
+        str_from("agnos-root"), str_from("/"), FS_EXT4, 0, 0, vec_new()));
+    var fstab = generate_fstab(parts, 1);
+    assert(str_contains_cstr(fstab, "/dev/mapper/agnos-root"),
+        "encrypted root uses /dev/mapper");
+    return 0;
+}
+
+fn t_default_kernel_params_full_security() {
+    test_group("default_kernel_params_full_security");
+    var sec = security_config_default();
+    var p = default_kernel_params(sec);
+    assert(_vec_str_any_eq(p, "rd.luks=1"), "rd.luks=1");
+    assert(_vec_str_any_eq(p, "lockdown=integrity"), "lockdown=integrity");
+    assert(_vec_str_any_eq(p, "tpm_tis.interrupts=0"), "tpm_tis");
+    assert(_vec_str_any_eq(p, "dm_verity.verify=1"), "dm_verity");
+    assert(_vec_str_any_contains(p, "lsm="), "has lsm=");
+    return 0;
+}
+
+fn t_default_kernel_params_no_security() {
+    test_group("default_kernel_params_no_security");
+    var sec = security_config_new(0, 0, 0, 0, TRUST_AUDIT_ONLY, FW_DENY);
+    var p = default_kernel_params(sec);
+    assert_eq(_vec_str_any_eq(p, "rd.luks=1"), 0, "no rd.luks=1");
+    assert_eq(_vec_str_any_eq(p, "lockdown=integrity"), 0, "no lockdown");
+    assert(_vec_str_any_eq(p, "quiet"), "still has quiet");
+    return 0;
+}
+
+fn t_kernel_cmdline_generation() {
+    test_group("kernel_cmdline_generation");
+    var c = kernel_cmdline(_test_config());
+    assert(str_contains_cstr(c, "quiet"), "has quiet");
+    assert(str_contains_cstr(c, "root=LABEL=agnos-root"), "root via LABEL");
+    return 0;
+}
+
+fn t_kernel_cmdline_encrypted() {
+    test_group("kernel_cmdline_encrypted");
+    var cfg = _test_config();
+    DiskLayout_set_encrypt(InstallConfig_disk(cfg), 1);
+    var c = kernel_cmdline(cfg);
+    assert(str_contains_cstr(c, "root=/dev/mapper/agnos-root"), "root via mapper");
+    return 0;
+}
+
+fn t_estimate_install_time_varies_by_mode() {
+    test_group("estimate_install_time_varies_by_mode");
+    var minimal = agnova_estimate_install_time(MODE_MINIMAL);
+    var desktop = agnova_estimate_install_time(MODE_DESKTOP);
+    assert(desktop > minimal, "desktop > minimal");
+    return 0;
+}
+
+# ============================================================
+# Misc state tests
+# ============================================================
+fn t_install_progress_initial_state() {
+    test_group("install_progress_initial_state");
+    var p = install_progress_new(PHASE_VALIDATE_CONFIG, str_from("init"), 0);
+    assert_eq(InstallProgress_current_phase(p), PHASE_VALIDATE_CONFIG, "phase");
+    assert_eq(InstallProgress_phase_progress(p), 0, "phase_progress 0");
+    assert_eq(InstallProgress_overall_progress(p), 0, "overall 0");
+    assert_eq(InstallProgress_has_estimate(p), 0, "no estimate");
+    return 0;
+}
+
+fn t_user_config_defaults() {
+    test_group("user_config_defaults");
+    var u = user_config_default();
+    assert(str_eq_cstr(UserConfig_shell(u), "/usr/bin/agnoshi"), "shell");
+    assert_eq(UserConfig_enable_sudo(u), 1, "sudo enabled");
+    assert(_vec_str_any_eq(UserConfig_groups(u), "wheel"), "wheel group");
+    return 0;
+}
+
+fn t_network_config_dhcp() {
+    test_group("network_config_dhcp");
+    var n = network_config_default();
+    assert_eq(NetworkConfig_use_dhcp(n), 1, "dhcp");
+    assert_eq(str_len(NetworkConfig_static_ip(n)), 0, "no static_ip");
+    assert(vec_len(NetworkConfig_dns(n)) > 0, "has dns");
+    return 0;
+}
+
+fn t_network_config_static_ip() {
+    test_group("network_config_static_ip");
+    var dns = vec_new();
+    vec_push(dns, str_from("192.168.1.1"));
+    var n = network_config_new(
+        str_from("server1"), 0,
+        str_from("192.168.1.100/24"), str_from("192.168.1.1"), dns);
+    assert_eq(NetworkConfig_use_dhcp(n), 0, "not dhcp");
+    assert(str_len(NetworkConfig_static_ip(n)) > 0, "has static_ip");
+    assert(str_len(NetworkConfig_gateway(n)) > 0, "has gateway");
+    return 0;
+}
+
+fn t_security_config_full_lockdown() {
+    test_group("security_config_full_lockdown");
+    var s = security_config_default();
+    assert_eq(SecurityConfig_enable_luks(s), 1, "luks");
+    assert_eq(SecurityConfig_enable_secureboot(s), 1, "secureboot");
+    assert_eq(SecurityConfig_enable_tpm(s), 1, "tpm");
+    assert_eq(SecurityConfig_enable_dmverity(s), 1, "dmverity");
+    assert_eq(SecurityConfig_trust_enforcement(s), TRUST_STRICT, "strict");
+    assert_eq(SecurityConfig_firewall_default(s), FW_DENY, "deny");
+    return 0;
+}
+
+fn t_install_error_recoverable_flag() {
+    test_group("install_error_recoverable_flag");
+    var e1 = install_error_new(PHASE_CONFIGURE_SYSTEM, str_from("locale not found"), 1);
+    assert_eq(InstallError_recoverable(e1), 1, "recoverable");
+    var e2 = install_error_new(PHASE_PARTITION_DISK, str_from("disk not found"), 0);
+    assert_eq(InstallError_recoverable(e2), 0, "non-recoverable");
+    return 0;
+}
+
+fn t_log_messages_recorded() {
+    test_group("log_messages_recorded");
+    var inst = agnova_installer_new(_test_config(), str_from(""));
+    agnova_log_message(inst, str_from("step 1 done"));
+    agnova_log_message(inst, str_from("step 2 done"));
+    var log = AgnovaInstaller_log(inst);
+    assert_eq(vec_len(log), 2, "2 entries");
+    assert(str_eq_cstr(vec_get(log, 0), "step 1 done"), "first entry");
+    return 0;
+}
+
+fn t_phase_count_matches_all() {
+    test_group("phase_count_matches_all");
+    assert_eq(agnova_phase_count(), 14, "14 phases");
+    assert_eq(agnova_phase_count(), PHASE_COUNT, "count == PHASE_COUNT");
+    return 0;
+}
+
+# ============================================================
+# Partition ops tests
+# ============================================================
+fn t_partition_ops_creates_gpt() {
+    test_group("partition_ops_creates_gpt");
+    var phase = plan_partition_ops(_test_config());
+    assert_eq(PhaseOps_phase(phase), PHASE_PARTITION_DISK, "phase tag");
+    var ops = PhaseOps_operations(phase);
+    var first = vec_get(ops, 0);
+    assert_eq(tag(first), OP_COMMAND, "first is Command");
+    var args = SystemOp_Command_args(payload(first));
+    assert(_vec_str_any_eq(args, "gpt"), "args contain gpt");
+    return 0;
+}
+
+fn t_partition_ops_creates_partitions() {
+    test_group("partition_ops_creates_partitions");
+    var phase = plan_partition_ops(_test_config());
+    assert(vec_len(PhaseOps_operations(phase)) >= 3, ">= 3 ops");
+    return 0;
+}
+
+fn t_partition_ops_sets_esp_flag() {
+    test_group("partition_ops_sets_esp_flag");
+    var phase = plan_partition_ops(_test_config());
+    assert_eq(_ops_has_command_arg(PhaseOps_operations(phase), "esp"), 1, "esp flag set");
+    return 0;
+}
+
+fn t_partition_device_helper_sda() {
+    test_group("partition_device_helper_sda");
+    assert(str_eq_cstr(partition_device(str_from("/dev/sda"), 0), "/dev/sda1"), "sda1");
+    assert(str_eq_cstr(partition_device(str_from("/dev/sda"), 2), "/dev/sda3"), "sda3");
+    return 0;
+}
+
+fn t_partition_device_helper_nvme() {
+    test_group("partition_device_helper_nvme");
+    assert(str_eq_cstr(partition_device(str_from("/dev/nvme0n1"), 0), "/dev/nvme0n1p1"), "nvme p1");
+    assert(str_eq_cstr(partition_device(str_from("/dev/mmcblk0"), 1), "/dev/mmcblk0p2"), "mmcblk p2");
+    return 0;
+}
+
+# ============================================================
+# Format ops tests
+# ============================================================
+fn t_format_ops_creates_filesystems() {
+    test_group("format_ops_creates_filesystems");
+    var phase = plan_format_ops(_test_config());
+    assert_eq(PhaseOps_phase(phase), PHASE_FORMAT_FILESYSTEMS, "phase tag");
+    assert_eq(vec_len(PhaseOps_operations(phase)), 2, "2 mkfs ops");
+    return 0;
+}
+
+fn t_format_ops_uses_correct_mkfs() {
+    test_group("format_ops_uses_correct_mkfs");
+    var ops = PhaseOps_operations(plan_format_ops(_test_config()));
+    assert(str_eq_cstr(SystemOp_Command_binary(payload(vec_get(ops, 0))), "mkfs.vfat"), "vfat first");
+    assert(str_eq_cstr(SystemOp_Command_binary(payload(vec_get(ops, 1))), "mkfs.ext4"), "ext4 second");
+    return 0;
+}
+
+# ============================================================
+# Encryption ops tests
+# ============================================================
+fn t_encryption_ops_empty_when_disabled() {
+    test_group("encryption_ops_empty_when_disabled");
+    var phase = plan_encryption_ops(_test_config(), str_from(""));
+    assert_eq(vec_len(PhaseOps_operations(phase)), 0, "no ops when disabled");
+    return 0;
+}
+
+fn t_encryption_ops_luks_when_enabled() {
+    test_group("encryption_ops_luks_when_enabled");
+    var c = _test_config();
+    DiskLayout_set_encrypt(InstallConfig_disk(c), 1);
+    var phase = plan_encryption_ops(c, str_from("hunter2"));
+    var ops = PhaseOps_operations(phase);
+    assert_eq(vec_len(ops), 2, "2 cryptsetup ops");
+    var op0 = vec_get(ops, 0);
+    var op1 = vec_get(ops, 1);
+    assert(str_eq_cstr(SystemOp_Command_binary(payload(op0)), "cryptsetup"), "cryptsetup");
+    assert(_vec_str_any_eq(SystemOp_Command_args(payload(op0)), "luksFormat"), "luksFormat");
+    assert(str_eq_cstr(SystemOp_Command_binary(payload(op1)), "cryptsetup"), "cryptsetup");
+    assert(_vec_str_any_eq(SystemOp_Command_args(payload(op1)), "open"), "open");
+    return 0;
+}
+
+fn t_encryption_ops_empty_partitions_no_panic() {
+    test_group("encryption_ops_empty_partitions_no_panic");
+    var c = _test_config();
+    DiskLayout_set_encrypt(InstallConfig_disk(c), 1);
+    DiskLayout_set_partitions(InstallConfig_disk(c), vec_new());
+    var phase = plan_encryption_ops(c, str_from("hunter2"));
+    assert_eq(vec_len(PhaseOps_operations(phase)), 0, "no ops, no panic");
+    return 0;
+}
+
+fn t_luks_format_uses_stdin_passphrase() {
+    test_group("luks_format_uses_stdin_passphrase");
+    var c = _test_config();
+    DiskLayout_set_encrypt(InstallConfig_disk(c), 1);
+    var phase = plan_encryption_ops(c, str_from("hunter2"));
+    var ops = PhaseOps_operations(phase);
+    assert(vec_len(ops) >= 2, "at least 2 ops");
+    var fmt = vec_get(ops, 0);
+    assert(str_eq_cstr(SystemOp_Command_binary(payload(fmt)), "cryptsetup"), "fmt cryptsetup");
+    var args0 = SystemOp_Command_args(payload(fmt));
+    assert(_vec_str_any_eq(args0, "--batch-mode"), "--batch-mode");
+    assert(_vec_str_any_eq(args0, "--key-file=-"), "--key-file=-");
+    assert(str_eq_cstr(SystemOp_Command_stdin(payload(fmt)), "hunter2"), "stdin = passphrase");
+    var open_op = vec_get(ops, 1);
+    var args1 = SystemOp_Command_args(payload(open_op));
+    assert(_vec_str_any_eq(args1, "open"), "open");
+    assert(_vec_str_any_eq(args1, "--key-file=-"), "open --key-file=-");
+    assert(str_eq_cstr(SystemOp_Command_stdin(payload(open_op)), "hunter2"), "open stdin");
+    return 0;
+}
+
+# ============================================================
+# Bootloader ops tests
+# ============================================================
+fn t_bootloader_ops_grub() {
+    test_group("bootloader_ops_grub");
+    var c = _test_config();
+    BootloaderConfig_set_bootloader_type(InstallConfig_bootloader(c), BOOT_GRUB2);
+    var phase = plan_bootloader_ops(c, str_from("/mnt"));
+    assert_eq(PhaseOps_phase(phase), PHASE_INSTALL_BOOTLOADER, "phase tag");
+    var ops = PhaseOps_operations(phase);
+    assert_eq(vec_len(ops), 3, "3 ops (grub-install + mkdir + cfg)");
+    assert(str_eq_cstr(SystemOp_Command_binary(payload(vec_get(ops, 0))), "grub-install"),
+        "first is grub-install");
+    var cfg_op = vec_get(ops, 2);
+    assert_eq(tag(cfg_op), OP_WRITE_FILE, "third is WriteFile");
+    assert(str_contains_cstr(SystemOp_WriteFile_path(payload(cfg_op)), "grub.cfg"), "path grub.cfg");
+    assert(str_contains_cstr(SystemOp_WriteFile_content(payload(cfg_op)), "AGNOS"), "content AGNOS");
+    assert(str_contains_cstr(SystemOp_WriteFile_content(payload(cfg_op)), "rescue"), "rescue entry");
+    return 0;
+}
+
+fn t_bootloader_ops_systemd_boot() {
+    test_group("bootloader_ops_systemd_boot");
+    var c = _test_config();
+    BootloaderConfig_set_bootloader_type(InstallConfig_bootloader(c), BOOT_SYSTEMD);
+    var ops = PhaseOps_operations(plan_bootloader_ops(c, str_from("/mnt")));
+    assert(str_eq_cstr(SystemOp_Command_binary(payload(vec_get(ops, 0))), "bootctl"), "bootctl");
+    return 0;
+}
+
+fn t_bootloader_grub_bios_mode() {
+    test_group("bootloader_grub_bios_mode");
+    var c = _test_config();
+    BootloaderConfig_set_bootloader_type(InstallConfig_bootloader(c), BOOT_GRUB2);
+    var ops = PhaseOps_operations(plan_bootloader_ops(c, str_from("/mnt")));
+    var op0 = vec_get(ops, 0);
+    assert_eq(tag(op0), OP_COMMAND, "Command");
+    var args = SystemOp_Command_args(payload(op0));
+    var has_target = 0;
+    var n = vec_len(args);
+    var i = 0;
+    while (i < n) {
+        if (str_starts_with(vec_get(args, i), str_from("--target=")) == 1) { has_target = 1; }
+        i = i + 1;
+    }
+    assert(has_target, "has --target= arg");
+    return 0;
+}
+
+fn t_bootloader_systemd_boot_has_entry_files() {
+    test_group("bootloader_systemd_boot_has_entry_files");
+    var c = _test_config();
+    BootloaderConfig_set_bootloader_type(InstallConfig_bootloader(c), BOOT_SYSTEMD);
+    var ops = PhaseOps_operations(plan_bootloader_ops(c, str_from("/mnt")));
+    assert(_ops_has_write_path(ops, "loader.conf"), "loader.conf");
+    assert(_ops_has_write_path(ops, "agnos.conf"), "agnos.conf");
+    assert(_ops_has_write_path(ops, "agnos-rescue.conf"), "rescue entry");
+    return 0;
+}
+
+fn t_grub_cfg_uses_kernel_version() {
+    test_group("grub_cfg_uses_kernel_version");
+    var c = _test_config();
+    BootloaderConfig_set_bootloader_type(InstallConfig_bootloader(c), BOOT_GRUB2);
+    var ops = PhaseOps_operations(plan_bootloader_ops(c, str_from("/mnt")));
+    var w = _find_write(ops, "grub.cfg");
+    assert(w != 0, "grub.cfg exists");
+    var content = SystemOp_WriteFile_content(w);
+    assert(str_contains_cstr(content, "vmlinuz-"), "references kernel by version");
+    assert(str_contains_cstr(content, "initramfs-"), "references initramfs");
+    var kver = kernel_version();
+    var kver_data = str_data(kver);
+    var kver_len = str_len(kver);
+    # Build a cstr from kver and check via str_contains
+    var kver_cstr = str_cstr(kver);
+    assert(str_contains_cstr(content, kver_cstr), "references kernel_version()");
+    return 0;
+}
+
+# ============================================================
+# User ops tests
+# ============================================================
+fn t_user_ops_creates_user() {
+    test_group("user_ops_creates_user");
+    var phase = plan_user_ops(_test_config(), str_from("/mnt"));
+    assert_eq(PhaseOps_phase(phase), PHASE_CREATE_USER, "phase tag");
+    var ops = PhaseOps_operations(phase);
+    var op0 = vec_get(ops, 0);
+    assert(str_eq_cstr(SystemOp_Command_binary(payload(op0)), "useradd"), "useradd");
+    assert(_vec_str_any_eq(SystemOp_Command_args(payload(op0)), "testuser"), "username arg");
+    return 0;
+}
+
+fn t_user_ops_installs_ssh_keys() {
+    test_group("user_ops_installs_ssh_keys");
+    var c = _test_config();
+    var keys = vec_new();
+    vec_push(keys, str_from("ssh-ed25519 AAAA... user@host"));
+    UserConfig_set_ssh_keys(InstallConfig_user(c), keys);
+    var ops = PhaseOps_operations(plan_user_ops(c, str_from("/mnt")));
+    assert(vec_len(ops) >= 3, "useradd + mkdir + write_keys");
+    assert(_ops_has_write_path(ops, "authorized_keys"), "writes authorized_keys");
+    return 0;
+}
+
+fn t_user_ops_adds_sudo() {
+    test_group("user_ops_adds_sudo");
+    var c = _test_config();
+    UserConfig_set_enable_sudo(InstallConfig_user(c), 1);
+    var ops = PhaseOps_operations(plan_user_ops(c, str_from("/mnt")));
+    assert(_ops_has_command_arg(ops, "wheel"), "adds to wheel");
+    return 0;
+}
+
+# ============================================================
+# Network ops tests
+# ============================================================
+fn t_network_ops_creates_hostname() {
+    test_group("network_ops_creates_hostname");
+    var ops = PhaseOps_operations(plan_network_ops(_test_config(), str_from("/mnt")));
+    assert(_ops_has_write_path_content(ops, "hostname", "agnos"), "hostname file with content");
+    return 0;
+}
+
+fn t_network_ops_creates_hosts() {
+    test_group("network_ops_creates_hosts");
+    var ops = PhaseOps_operations(plan_network_ops(_test_config(), str_from("/mnt")));
+    assert(_ops_has_write_path_content(ops, "/etc/hosts", "localhost"), "hosts has localhost");
+    return 0;
+}
+
+fn t_network_ops_creates_resolv_conf() {
+    test_group("network_ops_creates_resolv_conf");
+    var c = _test_config();
+    var dns = vec_new();
+    vec_push(dns, str_from("8.8.8.8"));
+    vec_push(dns, str_from("1.1.1.1"));
+    NetworkConfig_set_dns(InstallConfig_network(c), dns);
+    var ops = PhaseOps_operations(plan_network_ops(c, str_from("/mnt")));
+    assert(_ops_has_write_path_content(ops, "resolv.conf", "8.8.8.8"), "resolv has 8.8.8.8");
+    return 0;
+}
+
+fn t_plan_network_ops_static_ip_config() {
+    test_group("plan_network_ops_static_ip_config");
+    var c = _test_config();
+    var net = InstallConfig_network(c);
+    NetworkConfig_set_use_dhcp(net, 0);
+    NetworkConfig_set_static_ip(net, str_from("192.168.1.100/24"));
+    NetworkConfig_set_gateway(net, str_from("192.168.1.1"));
+    var dns = vec_new();
+    vec_push(dns, str_from("1.1.1.1"));
+    vec_push(dns, str_from("8.8.8.8"));
+    NetworkConfig_set_dns(net, dns);
+    var ops = PhaseOps_operations(plan_network_ops(c, str_from("/mnt/target")));
+    var w = _find_write(ops, "10-static.network");
+    assert(w != 0, "10-static.network exists");
+    var content = SystemOp_WriteFile_content(w);
+    assert(str_contains_cstr(content, "[Match]"), "[Match]");
+    assert(str_contains_cstr(content, "Name=eth0"), "Name=eth0");
+    assert(str_contains_cstr(content, "Address=192.168.1.100/24"), "Address");
+    assert(str_contains_cstr(content, "Gateway=192.168.1.1"), "Gateway");
+    assert(str_contains_cstr(content, "DNS=1.1.1.1"), "DNS=1.1.1.1");
+    assert(str_contains_cstr(content, "DNS=8.8.8.8"), "DNS=8.8.8.8");
+    return 0;
+}
+
+fn t_plan_network_ops_dhcp_no_static_file() {
+    test_group("plan_network_ops_dhcp_no_static_file");
+    var ops = PhaseOps_operations(plan_network_ops(_test_config(), str_from("/mnt/target")));
+    assert_eq(_ops_has_write_path(ops, "10-static.network"), 0,
+        "DHCP mode should NOT write static.network");
+    return 0;
+}
+
+# ============================================================
+# Locale ops tests
+# ============================================================
+fn t_locale_ops_creates_locale_conf() {
+    test_group("locale_ops_creates_locale_conf");
+    var ops = PhaseOps_operations(plan_locale_ops(_test_config(), str_from("/mnt")));
+    assert(_ops_has_write_path_content(ops, "locale.conf", "en_US.UTF-8"), "locale.conf");
+    return 0;
+}
+
+fn t_locale_ops_creates_timezone_symlink() {
+    test_group("locale_ops_creates_timezone_symlink");
+    var ops = PhaseOps_operations(plan_locale_ops(_test_config(), str_from("/mnt")));
+    var sl = _find_symlink(ops);
+    assert(sl != 0, "has symlink");
+    assert(str_contains_cstr(SystemOp_Symlink_target(sl), "zoneinfo"), "target zoneinfo");
+    assert(str_contains_cstr(SystemOp_Symlink_link(sl), "localtime"), "link localtime");
+    return 0;
+}
+
+fn t_locale_ops_creates_fstab() {
+    test_group("locale_ops_creates_fstab");
+    var ops = PhaseOps_operations(plan_locale_ops(_test_config(), str_from("/mnt")));
+    assert(_ops_has_write_path(ops, "fstab"), "writes fstab");
+    return 0;
+}
+
+fn t_locale_ops_creates_machine_id() {
+    test_group("locale_ops_creates_machine_id");
+    var ops = PhaseOps_operations(plan_locale_ops(_test_config(), str_from("/mnt")));
+    assert(_ops_has_write_path(ops, "machine-id"), "writes machine-id");
+    return 0;
+}
+
+# ============================================================
+# Mount / install / packages / security / first-boot / cleanup
+# ============================================================
+fn t_mount_ops_mounts_root_first() {
+    test_group("mount_ops_mounts_root_first");
+    var phase = plan_mount_ops(_test_config(), str_from("/mnt"));
+    assert_eq(PhaseOps_phase(phase), PHASE_MOUNT_FILESYSTEMS, "phase tag");
+    var ops = PhaseOps_operations(phase);
+    assert(vec_len(ops) > 0, "non-empty");
+    var m = _find_mount(ops);
+    assert(m != 0, "has mount");
+    assert(str_eq_cstr(SystemOp_Mount_mount_point(m), "/mnt/"), "first mount = /mnt/");
+    return 0;
+}
+
+fn t_install_base_ops_creates_dirs_and_extracts() {
+    test_group("install_base_ops_creates_dirs_and_extracts");
+    var phase = plan_install_base_ops(_test_config(), str_from("/mnt"));
+    assert_eq(PhaseOps_phase(phase), PHASE_INSTALL_BASE, "phase tag");
+    var ops = PhaseOps_operations(phase);
+    assert(vec_len(ops) >= 3, ">=3 ops");
+    assert(_ops_has_command_binary(ops, "tar"), "tar extraction");
+    return 0;
+}
+
+fn t_install_packages_ops_uses_ark() {
+    test_group("install_packages_ops_uses_ark");
+    var phase = plan_install_packages_ops(_test_config(), str_from("/mnt"));
+    assert_eq(PhaseOps_phase(phase), PHASE_INSTALL_PACKAGES, "phase tag");
+    assert(_ops_has_command_binary(PhaseOps_operations(phase), "ark"), "ark cmd");
+    return 0;
+}
+
+fn t_security_ops_writes_nft_and_sysctl() {
+    test_group("security_ops_writes_nft_and_sysctl");
+    var phase = plan_security_ops(_test_config(), str_from("/mnt"));
+    assert_eq(PhaseOps_phase(phase), PHASE_SETUP_SECURITY, "phase tag");
+    var ops = PhaseOps_operations(phase);
+    assert(_ops_has_write_path(ops, "nftables"), "nftables");
+    assert(_ops_has_write_path(ops, "sysctl"), "sysctl");
+    return 0;
+}
+
+fn t_first_boot_ops_enables_services() {
+    test_group("first_boot_ops_enables_services");
+    var c = _test_config();
+    InstallConfig_set_mode(c, MODE_DESKTOP);
+    var phase = plan_first_boot_ops(c, str_from("/mnt"));
+    assert_eq(PhaseOps_phase(phase), PHASE_FIRST_BOOT_SETUP, "phase tag");
+    var ops = PhaseOps_operations(phase);
+    assert(_ops_has_command_binary(ops, "chroot"), "chroot enable");
+    assert(_ops_has_command_arg(ops, "aethersafha"), "compositor enable for Desktop");
+    return 0;
+}
+
+fn t_cleanup_ops_unmounts_and_syncs() {
+    test_group("cleanup_ops_unmounts_and_syncs");
+    var phase = plan_cleanup_ops(_test_config(), str_from("/mnt"));
+    assert_eq(PhaseOps_phase(phase), PHASE_CLEANUP, "phase tag");
+    var ops = PhaseOps_operations(phase);
+    assert(_ops_has_command_binary(ops, "sync"), "sync");
+    assert(_ops_has_unmount(ops), "unmount");
+    return 0;
+}
+
+# ============================================================
+# Full-plan tests
+# ============================================================
+fn t_full_execution_plan_has_all_phases() {
+    test_group("full_execution_plan_has_all_phases");
+    var plan = full_execution_plan(_test_config(), str_from("/mnt"), str_from(""));
+    assert_eq(vec_len(plan), 13, "13 phases");
+    return 0;
+}
+
+fn t_total_ops_count_nonzero() {
+    test_group("total_ops_count_nonzero");
+    var n = total_ops_count(_test_config(), str_from("/mnt"), str_from(""));
+    assert(n > 10, ">10 ops");
+    return 0;
+}
+
+# ============================================================
+# ISO config tests
+# ============================================================
+fn t_iso_config_defaults() {
+    test_group("iso_config_defaults");
+    var iso = iso_config_default();
+    assert_eq(IsoConfig_uefi(iso), 1, "uefi");
+    assert_eq(IsoConfig_bios(iso), 0, "no bios");
+    assert(str_eq_cstr(IsoConfig_compression(iso), "zstd"), "zstd");
+    assert(str_eq_cstr(IsoConfig_volume_label(iso), "AGNOS"), "AGNOS label");
+    return 0;
+}
+
+fn t_iso_build_command_uefi() {
+    test_group("iso_build_command_uefi");
+    var op = iso_build_command(iso_config_default());
+    assert_eq(tag(op), OP_COMMAND, "Command");
+    assert(str_eq_cstr(SystemOp_Command_binary(payload(op)), "xorriso"), "xorriso");
+    var args = SystemOp_Command_args(payload(op));
+    assert(_vec_str_any_eq(args, "-no-emul-boot"), "-no-emul-boot");
+    assert(_vec_str_any_contains(args, "efi"), "efi-related arg");
+    return 0;
+}
+
+fn t_iso_build_command_bios() {
+    test_group("iso_build_command_bios");
+    var iso = iso_config_default();
+    IsoConfig_set_uefi(iso, 0);
+    IsoConfig_set_bios(iso, 1);
+    var op = iso_build_command(iso);
+    var args = SystemOp_Command_args(payload(op));
+    assert(_vec_str_any_contains(args, "bios"), "bios-related arg");
+    return 0;
+}
+
+fn t_system_op_descriptors() {
+    # Replaces the Rust system_op_display test (we don't have impl Display);
+    # instead verify we can construct + read all 6 variant kinds.
+    test_group("system_op_descriptors");
+    var args = vec_new();
+    vec_push(args, str_from("-s"));
+    vec_push(args, str_from("/dev/sda"));
+    var c = op_command(str_from("parted"), args, str_from("partition disk"), 1, str_from(""));
+    assert_eq(tag(c), OP_COMMAND, "Command tag");
+    assert(str_eq_cstr(SystemOp_Command_binary(payload(c)), "parted"), "binary");
+    assert(str_eq_cstr(SystemOp_Command_description(payload(c)), "partition disk"), "desc");
+
+    var w = op_write_file(str_from("/etc/hostname"), str_from("agnos\n"), 420, str_from(""));
+    assert_eq(tag(w), OP_WRITE_FILE, "WriteFile tag");
+    assert(str_eq_cstr(SystemOp_WriteFile_path(payload(w)), "/etc/hostname"), "wf path");
+
+    var s = op_symlink(str_from("/usr/share/zoneinfo/UTC"), str_from("/etc/localtime"));
+    assert_eq(tag(s), OP_SYMLINK, "Symlink tag");
+    assert(str_eq_cstr(SystemOp_Symlink_link(payload(s)), "/etc/localtime"), "sl link");
+
+    var u = op_unmount(str_from("/mnt"));
+    assert_eq(tag(u), OP_UNMOUNT, "Unmount tag");
+
+    var md = op_make_dir(str_from("/mnt/etc"), 493, 1);
+    assert_eq(tag(md), OP_MAKE_DIR, "MakeDir tag");
+    assert_eq(SystemOp_MakeDir_parents(payload(md)), 1, "parents");
+
+    var opts = vec_new();
+    vec_push(opts, str_from("defaults"));
+    var mn = op_mount(str_from("/dev/sda1"), str_from("/mnt"), str_from("ext4"), opts);
+    assert_eq(tag(mn), OP_MOUNT, "Mount tag");
+    return 0;
+}
+
+# ============================================================
+# main — calls every test, prints summary, returns failure count
+# ============================================================
 fn main() {
     alloc_init();
-    test_group("smoke");
-    assert(1, "true is true");
-    assert_eq(1 + 1, 2, "math works");
+
+    # Display tests
+    t_install_mode_display();
+    t_filesystem_display();
+    t_bootloader_type_display();
+    t_partition_flag_variants();
+    t_trust_enforcement_mode_display();
+    t_firewall_default_display();
+
+    # Phase tests
+    t_install_phase_ordering();
+    t_install_phase_display();
+    t_install_phase_next();
+    t_phase_ordering_encryption_before_format();
+
+    # Disk layout tests
+    t_default_disk_layout_structure();
+    t_default_disk_layout_with_encryption();
+    t_disk_layout_gpt_default();
+
+    # Package selection tests
+    t_default_packages_server();
+    t_default_packages_desktop_more_than_server();
+    t_default_packages_minimal_fewest();
+    t_package_selection_total_count();
+
+    # Validation tests
+    t_validate_config_valid();
+    t_validate_config_missing_device();
+    t_validate_config_empty_username();
+    t_validate_config_no_partitions();
+    t_validate_config_warns_luks_mismatch();
+    t_validate_rejects_dangerous_kernel_param_init();
+    t_validate_accepts_safe_kernel_params();
+    t_validate_rejects_device_path_with_dotdot();
+    t_validate_rejects_device_path_with_semicolon();
+    t_validate_accepts_valid_device_path();
+    t_validate_rejects_hostname_with_spaces();
+    t_validate_accepts_valid_hostname();
+    t_validate_rejects_username_root();
+    t_validate_rejects_username_with_special_chars();
+    t_validate_rejects_no_dhcp_without_static_ip();
+    t_validate_rejects_partition_label_with_spaces();
+    t_validate_rejects_partition_label_with_shell_chars();
+    t_validate_rejects_empty_partition_label();
+    t_validate_rejects_fill_remaining_not_last();
+    t_validate_rejects_full_name_with_colon();
+    t_validate_rejects_group_with_special_chars();
+    t_validate_accepts_valid_partition_labels();
+    t_validate_rejects_mbr_with_more_than_four_partitions();
+    t_validate_accepts_mbr_with_four_partitions();
+
+    # Phase advancement tests
+    t_phase_advancement_sequence();
+    t_phase_advancement_past_complete_returns_false();
+    t_fail_phase_records_error();
+    t_advance_phase_blocked_after_non_recoverable_failure();
+
+    # Result tests
+    t_result_after_completion();
+    t_result_with_errors();
+
+    # Helper-fn tests
+    t_generate_machine_id_format();
+    t_generate_hostname_config_content();
+    t_generate_fstab_basic();
+    t_generate_fstab_with_encryption();
+    t_default_kernel_params_full_security();
+    t_default_kernel_params_no_security();
+    t_kernel_cmdline_generation();
+    t_kernel_cmdline_encrypted();
+    t_estimate_install_time_varies_by_mode();
+
+    # Misc state tests
+    t_install_progress_initial_state();
+    t_user_config_defaults();
+    t_network_config_dhcp();
+    t_network_config_static_ip();
+    t_security_config_full_lockdown();
+    t_install_error_recoverable_flag();
+    t_log_messages_recorded();
+    t_phase_count_matches_all();
+
+    # Partition ops tests
+    t_partition_ops_creates_gpt();
+    t_partition_ops_creates_partitions();
+    t_partition_ops_sets_esp_flag();
+    t_partition_device_helper_sda();
+    t_partition_device_helper_nvme();
+
+    # Format ops tests
+    t_format_ops_creates_filesystems();
+    t_format_ops_uses_correct_mkfs();
+
+    # Encryption ops tests
+    t_encryption_ops_empty_when_disabled();
+    t_encryption_ops_luks_when_enabled();
+    t_encryption_ops_empty_partitions_no_panic();
+    t_luks_format_uses_stdin_passphrase();
+
+    # Bootloader ops tests
+    t_bootloader_ops_grub();
+    t_bootloader_ops_systemd_boot();
+    t_bootloader_grub_bios_mode();
+    t_bootloader_systemd_boot_has_entry_files();
+    t_grub_cfg_uses_kernel_version();
+
+    # User / network / locale / mount / install / packages / security / first-boot / cleanup
+    t_user_ops_creates_user();
+    t_user_ops_installs_ssh_keys();
+    t_user_ops_adds_sudo();
+    t_network_ops_creates_hostname();
+    t_network_ops_creates_hosts();
+    t_network_ops_creates_resolv_conf();
+    t_plan_network_ops_static_ip_config();
+    t_plan_network_ops_dhcp_no_static_file();
+    t_locale_ops_creates_locale_conf();
+    t_locale_ops_creates_timezone_symlink();
+    t_locale_ops_creates_fstab();
+    t_locale_ops_creates_machine_id();
+    t_mount_ops_mounts_root_first();
+    t_install_base_ops_creates_dirs_and_extracts();
+    t_install_packages_ops_uses_ark();
+    t_security_ops_writes_nft_and_sysctl();
+    t_first_boot_ops_enables_services();
+    t_cleanup_ops_unmounts_and_syncs();
+
+    # Full-plan tests
+    t_full_execution_plan_has_all_phases();
+    t_total_ops_count_nonzero();
+
+    # ISO + descriptor tests
+    t_iso_config_defaults();
+    t_iso_build_command_uefi();
+    t_iso_build_command_bios();
+    t_system_op_descriptors();
+
     return assert_summary();
 }
 

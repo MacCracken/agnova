@@ -47,6 +47,14 @@ jobs:
           mkdir -p build
           cyrius build src/main.cyr build/agnova
 
+      - name: Test suite
+        run: |
+          out=$(cyrius test tests/agnova.tcyr 2>&1)
+          tail=$(echo "$out" | tail -1)
+          echo "$tail"
+          # Must say "N passed, 0 failed (N total)"
+          echo "$tail" | grep -qE '^[0-9]+ passed, 0 failed \([0-9]+ total\)$'
+
       - name: Smoke test (version)
         run: |
           out=$(./build/agnova version)
