@@ -1,0 +1,14 @@
+[package]
+name = "agnova"
+version = "0.1.0"
+description = "agnova — Cyrius port (from 3656 lines of Rust)"
+license = "GPL-3.0-only"
+language = "cyrius"
+cyrius = "5.7.12"
+
+[build]
+entry = "src/main.cyr"
+output = "agnova"
+
+[deps]
+stdlib = ["string", "fmt", "alloc", "vec", "str", "syscalls", "io", "args", "assert", "tagged"]

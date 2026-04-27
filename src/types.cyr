@@ -1,0 +1,202 @@
+# types.cyr — agnova core types (enums, structs, SystemOp tagged union)
+#
+# Ported from rust-old/src/types.rs
+#
+# Conventions:
+#   - Enum members are upper-case + prefixed (Cyrius enums are global)
+#   - Stringify fns return cstr (C-string literal); use str_from() for Str
+#   - Option<T> in Rust → empty Str sentinel for strings, separate has_X flag for ints
+#   - f32 progress → i64 basis points (0..10000)
+#   - DateTime<Utc> → i64 unix seconds
+#   - luks_passphrase is NOT in DiskLayout (held by orchestrator); preserves the
+#     #[serde(skip)] semantics from the Rust version
+
+# ============================================================
+# InstallMode
+# ============================================================
+enum InstallMode {
+    MODE_SERVER = 0;
+    MODE_DESKTOP = 1;
+    MODE_MINIMAL = 2;
+    MODE_CUSTOM = 3;
+}
+
+fn mode_str(m) {
+    if (m == MODE_SERVER) { return "Server"; }
+    if (m == MODE_DESKTOP) { return "Desktop"; }
+    if (m == MODE_MINIMAL) { return "Minimal"; }
+    if (m == MODE_CUSTOM) { return "Custom"; }
+    return "Unknown";
+}
+
+# ============================================================
+# Filesystem
+# ============================================================
+enum Filesystem {
+    FS_EXT4 = 0;
+    FS_BTRFS = 1;
+    FS_XFS = 2;
+    FS_VFAT = 3;
+    FS_SWAP = 4;
+}
+
+fn fs_str(f) {
+    if (f == FS_EXT4) { return "ext4"; }
+    if (f == FS_BTRFS) { return "btrfs"; }
+    if (f == FS_XFS) { return "xfs"; }
+    if (f == FS_VFAT) { return "vfat"; }
+    if (f == FS_SWAP) { return "swap"; }
+    return "unknown";
+}
+
+# ============================================================
+# PartitionFlag
+# ============================================================
+enum PartitionFlag {
+    PFLAG_BOOT = 0;
+    PFLAG_ESP = 1;
+    PFLAG_LVM = 2;
+    PFLAG_RAID = 3;
+}
+
+fn pflag_str(p) {
+    if (p == PFLAG_BOOT) { return "boot"; }
+    if (p == PFLAG_ESP) { return "esp"; }
+    if (p == PFLAG_LVM) { return "lvm"; }
+    if (p == PFLAG_RAID) { return "raid"; }
+    return "unknown";
+}
+
+# ============================================================
+# BootloaderType
+# ============================================================
+enum BootloaderType {
+    BOOT_SYSTEMD = 0;
+    BOOT_GRUB2 = 1;
+}
+
+fn bt_str(b) {
+    if (b == BOOT_SYSTEMD) { return "systemd-boot"; }
+    if (b == BOOT_GRUB2) { return "GRUB 2"; }
+    return "unknown";
+}
+
+# ============================================================
+# TrustEnforcementMode
+# ============================================================
+enum TrustEnforcementMode {
+    TRUST_STRICT = 0;
+    TRUST_PERMISSIVE = 1;
+    TRUST_AUDIT_ONLY = 2;
+}
+
+fn trust_str(t) {
+    if (t == TRUST_STRICT) { return "strict"; }
+    if (t == TRUST_PERMISSIVE) { return "permissive"; }
+    if (t == TRUST_AUDIT_ONLY) { return "audit-only"; }
+    return "unknown";
+}
+
+# ============================================================
+# FirewallDefault
+# ============================================================
+enum FirewallDefault {
+    FW_DENY = 0;
+    FW_ALLOW = 1;
+}
+
+fn fw_str(f) {
+    if (f == FW_DENY) { return "deny"; }
+    if (f == FW_ALLOW) { return "allow"; }
+    return "unknown";
+}
+
+# ============================================================
+# InstallPhase — execution order matches Rust ALL slice
+# ============================================================
+enum InstallPhase {
+    PHASE_VALIDATE_CONFIG = 0;
+    PHASE_PARTITION_DISK = 1;
+    PHASE_SETUP_ENCRYPTION = 2;
+    PHASE_FORMAT_FILESYSTEMS = 3;
+    PHASE_MOUNT_FILESYSTEMS = 4;
+    PHASE_INSTALL_BASE = 5;
+    PHASE_INSTALL_PACKAGES = 6;
+    PHASE_CONFIGURE_SYSTEM = 7;
+    PHASE_INSTALL_BOOTLOADER = 8;
+    PHASE_CREATE_USER = 9;
+    PHASE_SETUP_SECURITY = 10;
+    PHASE_FIRST_BOOT_SETUP = 11;
+    PHASE_CLEANUP = 12;
+    PHASE_COMPLETE = 13;
+}
+
+var PHASE_COUNT = 14;
+
+fn phase_str(p) {
+    if (p == PHASE_VALIDATE_CONFIG) { return "Validating configuration"; }
+    if (p == PHASE_PARTITION_DISK) { return "Partitioning disk"; }
+    if (p == PHASE_FORMAT_FILESYSTEMS) { return "Formatting filesystems"; }
+    if (p == PHASE_SETUP_ENCRYPTION) { return "Setting up encryption"; }
+    if (p == PHASE_MOUNT_FILESYSTEMS) { return "Mounting filesystems"; }
+    if (p == PHASE_INSTALL_BASE) { return "Installing base system"; }
+    if (p == PHASE_INSTALL_PACKAGES) { return "Installing packages"; }
+    if (p == PHASE_CONFIGURE_SYSTEM) { return "Configuring system"; }
+    if (p == PHASE_INSTALL_BOOTLOADER) { return "Installing bootloader"; }
+    if (p == PHASE_CREATE_USER) { return "Creating user account"; }
+    if (p == PHASE_SETUP_SECURITY) { return "Setting up security"; }
+    if (p == PHASE_FIRST_BOOT_SETUP) { return "Preparing first boot"; }
+    if (p == PHASE_CLEANUP) { return "Cleaning up"; }
+    if (p == PHASE_COMPLETE) { return "Installation complete"; }
+    return "unknown";
+}
+
+# Returns next phase index or -1 if already at PHASE_COMPLETE.
+fn phase_next(p) {
+    if (p >= PHASE_COMPLETE) { return -1; }
+    return p + 1;
+}
+
+# ============================================================
+# SystemOp — tagged union over 6 system action variants
+# ============================================================
+# Layout: tagged_new(tag, &variant_payload_struct).
+# Read with tag(op) + payload(op); cast payload to the matching
+# struct pointer and load fields by offset (or via field accessors).
+# JSON serialization is manual (#derive(Serialize) does not handle
+# discriminated unions).
+
+enum SystemOpTag {
+    OP_COMMAND = 0;
+    OP_WRITE_FILE = 1;
+    OP_MAKE_DIR = 2;
+    OP_SYMLINK = 3;
+    OP_MOUNT = 4;
+    OP_UNMOUNT = 5;
+}
+
+# --- Variant: Command ---
+# stdin: Str (empty == no stdin); args: vec<Str>
+#derive(Serialize)
+struct SystemOp_Command {
+    binary: Str;
+    args;
+    description: Str;
+    fatal;
+    stdin: Str;
+}
+
+fn op_command(binary, args, description, fatal, stdin) {
+    var p = alloc(sizeof(SystemOp_Command));
+    store64(p, binary);
+    store64(p + 8, args);
+    store64(p + 16, description);
+    store64(p + 24, fatal);
+    store64(p + 32, stdin);
+    return tagged_new(OP_COMMAND, p);
+}
+
+# Smoke: confirm we can read back what we wrote.
+fn op_command_binary(op) {
+    return load64(payload(op));
+}

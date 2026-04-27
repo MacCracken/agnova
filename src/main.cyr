@@ -1,0 +1,23 @@
+# agnova — OS installer for AGNOS
+# Ported from 3656 lines of Rust (rust-old/src/)
+#
+# Stdlib auto-included via cyrius.cyml ([deps].stdlib).
+# Submodules included below in dependency order: types is leaf (no deps
+# on other submodules), so it comes first.
+
+include "src/types.cyr"
+
+fn main() {
+    alloc_init();
+    println("agnova ready");
+
+    # Smoke check: confirm types.cyr compiles + symbols are visible.
+    println(phase_str(PHASE_VALIDATE_CONFIG));
+    println(mode_str(MODE_DESKTOP));
+    println(fs_str(FS_EXT4));
+
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

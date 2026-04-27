@@ -20,3 +20,7 @@ tarpaulin-report.*
 .env.*
 *.pem
 *.key
+
+# Cyrius port
+/rust-old/target/
+/build/
