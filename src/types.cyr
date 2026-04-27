@@ -10,6 +10,8 @@
 #   - DateTime<Utc> → i64 unix seconds
 #   - luks_passphrase is NOT in DiskLayout (held by orchestrator); preserves the
 #     #[serde(skip)] semantics from the Rust version
+#   - #derive(accessors) on every struct → Type_field(p) getters + Type_set_field(p, v) setters
+#   - #derive(Serialize) only on all-scalar/all-Str structs (no vec/ptr fields)
 
 # ============================================================
 # InstallMode
@@ -112,7 +114,8 @@ fn fw_str(f) {
 }
 
 # ============================================================
-# InstallPhase — execution order matches Rust ALL slice
+# InstallPhase — values match the Rust ALL slice order (NOT
+# decl order); .index() in Rust returns position in ALL.
 # ============================================================
 enum InstallPhase {
     PHASE_VALIDATE_CONFIG = 0;
@@ -161,10 +164,8 @@ fn phase_next(p) {
 # SystemOp — tagged union over 6 system action variants
 # ============================================================
 # Layout: tagged_new(tag, &variant_payload_struct).
-# Read with tag(op) + payload(op); cast payload to the matching
-# struct pointer and load fields by offset (or via field accessors).
-# JSON serialization is manual (#derive(Serialize) does not handle
-# discriminated unions).
+# Read with tag(op) + payload(op); use the auto-generated
+# accessor fns (e.g., SystemOp_Command_binary(payload(op))).
 
 enum SystemOpTag {
     OP_COMMAND = 0;
@@ -175,9 +176,8 @@ enum SystemOpTag {
     OP_UNMOUNT = 5;
 }
 
-# --- Variant: Command ---
-# stdin: Str (empty == no stdin); args: vec<Str>
-#derive(Serialize)
+# --- Variant: Command --- args: vec<Str>; stdin empty Str == None
+#derive(accessors)
 struct SystemOp_Command {
     binary: Str;
     args;
@@ -196,7 +196,492 @@ fn op_command(binary, args, description, fatal, stdin) {
     return tagged_new(OP_COMMAND, p);
 }
 
-# Smoke: confirm we can read back what we wrote.
-fn op_command_binary(op) {
-    return load64(payload(op));
+# --- Variant: WriteFile --- owner empty Str == None
+#derive(accessors)
+struct SystemOp_WriteFile {
+    path: Str;
+    content: Str;
+    mode;
+    owner: Str;
+}
+
+fn op_write_file(path, content, mode, owner) {
+    var p = alloc(sizeof(SystemOp_WriteFile));
+    store64(p, path);
+    store64(p + 8, content);
+    store64(p + 16, mode);
+    store64(p + 24, owner);
+    return tagged_new(OP_WRITE_FILE, p);
+}
+
+# --- Variant: MakeDir ---
+#derive(accessors)
+struct SystemOp_MakeDir {
+    path: Str;
+    mode;
+    parents;
+}
+
+fn op_make_dir(path, mode, parents) {
+    var p = alloc(sizeof(SystemOp_MakeDir));
+    store64(p, path);
+    store64(p + 8, mode);
+    store64(p + 16, parents);
+    return tagged_new(OP_MAKE_DIR, p);
+}
+
+# --- Variant: Symlink ---
+#derive(accessors)
+struct SystemOp_Symlink {
+    target: Str;
+    link: Str;
+}
+
+fn op_symlink(target, link) {
+    var p = alloc(sizeof(SystemOp_Symlink));
+    store64(p, target);
+    store64(p + 8, link);
+    return tagged_new(OP_SYMLINK, p);
+}
+
+# --- Variant: Mount --- options: vec<Str>
+#derive(accessors)
+struct SystemOp_Mount {
+    device: Str;
+    mount_point: Str;
+    fs_type: Str;
+    options;
+}
+
+fn op_mount(device, mount_point, fs_type, options) {
+    var p = alloc(sizeof(SystemOp_Mount));
+    store64(p, device);
+    store64(p + 8, mount_point);
+    store64(p + 16, fs_type);
+    store64(p + 24, options);
+    return tagged_new(OP_MOUNT, p);
+}
+
+# --- Variant: Unmount ---
+#derive(accessors)
+struct SystemOp_Unmount {
+    mount_point: Str;
+}
+
+fn op_unmount(mount_point) {
+    var p = alloc(sizeof(SystemOp_Unmount));
+    store64(p, mount_point);
+    return tagged_new(OP_UNMOUNT, p);
+}
+
+# ============================================================
+# PhaseOps — one phase's plan: phase + description + ordered list of SystemOp
+# ============================================================
+#derive(accessors)
+struct PhaseOps {
+    phase;
+    description: Str;
+    operations;
+}
+
+fn phase_ops_new(phase, description, operations) {
+    var p = alloc(sizeof(PhaseOps));
+    store64(p, phase);
+    store64(p + 8, description);
+    store64(p + 16, operations);
+    return p;
+}
+
+# ============================================================
+# PartitionSpec
+# ============================================================
+# size_mb=0 + has_size=0 means "fill remaining" (Option::None equivalent).
+# flags: vec<i64> of PartitionFlag enum values.
+#derive(accessors)
+struct PartitionSpec {
+    label: Str;
+    mount_point: Str;
+    filesystem;
+    size_mb;
+    has_size;
+    flags;
+}
+
+fn partition_spec_new(label, mount_point, filesystem, size_mb, has_size, flags) {
+    var p = alloc(sizeof(PartitionSpec));
+    store64(p, label);
+    store64(p + 8, mount_point);
+    store64(p + 16, filesystem);
+    store64(p + 24, size_mb);
+    store64(p + 32, has_size);
+    store64(p + 40, flags);
+    return p;
+}
+
+# ============================================================
+# DiskLayout — luks_passphrase intentionally absent (orchestrator
+# holds it; mirrors Rust #[serde(skip_serializing)]).
+# ============================================================
+#derive(accessors)
+struct DiskLayout {
+    target_device: Str;
+    partitions;
+    use_gpt;
+    encrypt;
+}
+
+fn disk_layout_new(target_device, partitions, use_gpt, encrypt) {
+    var p = alloc(sizeof(DiskLayout));
+    store64(p, target_device);
+    store64(p + 8, partitions);
+    store64(p + 16, use_gpt);
+    store64(p + 24, encrypt);
+    return p;
+}
+
+fn disk_layout_default() {
+    return disk_layout_new(str_from(""), vec_new(), 1, 0);
+}
+
+# ============================================================
+# BootloaderConfig
+# ============================================================
+#derive(accessors)
+struct BootloaderConfig {
+    bootloader_type;
+    timeout_secs;
+    default_entry: Str;
+    kernel_params;
+}
+
+fn bootloader_config_new(bootloader_type, timeout_secs, default_entry, kernel_params) {
+    var p = alloc(sizeof(BootloaderConfig));
+    store64(p, bootloader_type);
+    store64(p + 8, timeout_secs);
+    store64(p + 16, default_entry);
+    store64(p + 24, kernel_params);
+    return p;
+}
+
+fn bootloader_config_default() {
+    var kp = vec_new();
+    vec_push(kp, str_from("quiet"));
+    return bootloader_config_new(BOOT_SYSTEMD, 5, str_from("agnos"), kp);
+}
+
+# ============================================================
+# NetworkConfig — static_ip and gateway use empty Str as None
+# ============================================================
+#derive(accessors)
+struct NetworkConfig {
+    hostname: Str;
+    use_dhcp;
+    static_ip: Str;
+    gateway: Str;
+    dns;
+}
+
+fn network_config_new(hostname, use_dhcp, static_ip, gateway, dns) {
+    var p = alloc(sizeof(NetworkConfig));
+    store64(p, hostname);
+    store64(p + 8, use_dhcp);
+    store64(p + 16, static_ip);
+    store64(p + 24, gateway);
+    store64(p + 32, dns);
+    return p;
+}
+
+fn network_config_default() {
+    var dns = vec_new();
+    vec_push(dns, str_from("1.1.1.1"));
+    vec_push(dns, str_from("8.8.8.8"));
+    return network_config_new(str_from("agnos"), 1, str_from(""), str_from(""), dns);
+}
+
+# ============================================================
+# UserConfig — full_name uses empty Str as None
+# ============================================================
+#derive(accessors)
+struct UserConfig {
+    username: Str;
+    full_name: Str;
+    shell: Str;
+    groups;
+    ssh_keys;
+    enable_sudo;
+}
+
+fn user_config_new(username, full_name, shell, groups, ssh_keys, enable_sudo) {
+    var p = alloc(sizeof(UserConfig));
+    store64(p, username);
+    store64(p + 8, full_name);
+    store64(p + 16, shell);
+    store64(p + 24, groups);
+    store64(p + 32, ssh_keys);
+    store64(p + 40, enable_sudo);
+    return p;
+}
+
+fn user_config_default() {
+    var groups = vec_new();
+    vec_push(groups, str_from("wheel"));
+    vec_push(groups, str_from("agents"));
+    return user_config_new(
+        str_from(""),
+        str_from(""),
+        str_from("/usr/bin/agnoshi"),
+        groups,
+        vec_new(),
+        1
+    );
+}
+
+# ============================================================
+# SecurityConfig — all-scalar, gets free JSON
+# ============================================================
+#derive(accessors)
+#derive(Serialize)
+struct SecurityConfig {
+    enable_luks;
+    enable_secureboot;
+    enable_tpm;
+    enable_dmverity;
+    trust_enforcement;
+    firewall_default;
+}
+
+fn security_config_new(enable_luks, enable_secureboot, enable_tpm, enable_dmverity, trust_enforcement, firewall_default) {
+    var p = alloc(sizeof(SecurityConfig));
+    store64(p, enable_luks);
+    store64(p + 8, enable_secureboot);
+    store64(p + 16, enable_tpm);
+    store64(p + 24, enable_dmverity);
+    store64(p + 32, trust_enforcement);
+    store64(p + 40, firewall_default);
+    return p;
+}
+
+fn security_config_default() {
+    return security_config_new(1, 1, 1, 1, TRUST_STRICT, FW_DENY);
+}
+
+# ============================================================
+# PackageSelection
+# ============================================================
+#derive(accessors)
+struct PackageSelection {
+    base_packages;
+    mode_packages;
+    extra_packages;
+    total_size_mb;
+}
+
+fn package_selection_new(base_packages, mode_packages, extra_packages, total_size_mb) {
+    var p = alloc(sizeof(PackageSelection));
+    store64(p, base_packages);
+    store64(p + 8, mode_packages);
+    store64(p + 16, extra_packages);
+    store64(p + 24, total_size_mb);
+    return p;
+}
+
+fn package_selection_empty() {
+    return package_selection_new(vec_new(), vec_new(), vec_new(), 0);
+}
+
+fn package_selection_total_count(ps) {
+    return vec_len(PackageSelection_base_packages(ps))
+         + vec_len(PackageSelection_mode_packages(ps))
+         + vec_len(PackageSelection_extra_packages(ps));
+}
+
+# ============================================================
+# InstallConfig — composite of pointers to sub-configs
+# ============================================================
+#derive(accessors)
+struct InstallConfig {
+    mode;
+    disk;
+    bootloader;
+    network;
+    user;
+    security;
+    packages;
+    locale: Str;
+    timezone: Str;
+}
+
+fn install_config_new(mode, disk, bootloader, network, user, security, packages, locale, timezone) {
+    var p = alloc(sizeof(InstallConfig));
+    store64(p, mode);
+    store64(p + 8, disk);
+    store64(p + 16, bootloader);
+    store64(p + 24, network);
+    store64(p + 32, user);
+    store64(p + 40, security);
+    store64(p + 48, packages);
+    store64(p + 56, locale);
+    store64(p + 64, timezone);
+    return p;
+}
+
+fn install_config_default() {
+    return install_config_new(
+        MODE_DESKTOP,
+        disk_layout_default(),
+        bootloader_config_default(),
+        network_config_default(),
+        user_config_default(),
+        security_config_default(),
+        package_selection_empty(),
+        str_from("en_US.UTF-8"),
+        str_from("UTC")
+    );
+}
+
+# ============================================================
+# InstallProgress — has_estimate=0 means estimated_remaining_secs absent
+# Progress fields are basis points 0..10000 (no f32 in Cyrius).
+# started_at is unix seconds (clock_gettime CLOCK_REALTIME).
+# ============================================================
+#derive(accessors)
+#derive(Serialize)
+struct InstallProgress {
+    current_phase;
+    phase_progress;
+    overall_progress;
+    message: Str;
+    started_at;
+    has_estimate;
+    estimated_remaining_secs;
+}
+
+fn install_progress_new(current_phase, message, started_at) {
+    var p = alloc(sizeof(InstallProgress));
+    store64(p, current_phase);
+    store64(p + 8, 0);
+    store64(p + 16, 0);
+    store64(p + 24, message);
+    store64(p + 32, started_at);
+    store64(p + 40, 0);
+    store64(p + 48, 0);
+    return p;
+}
+
+# ============================================================
+# InstallError
+# ============================================================
+#derive(accessors)
+#derive(Serialize)
+struct InstallError {
+    phase;
+    message: Str;
+    recoverable;
+}
+
+fn install_error_new(phase, message, recoverable) {
+    var p = alloc(sizeof(InstallError));
+    store64(p, phase);
+    store64(p + 8, message);
+    store64(p + 16, recoverable);
+    return p;
+}
+
+# ============================================================
+# InstallResult
+# ============================================================
+#derive(accessors)
+struct InstallResult {
+    success;
+    phases_completed;
+    errors;
+    duration_secs;
+    installed_packages;
+    disk_used_mb;
+}
+
+fn install_result_new(success, phases_completed, errors, duration_secs, installed_packages, disk_used_mb) {
+    var p = alloc(sizeof(InstallResult));
+    store64(p, success);
+    store64(p + 8, phases_completed);
+    store64(p + 16, errors);
+    store64(p + 24, duration_secs);
+    store64(p + 32, installed_packages);
+    store64(p + 40, disk_used_mb);
+    return p;
+}
+
+# ============================================================
+# IsoConfig — config for generating a bootable installer ISO
+# ============================================================
+#derive(accessors)
+#derive(Serialize)
+struct IsoConfig {
+    output_path: Str;
+    volume_label: Str;
+    root_tree: Str;
+    uefi;
+    bios;
+    compression: Str;
+}
+
+fn iso_config_new(output_path, volume_label, root_tree, uefi, bios, compression) {
+    var p = alloc(sizeof(IsoConfig));
+    store64(p, output_path);
+    store64(p + 8, volume_label);
+    store64(p + 16, root_tree);
+    store64(p + 24, uefi);
+    store64(p + 32, bios);
+    store64(p + 40, compression);
+    return p;
+}
+
+fn iso_config_default() {
+    return iso_config_new(
+        str_from("agnos-install.iso"),
+        str_from("AGNOS"),
+        str_from("/tmp/agnos-iso-tree"),
+        1,
+        0,
+        str_from("zstd")
+    );
+}
+
+# Build the xorriso command for the given IsoConfig.
+# Returns a tagged SystemOp (Command variant).
+fn iso_build_command(cfg) {
+    var args = vec_new();
+    vec_push(args, str_from("-as"));
+    vec_push(args, str_from("mkisofs"));
+    vec_push(args, str_from("-o"));
+    vec_push(args, str_clone(IsoConfig_output_path(cfg)));
+    vec_push(args, str_from("-V"));
+    vec_push(args, str_clone(IsoConfig_volume_label(cfg)));
+    vec_push(args, str_from("-J"));
+    vec_push(args, str_from("-R"));
+
+    if (IsoConfig_uefi(cfg) == 1) {
+        vec_push(args, str_from("-e"));
+        vec_push(args, str_from("boot/efi.img"));
+        vec_push(args, str_from("-no-emul-boot"));
+        vec_push(args, str_from("-isohybrid-gpt-basdat"));
+    }
+
+    if (IsoConfig_bios(cfg) == 1) {
+        vec_push(args, str_from("-b"));
+        vec_push(args, str_from("boot/grub/bios.img"));
+        vec_push(args, str_from("-no-emul-boot"));
+        vec_push(args, str_from("-boot-load-size"));
+        vec_push(args, str_from("4"));
+        vec_push(args, str_from("-boot-info-table"));
+    }
+
+    vec_push(args, str_clone(IsoConfig_root_tree(cfg)));
+
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "Generate ISO: ");
+    str_builder_add(sb, IsoConfig_output_path(cfg));
+    var description = str_builder_build(sb);
+
+    return op_command(str_from("xorriso"), args, description, 1, str_from(""));
 }

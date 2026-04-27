@@ -1,0 +1,254 @@
+# executor.cyr — execute SystemOp variants against the live system
+#
+# Each _exec_* dispatcher returns 0 on success, non-zero on failure
+# (typically a syscall errno or child exit status).
+#
+# CAUTION: these are the *destructive* primitives. The CLI gates
+# their invocation behind --i-mean-it. Tests should NEVER call
+# execute_op() — they validate plan output via the planner only.
+
+# ---- Helper: convert vec<Str> args into a null-terminated argv of cstrs ----
+
+fn _build_argv(args) {
+    var n = vec_len(args);
+    var argv = alloc((n + 1) * 8);
+    var i = 0;
+    while (i < n) {
+        store64(argv + i * 8, str_cstr(vec_get(args, i)));
+        i = i + 1;
+    }
+    store64(argv + n * 8, 0);
+    return argv;
+}
+
+# Spawn a command, optionally piping stdin_str into the child's stdin.
+# stdin_str empty == no stdin (just runs the command). Returns child
+# exit status (0 = success).
+fn _exec_with_stdin(args, stdin_str) {
+    var n = vec_len(args);
+    if (n < 1) { return 0 - 1; }
+    var argv = _build_argv(args);
+    var cmd_cstr = load64(argv);
+    var envp = alloc(8);
+    store64(envp, 0);
+
+    var has_stdin = 0;
+    if (str_len(stdin_str) > 0) { has_stdin = 1; }
+
+    var pipefd[16];
+    var rfd = 0 - 1;
+    var wfd = 0 - 1;
+    if (has_stdin == 1) {
+        sys_pipe(&pipefd);
+        rfd = load32(&pipefd);
+        wfd = load32(&pipefd + 4);
+    }
+
+    var pid = sys_fork();
+    if (pid < 0) {
+        if (has_stdin == 1) { sys_close(rfd); sys_close(wfd); }
+        return 0 - 1;
+    }
+    if (pid == 0) {
+        if (has_stdin == 1) {
+            sys_close(wfd);
+            sys_dup2(rfd, 0);
+            sys_close(rfd);
+        }
+        sys_execve(cmd_cstr, argv, envp);
+        sys_exit(127);
+    }
+
+    if (has_stdin == 1) {
+        sys_close(rfd);
+        sys_write(wfd, str_data(stdin_str), str_len(stdin_str));
+        sys_close(wfd);
+    }
+    var stbuf[1];
+    sys_waitpid(pid, &stbuf, 0);
+    var st = load32(&stbuf);
+    if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }
+    return 0 - 1;
+}
+
+# Chown via shell-out (no sys_chown wrapper in stdlib). owner format
+# is "user:group" — passed verbatim to the chown(1) binary.
+fn _chown(path_str, owner_str) {
+    if (str_len(owner_str) == 0) { return 0; }
+    var args = vec_new();
+    vec_push(args, str_from("chown"));
+    vec_push(args, owner_str);
+    vec_push(args, path_str);
+    return _exec_with_stdin(args, str_from(""));
+}
+
+# Recursive mkdir (mkdir -p). Cyrius stdlib has no recursive mkdir
+# helper; shell-out to the mkdir(1) binary. mode bits applied via chmod.
+fn _mkdir_recursive(path_str, mode) {
+    var args = vec_new();
+    vec_push(args, str_from("mkdir"));
+    vec_push(args, str_from("-p"));
+    vec_push(args, path_str);
+    var rc = _exec_with_stdin(args, str_from(""));
+    if (rc != 0) { return rc; }
+    return sys_chmod(str_cstr(path_str), mode);
+}
+
+# ---- Per-variant dispatchers ----
+
+fn _exec_command(p) {
+    var binary = SystemOp_Command_binary(p);
+    var args_vec = SystemOp_Command_args(p);
+    var stdin_str = SystemOp_Command_stdin(p);
+
+    # Prepend binary as argv[0]
+    var full = vec_new();
+    vec_push(full, binary);
+    var n = vec_len(args_vec);
+    var i = 0;
+    while (i < n) {
+        vec_push(full, vec_get(args_vec, i));
+        i = i + 1;
+    }
+    return _exec_with_stdin(full, stdin_str);
+}
+
+fn _exec_write_file(p) {
+    var path = SystemOp_WriteFile_path(p);
+    var content = SystemOp_WriteFile_content(p);
+    var mode = SystemOp_WriteFile_mode(p);
+    var owner = SystemOp_WriteFile_owner(p);
+
+    var path_cstr = str_cstr(path);
+    var fd = sys_open(path_cstr, O_WRONLY + O_CREAT + O_TRUNC, mode);
+    if (fd < 0) { return fd; }
+    var clen = str_len(content);
+    if (clen > 0) {
+        var written = sys_write(fd, str_data(content), clen);
+        if (written != clen) { sys_close(fd); return 0 - 1; }
+    }
+    sys_close(fd);
+
+    # Re-apply mode (open's mode arg is masked by umask)
+    var rc = sys_chmod(path_cstr, mode);
+    if (rc < 0) { return rc; }
+
+    if (str_len(owner) > 0) {
+        return _chown(path, owner);
+    }
+    return 0;
+}
+
+fn _exec_make_dir(p) {
+    var path = SystemOp_MakeDir_path(p);
+    var mode = SystemOp_MakeDir_mode(p);
+    var parents = SystemOp_MakeDir_parents(p);
+    if (parents == 1) { return _mkdir_recursive(path, mode); }
+    var rc = sys_mkdir(str_cstr(path), mode);
+    if (rc < 0) { return rc; }
+    return sys_chmod(str_cstr(path), mode);
+}
+
+fn _exec_symlink(p) {
+    # No sys_symlink wrapper in stdlib; shell out to ln -sfT.
+    var args = vec_new();
+    vec_push(args, str_from("ln"));
+    vec_push(args, str_from("-sfT"));
+    vec_push(args, SystemOp_Symlink_target(p));
+    vec_push(args, SystemOp_Symlink_link(p));
+    return _exec_with_stdin(args, str_from(""));
+}
+
+fn _exec_mount(p) {
+    var device = SystemOp_Mount_device(p);
+    var mount_point = SystemOp_Mount_mount_point(p);
+    var fs_type = SystemOp_Mount_fs_type(p);
+    # options vec is currently informational only — kernel-level options
+    # require parsing into MS_* flag bits + a comma-separated data string.
+    # For now mount with no flags / no data; agnova only ever passes
+    # ["defaults"] (matching mount(8) defaults). Revisit when we need ro/sync/noexec.
+    return sys_mount(
+        str_cstr(device),
+        str_cstr(mount_point),
+        str_cstr(fs_type),
+        0,
+        0
+    );
+}
+
+fn _exec_unmount(p) {
+    return sys_umount2(str_cstr(SystemOp_Unmount_mount_point(p)), 0);
+}
+
+# Top-level dispatch on op tag.
+fn execute_op(op) {
+    var t = tag(op);
+    var p = payload(op);
+    if (t == OP_COMMAND) { return _exec_command(p); }
+    if (t == OP_WRITE_FILE) { return _exec_write_file(p); }
+    if (t == OP_MAKE_DIR) { return _exec_make_dir(p); }
+    if (t == OP_SYMLINK) { return _exec_symlink(p); }
+    if (t == OP_MOUNT) { return _exec_mount(p); }
+    if (t == OP_UNMOUNT) { return _exec_unmount(p); }
+    return 0 - 1;
+}
+
+# Whether this op's failure should abort the install. Only Command
+# carries an explicit fatal flag; the structural ops (mkdir, mount,
+# write, symlink) are always considered fatal because skipping them
+# would leave the rootfs in an inconsistent state.
+fn op_is_fatal(op) {
+    if (tag(op) == OP_COMMAND) { return SystemOp_Command_fatal(payload(op)); }
+    return 1;
+}
+
+# Execute every operation in a phase. Drives the AgnovaInstaller
+# state machine: any fatal failure calls agnova_fail_phase() and stops.
+# Returns 0 if all ops succeeded (or only non-fatal ones failed), -1 on
+# fatal failure.
+fn execute_phase(inst, phase_ops) {
+    var ops = PhaseOps_operations(phase_ops);
+    var n = vec_len(ops);
+    var i = 0;
+    while (i < n) {
+        var op = vec_get(ops, i);
+        var rc = execute_op(op);
+        if (rc != 0) {
+            if (op_is_fatal(op) == 1) {
+                var msg = str_builder_new();
+                str_builder_add_cstr(msg, "op failed (rc=");
+                str_builder_add_int(msg, rc);
+                str_builder_add_cstr(msg, "): ");
+                if (tag(op) == OP_COMMAND) {
+                    str_builder_add(msg, SystemOp_Command_description(payload(op)));
+                }
+                agnova_fail_phase(inst, str_builder_build(msg));
+                return 0 - 1;
+            }
+            # non-fatal: log and continue
+            var warn = str_builder_new();
+            str_builder_add_cstr(warn, "WARN op failed (rc=");
+            str_builder_add_int(warn, rc);
+            str_builder_add_cstr(warn, "): non-fatal, continuing");
+            agnova_log_message(inst, str_builder_build(warn));
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Execute the entire planned install: every PhaseOps in order, advancing
+# the orchestrator's phase between successful runs. Returns 0 on full
+# success, -1 if any fatal op failed (orchestrator state holds details).
+fn execute_all(inst, plans) {
+    var n = vec_len(plans);
+    var i = 0;
+    while (i < n) {
+        var phase_ops = vec_get(plans, i);
+        var rc = execute_phase(inst, phase_ops);
+        if (rc != 0) { return 0 - 1; }
+        agnova_advance_phase(inst);
+        i = i + 1;
+    }
+    return 0;
+}

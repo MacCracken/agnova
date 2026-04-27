@@ -1,22 +1,23 @@
 # agnova — OS installer for AGNOS
-# Ported from 3656 lines of Rust (rust-old/src/)
+# Ported from rust-old/src/ (3656 LOC of Rust).
 #
 # Stdlib auto-included via cyrius.cyml ([deps].stdlib).
-# Submodules included below in dependency order: types is leaf (no deps
-# on other submodules), so it comes first.
+# Submodules included in dependency order: types is leaf,
+# helpers/validation depend on types, partitioning/rootfs depend on
+# both, orchestrator on those, executor on orchestrator, cli on all.
 
 include "src/types.cyr"
+include "src/helpers.cyr"
+include "src/validation.cyr"
+include "src/partitioning.cyr"
+include "src/rootfs.cyr"
+include "src/orchestrator.cyr"
+include "src/executor.cyr"
+include "src/cli.cyr"
 
 fn main() {
     alloc_init();
-    println("agnova ready");
-
-    # Smoke check: confirm types.cyr compiles + symbols are visible.
-    println(phase_str(PHASE_VALIDATE_CONFIG));
-    println(mode_str(MODE_DESKTOP));
-    println(fs_str(FS_EXT4));
-
-    return 0;
+    return cli_main();
 }
 
 var r = main();

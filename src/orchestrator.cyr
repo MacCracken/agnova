@@ -1,0 +1,156 @@
+# orchestrator.cyr — AgnovaInstaller state machine
+#
+# Ported from rust-old/src/lib.rs::AgnovaInstaller
+#
+# Holds runtime state during an install: config, progress, log,
+# completed phases, errors, and the LUKS passphrase (lifted out
+# of DiskLayout so the latter can serialize without leaking secrets).
+
+#derive(accessors)
+struct AgnovaInstaller {
+    config;
+    progress;
+    log;
+    completed_phases;
+    errors;
+    luks_passphrase: Str;
+}
+
+# Phases whose failure is unrecoverable (must abort install)
+fn _phase_recoverable(p) {
+    if (p == PHASE_PARTITION_DISK) { return 0; }
+    if (p == PHASE_SETUP_ENCRYPTION) { return 0; }
+    if (p == PHASE_FORMAT_FILESYSTEMS) { return 0; }
+    if (p == PHASE_INSTALL_BASE) { return 0; }
+    if (p == PHASE_INSTALL_BOOTLOADER) { return 0; }
+    return 1;
+}
+
+# Construct a fresh installer for the given config + LUKS passphrase.
+# Pass empty Str for luks_passphrase if encrypt=0.
+fn agnova_installer_new(config, luks_passphrase) {
+    var p = alloc(sizeof(AgnovaInstaller));
+    store64(p, config);
+    store64(p + 8, install_progress_new(
+        PHASE_VALIDATE_CONFIG,
+        str_from("Preparing installation"),
+        clock_epoch_secs()));
+    store64(p + 16, vec_new());
+    store64(p + 24, vec_new());
+    store64(p + 32, vec_new());
+    store64(p + 40, luks_passphrase);
+    return p;
+}
+
+# Standard disk layout: 512 MB ESP + remaining for root.
+fn agnova_default_disk_layout(device, encrypt) {
+    var parts = vec_new();
+    var esp_flags = vec_new();
+    vec_push(esp_flags, PFLAG_BOOT);
+    vec_push(esp_flags, PFLAG_ESP);
+    vec_push(parts, partition_spec_new(
+        str_from("ESP"), str_from("/boot/efi"), FS_VFAT, 512, 1, esp_flags));
+    vec_push(parts, partition_spec_new(
+        str_from("agnos-root"), str_from("/"), FS_EXT4, 0, 0, vec_new()));
+    return disk_layout_new(device, parts, 1, encrypt);
+}
+
+fn agnova_phase_count() {
+    return PHASE_COUNT;
+}
+
+fn agnova_current_phase(inst) {
+    return InstallProgress_current_phase(AgnovaInstaller_progress(inst));
+}
+
+fn agnova_is_complete(inst) {
+    if (agnova_current_phase(inst) == PHASE_COMPLETE) { return 1; }
+    return 0;
+}
+
+# Advance to the next phase. Returns 1 if advanced, 0 if blocked
+# (non-recoverable error at current phase) or already complete.
+fn agnova_advance_phase(inst) {
+    var current = agnova_current_phase(inst);
+
+    # Block if there's a non-recoverable error at current phase
+    var errs = AgnovaInstaller_errors(inst);
+    var i = 0;
+    var en = vec_len(errs);
+    while (i < en) {
+        var e = vec_get(errs, i);
+        if (InstallError_phase(e) == current) {
+            if (InstallError_recoverable(e) == 0) { return 0; }
+        }
+        i = i + 1;
+    }
+
+    var next = phase_next(current);
+    if (next < 0) { return 0; }
+
+    vec_push(AgnovaInstaller_completed_phases(inst), current);
+    var prog = AgnovaInstaller_progress(inst);
+    InstallProgress_set_current_phase(prog, next);
+
+    # overall_progress = next/PHASE_COUNT * 10000 (basis points)
+    var pct = (next * 10000) / PHASE_COUNT;
+    InstallProgress_set_overall_progress(prog, pct);
+    InstallProgress_set_phase_progress(prog, 0);
+    InstallProgress_set_message(prog, str_from(phase_str(next)));
+
+    return 1;
+}
+
+# Record a failure at the current phase; recoverability is per-phase.
+fn agnova_fail_phase(inst, message) {
+    var phase = agnova_current_phase(inst);
+    var rec = _phase_recoverable(phase);
+    var err = install_error_new(phase, message, rec);
+    vec_push(AgnovaInstaller_errors(inst), err);
+
+    var entry = str_builder_new();
+    str_builder_add_cstr(entry, "ERROR [");
+    str_builder_add_cstr(entry, phase_str(phase));
+    str_builder_add_cstr(entry, "]: ");
+    str_builder_add(entry, message);
+    vec_push(AgnovaInstaller_log(inst), str_builder_build(entry));
+    return 0;
+}
+
+# Build the final InstallResult.
+fn agnova_result(inst) {
+    var prog = AgnovaInstaller_progress(inst);
+    var elapsed = clock_epoch_secs() - InstallProgress_started_at(prog);
+    if (elapsed < 0) { elapsed = 0 - elapsed; }
+
+    var success = 0;
+    if (vec_len(AgnovaInstaller_errors(inst)) == 0) {
+        if (agnova_is_complete(inst) == 1) { success = 1; }
+    }
+
+    var cfg = AgnovaInstaller_config(inst);
+    var packages = InstallConfig_packages(cfg);
+
+    return install_result_new(
+        success,
+        AgnovaInstaller_completed_phases(inst),
+        AgnovaInstaller_errors(inst),
+        elapsed,
+        package_selection_total_count(packages),
+        PackageSelection_total_size_mb(packages)
+    );
+}
+
+fn agnova_log_message(inst, msg) {
+    vec_push(AgnovaInstaller_log(inst), msg);
+    return 0;
+}
+
+# Rough total install time estimate per mode (seconds).
+fn agnova_estimate_install_time(mode) {
+    if (mode == MODE_MINIMAL) { return 120; }
+    if (mode == MODE_SERVER) { return 300; }
+    if (mode == MODE_DESKTOP) { return 480; }
+    if (mode == MODE_CUSTOM) { return 360; }
+    return 360;
+}

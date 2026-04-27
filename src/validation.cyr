@@ -1,0 +1,406 @@
+# validation.cyr — InstallConfig validation for agnova
+#
+# Ported from rust-old/src/validation.rs
+#
+# Returns a tagged Result:
+#   Ok(warnings_vec)  — vec<Str> of non-fatal warnings (may be empty)
+#   Err(message_str) — first hard validation failure as a Str
+#
+# Caller checks tag(result) == OK; on Ok, payload is a vec ptr; on Err,
+# payload is a Str ptr. Mirrors Rust's `Result<Vec<String>>`.
+
+# ---- Internal: char-class predicates ----
+
+fn _is_lower(c) {
+    if (c < 97) { return 0; }
+    if (c > 122) { return 0; }
+    return 1;
+}
+
+fn _is_digit(c) {
+    if (c < 48) { return 0; }
+    if (c > 57) { return 0; }
+    return 1;
+}
+
+fn _is_upper(c) {
+    if (c < 65) { return 0; }
+    if (c > 90) { return 0; }
+    return 1;
+}
+
+fn _is_alpha(c) {
+    if (_is_lower(c) == 1) { return 1; }
+    if (_is_upper(c) == 1) { return 1; }
+    return 0;
+}
+
+fn _is_alnum(c) {
+    if (_is_alpha(c) == 1) { return 1; }
+    if (_is_digit(c) == 1) { return 1; }
+    return 0;
+}
+
+# 1 if every byte of s is alphanumeric or one of '/', '-', '_'.
+fn _all_dev_path_chars(s) {
+    var data = str_data(s);
+    var n = str_len(s);
+    var i = 0;
+    while (i < n) {
+        var c = load8(data + i);
+        var ok = 0;
+        if (_is_alnum(c) == 1) { ok = 1; }
+        if (c == 47) { ok = 1; }
+        if (c == 45) { ok = 1; }
+        if (c == 95) { ok = 1; }
+        if (ok == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# 1 if every byte is in [a-z0-9_-].
+fn _all_lname_chars(s) {
+    var data = str_data(s);
+    var n = str_len(s);
+    var i = 0;
+    while (i < n) {
+        var c = load8(data + i);
+        var ok = 0;
+        if (_is_lower(c) == 1) { ok = 1; }
+        if (_is_digit(c) == 1) { ok = 1; }
+        if (c == 45) { ok = 1; }
+        if (c == 95) { ok = 1; }
+        if (ok == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# 1 if every byte is in [a-zA-Z0-9-] (hostname rule).
+fn _all_hostname_chars(s) {
+    var data = str_data(s);
+    var n = str_len(s);
+    var i = 0;
+    while (i < n) {
+        var c = load8(data + i);
+        var ok = 0;
+        if (_is_alnum(c) == 1) { ok = 1; }
+        if (c == 45) { ok = 1; }
+        if (ok == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# 1 if every byte is in [a-zA-Z0-9-_] (partition label rule).
+fn _all_label_chars(s) {
+    var data = str_data(s);
+    var n = str_len(s);
+    var i = 0;
+    while (i < n) {
+        var c = load8(data + i);
+        var ok = 0;
+        if (_is_alnum(c) == 1) { ok = 1; }
+        if (c == 45) { ok = 1; }
+        if (c == 95) { ok = 1; }
+        if (ok == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# 1 if any byte of s is one of: : ; | & ` \n \0
+fn _has_passwd_dangerous(s) {
+    var data = str_data(s);
+    var n = str_len(s);
+    var i = 0;
+    while (i < n) {
+        var c = load8(data + i);
+        if (c == 58) { return 1; }
+        if (c == 59) { return 1; }
+        if (c == 124) { return 1; }
+        if (c == 38) { return 1; }
+        if (c == 96) { return 1; }
+        if (c == 10) { return 1; }
+        if (c == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# 1 if any byte of s is one of: | ; & ` \n (kernel param dangerous)
+fn _has_kparam_dangerous(s) {
+    var data = str_data(s);
+    var n = str_len(s);
+    var i = 0;
+    while (i < n) {
+        var c = load8(data + i);
+        if (c == 124) { return 1; }
+        if (c == 59) { return 1; }
+        if (c == 38) { return 1; }
+        if (c == 96) { return 1; }
+        if (c == 10) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# 1 if any byte of s is one of: .. (handled separately) ` | & ; \n space
+fn _has_devpath_dangerous(s) {
+    var data = str_data(s);
+    var n = str_len(s);
+    var i = 0;
+    while (i < n) {
+        var c = load8(data + i);
+        if (c == 32) { return 1; }
+        if (c == 59) { return 1; }
+        if (c == 124) { return 1; }
+        if (c == 38) { return 1; }
+        if (c == 96) { return 1; }
+        if (c == 10) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Validate the InstallConfig pointed to by `cfg`.
+# Returns Ok(warnings_vec) or Err(error_message_str).
+fn validate_config(cfg) {
+    var warnings = vec_new();
+
+    var disk = InstallConfig_disk(cfg);
+    var dev = DiskLayout_target_device(disk);
+    var dev_len = str_len(dev);
+
+    # 1. Target device must be set
+    if (dev_len == 0) {
+        return Err(str_from("target device is not set"));
+    }
+
+    # 2. Must start with /dev/
+    if (str_starts_with(dev, str_from("/dev/")) == 0) {
+        return Err(str_from("target device must start with /dev/"));
+    }
+
+    # 3. No "..", and no shell-dangerous chars
+    if (str_contains_cstr(dev, "..") == 1) {
+        return Err(str_from("target device path contains invalid characters"));
+    }
+    if (_has_devpath_dangerous(dev) == 1) {
+        return Err(str_from("target device path contains invalid characters"));
+    }
+
+    # 4. Suffix after /dev/ must be alphanumeric, /, -, _
+    if (dev_len <= 5) {
+        return Err(str_from("target device path contains invalid characters after /dev/"));
+    }
+    var suffix = str_substr(dev, 5, dev_len);
+    if (_all_dev_path_chars(suffix) == 0) {
+        return Err(str_from("target device path contains invalid characters after /dev/"));
+    }
+
+    # 5. Must have at least one partition
+    var parts = DiskLayout_partitions(disk);
+    var pcount = vec_len(parts);
+    if (pcount == 0) {
+        return Err(str_from("no partitions defined"));
+    }
+
+    # 6. Username required
+    var user = InstallConfig_user(cfg);
+    var uname = UserConfig_username(user);
+    var ulen = str_len(uname);
+    if (ulen == 0) {
+        return Err(str_from("username is empty"));
+    }
+
+    # 7. Username cannot be 'root'
+    if (str_eq_cstr(uname, "root") == 1) {
+        return Err(str_from("username cannot be 'root'"));
+    }
+
+    # 8. Length 1..=32
+    if (ulen > 32) {
+        return Err(str_from("username must be 1-32 characters"));
+    }
+
+    # 9. Must start with a-z
+    var udata = str_data(uname);
+    var first = load8(udata);
+    if (_is_lower(first) == 0) {
+        return Err(str_from("username must start with a lowercase letter"));
+    }
+
+    # 10. Chars must be in [a-z0-9_-]
+    if (_all_lname_chars(uname) == 0) {
+        return Err(str_from("username contains invalid characters (allowed: a-z, 0-9, _, -)"));
+    }
+
+    # 11. Hostname required
+    var net = InstallConfig_network(cfg);
+    var hn = NetworkConfig_hostname(net);
+    var hlen = str_len(hn);
+    if (hlen == 0) {
+        return Err(str_from("hostname is empty"));
+    }
+
+    # 12. Hostname length
+    if (hlen > 63) {
+        return Err(str_from("hostname must be 1-63 characters"));
+    }
+
+    # 13. Hostname must not start/end with hyphen
+    var hdata = str_data(hn);
+    if (load8(hdata) == 45) {
+        return Err(str_from("hostname must not start or end with a hyphen"));
+    }
+    if (load8(hdata + hlen - 1) == 45) {
+        return Err(str_from("hostname must not start or end with a hyphen"));
+    }
+
+    # 14. Hostname must not start with dot
+    if (load8(hdata) == 46) {
+        return Err(str_from("hostname must not start with a dot"));
+    }
+
+    # 15. Hostname chars in [a-zA-Z0-9-]
+    if (_all_hostname_chars(hn) == 0) {
+        return Err(str_from("hostname contains invalid characters (allowed: alphanumeric and hyphens)"));
+    }
+
+    # 16. Static network requires static_ip
+    var use_dhcp = NetworkConfig_use_dhcp(net);
+    var sip = NetworkConfig_static_ip(net);
+    if (use_dhcp == 0) {
+        if (str_len(sip) == 0) {
+            return Err(str_from("static network configuration requires a static_ip"));
+        }
+    }
+
+    # 17 + 18. Kernel param checks
+    var boot = InstallConfig_bootloader(cfg);
+    var kparams = BootloaderConfig_kernel_params(boot);
+    var kn = vec_len(kparams);
+    var ki = 0;
+    while (ki < kn) {
+        var p = vec_get(kparams, ki);
+        if (str_contains_cstr(p, "init=") == 1) {
+            return Err(str_from("dangerous kernel parameter detected"));
+        }
+        if (str_contains_cstr(p, "rd.break") == 1) {
+            return Err(str_from("dangerous kernel parameter detected"));
+        }
+        if (str_contains_cstr(p, "single") == 1) {
+            return Err(str_from("dangerous kernel parameter detected"));
+        }
+        if (str_contains_cstr(p, "rescue") == 1) {
+            return Err(str_from("dangerous kernel parameter detected"));
+        }
+        if (str_contains_cstr(p, "break=") == 1) {
+            return Err(str_from("dangerous kernel parameter detected"));
+        }
+        if (_has_kparam_dangerous(p) == 1) {
+            return Err(str_from("kernel parameter contains dangerous character"));
+        }
+        ki = ki + 1;
+    }
+
+    # 19/20/21. Partition labels
+    var pi = 0;
+    while (pi < pcount) {
+        var part = vec_get(parts, pi);
+        var lbl = PartitionSpec_label(part);
+        var llen = str_len(lbl);
+        if (llen == 0) {
+            return Err(str_from("partition has an empty label"));
+        }
+        if (llen > 36) {
+            return Err(str_from("partition label is too long (max 36 chars)"));
+        }
+        if (_all_label_chars(lbl) == 0) {
+            return Err(str_from("partition label contains invalid characters (allowed: a-z, A-Z, 0-9, -, _)"));
+        }
+        pi = pi + 1;
+    }
+
+    # 22. Only the LAST partition may have has_size=0 (fill remaining)
+    pi = 0;
+    while (pi < pcount) {
+        var part = vec_get(parts, pi);
+        if (PartitionSpec_has_size(part) == 0) {
+            if (pi + 1 < pcount) {
+                return Err(str_from("non-last partition has no size (fill remaining only allowed on last partition)"));
+            }
+        }
+        pi = pi + 1;
+    }
+
+    # 23. MBR limited to 4 primary partitions
+    if (DiskLayout_use_gpt(disk) == 0) {
+        if (pcount > 4) {
+            return Err(str_from("MBR partition table limited to 4 primary partitions"));
+        }
+    }
+
+    # 24/25. full_name validation (if non-empty)
+    var fname = UserConfig_full_name(user);
+    var fnlen = str_len(fname);
+    if (fnlen > 0) {
+        if (fnlen > 256) {
+            return Err(str_from("user full_name is too long (max 256 chars)"));
+        }
+        if (_has_passwd_dangerous(fname) == 1) {
+            return Err(str_from("user full_name contains invalid characters"));
+        }
+    }
+
+    # 26/27. Group names
+    var groups = UserConfig_groups(user);
+    var gn = vec_len(groups);
+    var gi = 0;
+    while (gi < gn) {
+        var g = vec_get(groups, gi);
+        var glen = str_len(g);
+        if (glen == 0) {
+            return Err(str_from("group name must be 1-32 characters"));
+        }
+        if (glen > 32) {
+            return Err(str_from("group name must be 1-32 characters"));
+        }
+        if (_all_lname_chars(g) == 0) {
+            return Err(str_from("group name contains invalid characters (allowed: a-z, 0-9, _, -)"));
+        }
+        gi = gi + 1;
+    }
+
+    # 28. Need a root partition
+    var has_root = 0;
+    pi = 0;
+    while (pi < pcount) {
+        var part = vec_get(parts, pi);
+        if (str_eq_cstr(PartitionSpec_mount_point(part), "/") == 1) {
+            has_root = 1;
+        }
+        pi = pi + 1;
+    }
+    if (has_root == 0) {
+        return Err(str_from("no root partition (mount_point = \"/\") defined"));
+    }
+
+    # ---- Warnings (non-fatal) ----
+    var sec = InstallConfig_security(cfg);
+    if (SecurityConfig_enable_luks(sec) == 1) {
+        if (DiskLayout_encrypt(disk) == 0) {
+            vec_push(warnings, str_from("security.enable_luks is true but disk.encrypt is false"));
+        }
+    }
+    if (SecurityConfig_trust_enforcement(sec) == TRUST_PERMISSIVE) {
+        vec_push(warnings, str_from("trust enforcement is set to permissive"));
+    }
+    if (SecurityConfig_firewall_default(sec) == FW_ALLOW) {
+        vec_push(warnings, str_from("firewall default policy is allow — not recommended"));
+    }
+
+    return Ok(warnings);
+}

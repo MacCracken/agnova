@@ -1,0 +1,990 @@
+# rootfs.cyr — root filesystem deployment, packages, bootloader,
+# users, network, locale, security, first-boot, cleanup planners
+#
+# Ported from rust-old/src/rootfs.rs (the largest planner module).
+# Every plan_*_ops returns a PhaseOps ptr.
+
+# ============================================================
+# Constants and helpers
+# ============================================================
+
+# Kernel version that ships with the AGNOS LFS recipe. Single source
+# of truth — boot entries reference this.
+fn kernel_version() {
+    return str_from("6.6.130-agnos");
+}
+
+# Detect whether the *running* (live) system booted via UEFI by probing
+# /sys/firmware/efi. Pure check, no side-effects. Returns 0/1.
+fn is_uefi_system() {
+    var fd = file_open("/sys/firmware/efi", 0, 0);
+    if (fd < 0) { return 0; }
+    file_close(fd);
+    return 1;
+}
+
+# Count how many '/' bytes are in a Str (used for mount-depth sort).
+fn _count_slashes(s) {
+    var data = str_data(s);
+    var n = str_len(s);
+    var i = 0;
+    var count = 0;
+    while (i < n) {
+        if (load8(data + i) == 47) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+# Build a Str of the form "<a>/<b>" (target_root prefix + mount_point).
+fn _join_path(a, b) {
+    var sb = str_builder_new();
+    str_builder_add(sb, a);
+    str_builder_add(sb, b);
+    return str_builder_build(sb);
+}
+
+# Small helper to push a series of cstr literals into a vec<Str>.
+# Saves boilerplate when building static package lists.
+fn _push_cstr(v, c) {
+    vec_push(v, str_from(c));
+    return 0;
+}
+
+# ============================================================
+# default_packages(mode) — the package selection per InstallMode
+# (Ported from rust-old/src/lib.rs::default_packages.)
+# ============================================================
+fn default_packages(mode) {
+    var base = vec_new();
+    _push_cstr(base, "linux-kernel");
+    _push_cstr(base, "linux-firmware");
+    _push_cstr(base, "agnos-init");
+    _push_cstr(base, "agnos-sys");
+    _push_cstr(base, "agnos-common");
+    _push_cstr(base, "agnoshi");
+    _push_cstr(base, "shakti");
+    _push_cstr(base, "daimon");
+    _push_cstr(base, "hoosh");
+    _push_cstr(base, "systemd");
+    _push_cstr(base, "dbus");
+    _push_cstr(base, "networkmanager");
+    _push_cstr(base, "nftables");
+    _push_cstr(base, "openssh");
+    _push_cstr(base, "coreutils");
+    _push_cstr(base, "util-linux");
+    _push_cstr(base, "bash");
+    _push_cstr(base, "zsh");
+    _push_cstr(base, "curl");
+    _push_cstr(base, "wget");
+    _push_cstr(base, "ca-certificates");
+    _push_cstr(base, "gnupg");
+    _push_cstr(base, "tar");
+    _push_cstr(base, "gzip");
+    _push_cstr(base, "xz");
+    _push_cstr(base, "bzip2");
+    _push_cstr(base, "iproute2");
+    _push_cstr(base, "iputils");
+    _push_cstr(base, "less");
+    _push_cstr(base, "nano");
+    _push_cstr(base, "man-pages");
+
+    var mode_pkgs = vec_new();
+    var size = 1200;
+    if (mode == MODE_SERVER) {
+        _push_cstr(mode_pkgs, "hoosh-server");
+        _push_cstr(mode_pkgs, "daimon-server");
+        _push_cstr(mode_pkgs, "ark");
+        _push_cstr(mode_pkgs, "nous");
+        _push_cstr(mode_pkgs, "prometheus-node-exporter");
+        _push_cstr(mode_pkgs, "fail2ban");
+        _push_cstr(mode_pkgs, "tmux");
+        size = 2400;
+    }
+    if (mode == MODE_DESKTOP) {
+        _push_cstr(mode_pkgs, "aethersafha");
+        _push_cstr(mode_pkgs, "pipewire");
+        _push_cstr(mode_pkgs, "wireplumber");
+        _push_cstr(mode_pkgs, "mesa");
+        _push_cstr(mode_pkgs, "vulkan-loader");
+        _push_cstr(mode_pkgs, "fonts-noto");
+        _push_cstr(mode_pkgs, "fonts-jetbrains-mono");
+        _push_cstr(mode_pkgs, "ark");
+        _push_cstr(mode_pkgs, "nous");
+        _push_cstr(mode_pkgs, "hoosh-server");
+        _push_cstr(mode_pkgs, "daimon-server");
+        _push_cstr(mode_pkgs, "xdg-utils");
+        _push_cstr(mode_pkgs, "nautilus");
+        _push_cstr(mode_pkgs, "evince");
+        _push_cstr(mode_pkgs, "firefox");
+        size = 4800;
+    }
+    if (mode == MODE_MINIMAL) { size = 800; }
+    # MODE_CUSTOM stays at default 1200
+
+    return package_selection_new(base, mode_pkgs, vec_new(), size);
+}
+
+# ============================================================
+# kernel_cmdline(cfg) — built joined kernel-line string.
+# Merges bootloader.kernel_params + default_kernel_params(security)
+# (no duplicates) + root device.
+# ============================================================
+fn kernel_cmdline(cfg) {
+    var disk = InstallConfig_disk(cfg);
+    var boot = InstallConfig_bootloader(cfg);
+    var sec = InstallConfig_security(cfg);
+
+    # Start with explicit kernel_params (we'll add security defaults next)
+    var base = BootloaderConfig_kernel_params(boot);
+    var merged = vec_new();
+    var bn = vec_len(base);
+    var i = 0;
+    while (i < bn) {
+        vec_push(merged, vec_get(base, i));
+        i = i + 1;
+    }
+
+    # Security-derived params, dedup against merged
+    var sec_params = default_kernel_params(sec);
+    var sn = vec_len(sec_params);
+    i = 0;
+    while (i < sn) {
+        var p = vec_get(sec_params, i);
+        var dup = 0;
+        var j = 0;
+        var mn = vec_len(merged);
+        while (j < mn) {
+            if (str_eq(vec_get(merged, j), p) == 1) {
+                dup = 1;
+                j = mn;
+            } else {
+                j = j + 1;
+            }
+        }
+        if (dup == 0) { vec_push(merged, p); }
+        i = i + 1;
+    }
+
+    # Root device
+    if (DiskLayout_encrypt(disk) == 1) {
+        vec_push(merged, str_from("root=/dev/mapper/agnos-root"));
+    } else {
+        vec_push(merged, str_from("root=LABEL=agnos-root"));
+    }
+
+    # Join with single space
+    var sb = str_builder_new();
+    var mn2 = vec_len(merged);
+    i = 0;
+    while (i < mn2) {
+        if (i > 0) { str_builder_add_byte(sb, 32); }
+        str_builder_add(sb, vec_get(merged, i));
+        i = i + 1;
+    }
+    return str_builder_build(sb);
+}
+
+# ============================================================
+# Phase: Mount filesystems
+# ============================================================
+fn plan_mount_ops(cfg, target_root) {
+    var disk = InstallConfig_disk(cfg);
+    var device = DiskLayout_target_device(disk);
+    var partitions = DiskLayout_partitions(disk);
+    var n = vec_len(partitions);
+    var ops = vec_new();
+
+    # Build (orig_idx, depth) pairs, then insertion-sort by depth ascending
+    # (root mp == "/" gets depth 0 by special case).
+    var pairs = vec_new();
+    var i = 0;
+    while (i < n) {
+        var part = vec_get(partitions, i);
+        var depth = _count_slashes(PartitionSpec_mount_point(part));
+        if (str_eq_cstr(PartitionSpec_mount_point(part), "/") == 1) { depth = 0; }
+        # Pack (idx, depth) into 16 bytes
+        var p = alloc(16);
+        store64(p, i);
+        store64(p + 8, depth);
+        vec_push(pairs, p);
+        i = i + 1;
+    }
+
+    # Insertion sort
+    i = 1;
+    while (i < n) {
+        var k = i;
+        while (k > 0) {
+            var a = vec_get(pairs, k - 1);
+            var b = vec_get(pairs, k);
+            if (load64(a + 8) > load64(b + 8)) {
+                vec_set(pairs, k - 1, b);
+                vec_set(pairs, k, a);
+                k = k - 1;
+            } else {
+                k = 0;
+            }
+        }
+        i = i + 1;
+    }
+
+    # Emit mkdir+mount in sorted order (swap → swapon, others → mount)
+    i = 0;
+    while (i < n) {
+        var pair = vec_get(pairs, i);
+        var idx = load64(pair);
+        var part = vec_get(partitions, idx);
+        var fs = PartitionSpec_filesystem(part);
+
+        if (fs == FS_SWAP) {
+            var sw_args = vec_new();
+            vec_push(sw_args, partition_device(device, idx));
+            var sw_desc = str_builder_new();
+            str_builder_add_cstr(sw_desc, "Activate swap (");
+            str_builder_add(sw_desc, PartitionSpec_label(part));
+            str_builder_add_cstr(sw_desc, ")");
+            vec_push(ops, op_command(
+                str_from("swapon"), sw_args, str_builder_build(sw_desc), 0, str_from("")));
+        } else {
+            var mp = PartitionSpec_mount_point(part);
+            var full = _join_path(target_root, mp);
+            vec_push(ops, op_make_dir(full, 493, 1));
+
+            var part_dev = partition_device(device, idx);
+            if (DiskLayout_encrypt(disk) == 1) {
+                if (str_eq_cstr(mp, "/") == 1) {
+                    part_dev = str_from("/dev/mapper/agnos-root");
+                }
+            }
+            var mount_options = vec_new();
+            vec_push(mount_options, str_from("defaults"));
+            vec_push(ops, op_mount(part_dev, _join_path(target_root, mp),
+                str_from(fs_str(fs)), mount_options));
+        }
+        i = i + 1;
+    }
+
+    return phase_ops_new(PHASE_MOUNT_FILESYSTEMS, str_from("Mount target filesystems"), ops);
+}
+
+# ============================================================
+# Phase: Install base system (mkdirs + tarball extract + ark fallback)
+# ============================================================
+fn plan_install_base_ops(cfg, target_root) {
+    var ops = vec_new();
+    var dirs = vec_new();
+    _push_cstr(dirs, "bin");
+    _push_cstr(dirs, "sbin");
+    _push_cstr(dirs, "lib");
+    _push_cstr(dirs, "lib64");
+    _push_cstr(dirs, "usr/bin");
+    _push_cstr(dirs, "usr/sbin");
+    _push_cstr(dirs, "usr/lib");
+    _push_cstr(dirs, "etc");
+    _push_cstr(dirs, "var/log");
+    _push_cstr(dirs, "var/lib/agnos/ark/installed");
+    _push_cstr(dirs, "tmp");
+    _push_cstr(dirs, "proc");
+    _push_cstr(dirs, "sys");
+    _push_cstr(dirs, "dev");
+    _push_cstr(dirs, "run");
+    _push_cstr(dirs, "home");
+    _push_cstr(dirs, "root");
+    _push_cstr(dirs, "boot");
+
+    var dn = vec_len(dirs);
+    var i = 0;
+    while (i < dn) {
+        var d = vec_get(dirs, i);
+        var sb = str_builder_new();
+        str_builder_add(sb, target_root);
+        str_builder_add_byte(sb, 47);
+        str_builder_add(sb, d);
+        var path = str_builder_build(sb);
+        # /tmp gets sticky 1777, others 755
+        var mode = 493;
+        if (str_eq_cstr(d, "tmp") == 1) { mode = 1023; }
+        vec_push(ops, op_make_dir(path, mode, 1));
+        i = i + 1;
+    }
+
+    # Extract base system tarball
+    var tar_args = vec_new();
+    _push_cstr(tar_args, "-xf");
+    _push_cstr(tar_args, "/run/agnos/installer/base-system.tar.zst");
+    _push_cstr(tar_args, "--zstd");
+    _push_cstr(tar_args, "-C");
+    vec_push(tar_args, str_clone(target_root));
+    vec_push(ops, op_command(
+        str_from("tar"), tar_args, str_from("Extract base system tarball"), 1, str_from("")));
+
+    # Fallback: ark install of base packages (non-fatal if tarball worked)
+    var ark_args = vec_new();
+    _push_cstr(ark_args, "--root");
+    vec_push(ark_args, str_clone(target_root));
+    _push_cstr(ark_args, "--packages");
+    _push_cstr(ark_args, "/run/agnos/installer/packages/");
+    vec_push(ops, op_command(
+        str_from("ark-install.sh"), ark_args,
+        str_from("Install base .ark packages (fallback)"), 0, str_from("")));
+
+    return phase_ops_new(PHASE_INSTALL_BASE, str_from("Deploy AGNOS base system"), ops);
+}
+
+# ============================================================
+# Phase: Install mode-specific + extra packages via ark
+# ============================================================
+fn plan_install_packages_ops(cfg, target_root) {
+    var mode = InstallConfig_mode(cfg);
+    var packages = default_packages(mode);
+    var ops = vec_new();
+
+    var mode_pkgs = PackageSelection_mode_packages(packages);
+    if (vec_len(mode_pkgs) > 0) {
+        var args = vec_new();
+        _push_cstr(args, "install");
+        _push_cstr(args, "--root");
+        vec_push(args, str_clone(target_root));
+        _push_cstr(args, "--no-confirm");
+        var mn = vec_len(mode_pkgs);
+        var i = 0;
+        while (i < mn) {
+            vec_push(args, str_clone(vec_get(mode_pkgs, i)));
+            i = i + 1;
+        }
+        var desc = str_builder_new();
+        str_builder_add_cstr(desc, "Install ");
+        str_builder_add_cstr(desc, mode_str(mode));
+        str_builder_add_cstr(desc, " mode packages");
+        vec_push(ops, op_command(
+            str_from("ark"), args, str_builder_build(desc), 1, str_from("")));
+    }
+
+    var extra = PackageSelection_extra_packages(packages);
+    if (vec_len(extra) > 0) {
+        var args2 = vec_new();
+        _push_cstr(args2, "install");
+        _push_cstr(args2, "--root");
+        vec_push(args2, str_clone(target_root));
+        _push_cstr(args2, "--no-confirm");
+        var en = vec_len(extra);
+        var j = 0;
+        while (j < en) {
+            vec_push(args2, str_clone(vec_get(extra, j)));
+            j = j + 1;
+        }
+        vec_push(ops, op_command(
+            str_from("ark"), args2,
+            str_from("Install extra user-selected packages"), 0, str_from("")));
+    }
+
+    var phase_desc = str_builder_new();
+    str_builder_add_cstr(phase_desc, "Install packages for ");
+    str_builder_add_cstr(phase_desc, mode_str(mode));
+    str_builder_add_cstr(phase_desc, " mode");
+    return phase_ops_new(PHASE_INSTALL_PACKAGES, str_builder_build(phase_desc), ops);
+}
+
+# ============================================================
+# Phase: Install bootloader (GRUB2 or systemd-boot)
+# ============================================================
+fn plan_bootloader_ops(cfg, target_root) {
+    var boot = InstallConfig_bootloader(cfg);
+    var disk = InstallConfig_disk(cfg);
+    var kver = kernel_version();
+    var cmdline = kernel_cmdline(cfg);
+    var ops = vec_new();
+    var uefi = is_uefi_system();
+    var bt = BootloaderConfig_bootloader_type(boot);
+
+    if (bt == BOOT_GRUB2) {
+        if (uefi == 1) {
+            var args = vec_new();
+            _push_cstr(args, "--target=x86_64-efi");
+            var efi_arg = str_builder_new();
+            str_builder_add_cstr(efi_arg, "--efi-directory=");
+            str_builder_add(efi_arg, target_root);
+            str_builder_add_cstr(efi_arg, "/boot/efi");
+            vec_push(args, str_builder_build(efi_arg));
+            var bd_arg = str_builder_new();
+            str_builder_add_cstr(bd_arg, "--boot-directory=");
+            str_builder_add(bd_arg, target_root);
+            str_builder_add_cstr(bd_arg, "/boot");
+            vec_push(args, str_builder_build(bd_arg));
+            _push_cstr(args, "--bootloader-id=AGNOS");
+            vec_push(ops, op_command(
+                str_from("grub-install"), args,
+                str_from("Install GRUB EFI bootloader"), 1, str_from("")));
+        } else {
+            var args2 = vec_new();
+            _push_cstr(args2, "--target=i386-pc");
+            var bd_arg2 = str_builder_new();
+            str_builder_add_cstr(bd_arg2, "--boot-directory=");
+            str_builder_add(bd_arg2, target_root);
+            str_builder_add_cstr(bd_arg2, "/boot");
+            vec_push(args2, str_builder_build(bd_arg2));
+            vec_push(args2, str_clone(DiskLayout_target_device(disk)));
+            vec_push(ops, op_command(
+                str_from("grub-install"), args2,
+                str_from("Install GRUB BIOS bootloader"), 1, str_from("")));
+        }
+
+        # Generate grub.cfg
+        var grub_cfg = str_builder_new();
+        str_builder_add_cstr(grub_cfg, "# AGNOS GRUB configuration\n");
+        str_builder_add_cstr(grub_cfg, "set default=");
+        str_builder_add(grub_cfg, BootloaderConfig_default_entry(boot));
+        str_builder_add_cstr(grub_cfg, "\nset timeout=");
+        str_builder_add_int(grub_cfg, BootloaderConfig_timeout_secs(boot));
+        str_builder_add_cstr(grub_cfg, "\n\nmenuentry \"AGNOS\" {\n    linux /vmlinuz-");
+        str_builder_add(grub_cfg, kver);
+        str_builder_add_byte(grub_cfg, 32);
+        str_builder_add(grub_cfg, cmdline);
+        str_builder_add_cstr(grub_cfg, "\n    initrd /initramfs-");
+        str_builder_add(grub_cfg, kver);
+        str_builder_add_cstr(grub_cfg, ".img\n}\n\nmenuentry \"AGNOS (rescue)\" {\n    linux /vmlinuz-");
+        str_builder_add(grub_cfg, kver);
+        str_builder_add_byte(grub_cfg, 32);
+        str_builder_add(grub_cfg, cmdline);
+        str_builder_add_cstr(grub_cfg, " single\n    initrd /initramfs-");
+        str_builder_add(grub_cfg, kver);
+        str_builder_add_cstr(grub_cfg, ".img\n}\n");
+
+        var gdir = str_builder_new();
+        str_builder_add(gdir, target_root);
+        str_builder_add_cstr(gdir, "/boot/grub");
+        vec_push(ops, op_make_dir(str_builder_build(gdir), 493, 1));
+
+        var gpath = str_builder_new();
+        str_builder_add(gpath, target_root);
+        str_builder_add_cstr(gpath, "/boot/grub/grub.cfg");
+        vec_push(ops, op_write_file(
+            str_builder_build(gpath), str_builder_build(grub_cfg),
+            420, str_from("root:root")));
+    }
+
+    if (bt == BOOT_SYSTEMD) {
+        var args = vec_new();
+        var esp = str_builder_new();
+        str_builder_add_cstr(esp, "--esp-path=");
+        str_builder_add(esp, target_root);
+        str_builder_add_cstr(esp, "/boot/efi");
+        vec_push(args, str_builder_build(esp));
+        _push_cstr(args, "install");
+        vec_push(ops, op_command(
+            str_from("bootctl"), args, str_from("Install systemd-boot"), 1, str_from("")));
+
+        # Loader config dir + loader.conf
+        var ldir = str_builder_new();
+        str_builder_add(ldir, target_root);
+        str_builder_add_cstr(ldir, "/boot/efi/loader");
+        vec_push(ops, op_make_dir(str_builder_build(ldir), 493, 1));
+
+        var lcfg = str_builder_new();
+        str_builder_add_cstr(lcfg, "default agnos.conf\ntimeout ");
+        str_builder_add_int(lcfg, BootloaderConfig_timeout_secs(boot));
+        str_builder_add_cstr(lcfg, "\neditor no\n");
+
+        var lpath = str_builder_new();
+        str_builder_add(lpath, target_root);
+        str_builder_add_cstr(lpath, "/boot/efi/loader/loader.conf");
+        vec_push(ops, op_write_file(
+            str_builder_build(lpath), str_builder_build(lcfg),
+            420, str_from("root:root")));
+
+        # Entries dir + agnos.conf + agnos-rescue.conf
+        var edir = str_builder_new();
+        str_builder_add(edir, target_root);
+        str_builder_add_cstr(edir, "/boot/efi/loader/entries");
+        vec_push(ops, op_make_dir(str_builder_build(edir), 493, 1));
+
+        var entry = str_builder_new();
+        str_builder_add_cstr(entry, "title   AGNOS\nlinux   /vmlinuz-");
+        str_builder_add(entry, kver);
+        str_builder_add_cstr(entry, "\ninitrd  /initramfs-");
+        str_builder_add(entry, kver);
+        str_builder_add_cstr(entry, ".img\noptions ");
+        str_builder_add(entry, cmdline);
+        str_builder_add_byte(entry, 10);
+        var epath = str_builder_new();
+        str_builder_add(epath, target_root);
+        str_builder_add_cstr(epath, "/boot/efi/loader/entries/agnos.conf");
+        vec_push(ops, op_write_file(
+            str_builder_build(epath), str_builder_build(entry),
+            420, str_from("root:root")));
+
+        var rentry = str_builder_new();
+        str_builder_add_cstr(rentry, "title   AGNOS (rescue)\nlinux   /vmlinuz-");
+        str_builder_add(rentry, kver);
+        str_builder_add_cstr(rentry, "\ninitrd  /initramfs-");
+        str_builder_add(rentry, kver);
+        str_builder_add_cstr(rentry, ".img\noptions ");
+        str_builder_add(rentry, cmdline);
+        str_builder_add_cstr(rentry, " single\n");
+        var rpath = str_builder_new();
+        str_builder_add(rpath, target_root);
+        str_builder_add_cstr(rpath, "/boot/efi/loader/entries/agnos-rescue.conf");
+        vec_push(ops, op_write_file(
+            str_builder_build(rpath), str_builder_build(rentry),
+            420, str_from("root:root")));
+    }
+
+    return phase_ops_new(PHASE_INSTALL_BOOTLOADER, str_from("Install bootloader"), ops);
+}
+
+# ============================================================
+# Phase: Create user account
+# ============================================================
+fn plan_user_ops(cfg, target_root) {
+    var user = InstallConfig_user(cfg);
+    var ops = vec_new();
+    var username = UserConfig_username(user);
+
+    # useradd args
+    var args = vec_new();
+    _push_cstr(args, "--root");
+    vec_push(args, str_clone(target_root));
+    _push_cstr(args, "-m");
+    _push_cstr(args, "-s");
+    vec_push(args, str_clone(UserConfig_shell(user)));
+    var fname = UserConfig_full_name(user);
+    if (str_len(fname) > 0) {
+        _push_cstr(args, "-c");
+        vec_push(args, str_clone(fname));
+    }
+    var groups = UserConfig_groups(user);
+    if (vec_len(groups) > 0) {
+        _push_cstr(args, "-G");
+        var gjoin = str_builder_new();
+        var gn = vec_len(groups);
+        var i = 0;
+        while (i < gn) {
+            if (i > 0) { str_builder_add_byte(gjoin, 44); }
+            str_builder_add(gjoin, vec_get(groups, i));
+            i = i + 1;
+        }
+        vec_push(args, str_builder_build(gjoin));
+    }
+    vec_push(args, str_clone(username));
+
+    var ud = str_builder_new();
+    str_builder_add_cstr(ud, "Create user '");
+    str_builder_add(ud, username);
+    str_builder_add_cstr(ud, "'");
+    vec_push(ops, op_command(
+        str_from("useradd"), args, str_builder_build(ud), 1, str_from("")));
+
+    # SSH keys
+    var keys = UserConfig_ssh_keys(user);
+    if (vec_len(keys) > 0) {
+        var ssh_dir = str_builder_new();
+        str_builder_add(ssh_dir, target_root);
+        str_builder_add_cstr(ssh_dir, "/home/");
+        str_builder_add(ssh_dir, username);
+        str_builder_add_cstr(ssh_dir, "/.ssh");
+        var ssh_dir_str = str_builder_build(ssh_dir);
+        vec_push(ops, op_make_dir(ssh_dir_str, 448, 1));
+
+        var keys_sb = str_builder_new();
+        var kn = vec_len(keys);
+        var ki = 0;
+        while (ki < kn) {
+            str_builder_add(keys_sb, vec_get(keys, ki));
+            str_builder_add_byte(keys_sb, 10);
+            ki = ki + 1;
+        }
+        var auth_path = str_builder_new();
+        str_builder_add(auth_path, target_root);
+        str_builder_add_cstr(auth_path, "/home/");
+        str_builder_add(auth_path, username);
+        str_builder_add_cstr(auth_path, "/.ssh/authorized_keys");
+        var owner = str_builder_new();
+        str_builder_add(owner, username);
+        str_builder_add_byte(owner, 58);
+        str_builder_add(owner, username);
+        vec_push(ops, op_write_file(
+            str_builder_build(auth_path), str_builder_build(keys_sb),
+            384, str_builder_build(owner)));
+    }
+
+    # sudo (wheel group)
+    if (UserConfig_enable_sudo(user) == 1) {
+        var sargs = vec_new();
+        _push_cstr(sargs, "--root");
+        vec_push(sargs, str_clone(target_root));
+        _push_cstr(sargs, "-aG");
+        _push_cstr(sargs, "wheel");
+        vec_push(sargs, str_clone(username));
+        var sd = str_builder_new();
+        str_builder_add_cstr(sd, "Add '");
+        str_builder_add(sd, username);
+        str_builder_add_cstr(sd, "' to wheel group");
+        vec_push(ops, op_command(
+            str_from("usermod"), sargs, str_builder_build(sd), 0, str_from("")));
+    }
+
+    var phase_desc = str_builder_new();
+    str_builder_add_cstr(phase_desc, "Create user ");
+    str_builder_add(phase_desc, username);
+    return phase_ops_new(PHASE_CREATE_USER, str_builder_build(phase_desc), ops);
+}
+
+# ============================================================
+# Phase: Configure network (hostname, hosts, resolv.conf, networkd)
+# ============================================================
+fn plan_network_ops(cfg, target_root) {
+    var net = InstallConfig_network(cfg);
+    var hn = NetworkConfig_hostname(net);
+    var ops = vec_new();
+
+    # /etc/hostname
+    var hpath = str_builder_new();
+    str_builder_add(hpath, target_root);
+    str_builder_add_cstr(hpath, "/etc/hostname");
+    vec_push(ops, op_write_file(
+        str_builder_build(hpath), generate_hostname_config(hn), 420, str_from("")));
+
+    # /etc/hosts
+    var hosts = str_builder_new();
+    str_builder_add_cstr(hosts, "127.0.0.1   localhost\n::1         localhost\n127.0.1.1   ");
+    str_builder_add(hosts, hn);
+    str_builder_add_byte(hosts, 10);
+    var hosts_path = str_builder_new();
+    str_builder_add(hosts_path, target_root);
+    str_builder_add_cstr(hosts_path, "/etc/hosts");
+    vec_push(ops, op_write_file(
+        str_builder_build(hosts_path), str_builder_build(hosts), 420, str_from("")));
+
+    # resolv.conf
+    var dns = NetworkConfig_dns(net);
+    if (vec_len(dns) > 0) {
+        var resolv = str_builder_new();
+        var dn = vec_len(dns);
+        var i = 0;
+        while (i < dn) {
+            str_builder_add_cstr(resolv, "nameserver ");
+            str_builder_add(resolv, vec_get(dns, i));
+            str_builder_add_byte(resolv, 10);
+            i = i + 1;
+        }
+        var rpath = str_builder_new();
+        str_builder_add(rpath, target_root);
+        str_builder_add_cstr(rpath, "/etc/resolv.conf");
+        vec_push(ops, op_write_file(
+            str_builder_build(rpath), str_builder_build(resolv), 420, str_from("")));
+    }
+
+    # Static IP via systemd-networkd
+    if (NetworkConfig_use_dhcp(net) == 0) {
+        var sip = NetworkConfig_static_ip(net);
+        if (str_len(sip) > 0) {
+            var nw = str_builder_new();
+            str_builder_add_cstr(nw, "[Match]\nName=eth0\n\n[Network]\nAddress=");
+            str_builder_add(nw, sip);
+            str_builder_add_byte(nw, 10);
+            var gw = NetworkConfig_gateway(net);
+            if (str_len(gw) > 0) {
+                str_builder_add_cstr(nw, "Gateway=");
+                str_builder_add(nw, gw);
+                str_builder_add_byte(nw, 10);
+            }
+            var dn2 = vec_len(dns);
+            var j = 0;
+            while (j < dn2) {
+                str_builder_add_cstr(nw, "DNS=");
+                str_builder_add(nw, vec_get(dns, j));
+                str_builder_add_byte(nw, 10);
+                j = j + 1;
+            }
+            var nwd = str_builder_new();
+            str_builder_add(nwd, target_root);
+            str_builder_add_cstr(nwd, "/etc/systemd/network");
+            vec_push(ops, op_make_dir(str_builder_build(nwd), 493, 1));
+            var npath = str_builder_new();
+            str_builder_add(npath, target_root);
+            str_builder_add_cstr(npath, "/etc/systemd/network/10-static.network");
+            vec_push(ops, op_write_file(
+                str_builder_build(npath), str_builder_build(nw), 420, str_from("")));
+        }
+    }
+
+    return phase_ops_new(PHASE_CONFIGURE_SYSTEM, str_from("Configure network"), ops);
+}
+
+# ============================================================
+# Phase: Locale + timezone + machine-id + fstab
+# ============================================================
+fn plan_locale_ops(cfg, target_root) {
+    var ops = vec_new();
+
+    # locale.conf
+    var lc = str_builder_new();
+    str_builder_add_cstr(lc, "LANG=");
+    str_builder_add(lc, InstallConfig_locale(cfg));
+    str_builder_add_byte(lc, 10);
+    var lpath = str_builder_new();
+    str_builder_add(lpath, target_root);
+    str_builder_add_cstr(lpath, "/etc/locale.conf");
+    vec_push(ops, op_write_file(
+        str_builder_build(lpath), str_builder_build(lc), 420, str_from("")));
+
+    # /etc/localtime symlink → /usr/share/zoneinfo/<tz>
+    var tz_target = str_builder_new();
+    str_builder_add_cstr(tz_target, "/usr/share/zoneinfo/");
+    str_builder_add(tz_target, InstallConfig_timezone(cfg));
+    var lt_path = str_builder_new();
+    str_builder_add(lt_path, target_root);
+    str_builder_add_cstr(lt_path, "/etc/localtime");
+    vec_push(ops, op_symlink(str_builder_build(tz_target), str_builder_build(lt_path)));
+
+    # machine-id
+    var mid = str_builder_new();
+    str_builder_add(mid, generate_machine_id());
+    str_builder_add_byte(mid, 10);
+    var mpath = str_builder_new();
+    str_builder_add(mpath, target_root);
+    str_builder_add_cstr(mpath, "/etc/machine-id");
+    vec_push(ops, op_write_file(
+        str_builder_build(mpath), str_builder_build(mid), 292, str_from("")));
+
+    # fstab
+    var disk = InstallConfig_disk(cfg);
+    var fstab = generate_fstab(DiskLayout_partitions(disk), DiskLayout_encrypt(disk));
+    var fpath = str_builder_new();
+    str_builder_add(fpath, target_root);
+    str_builder_add_cstr(fpath, "/etc/fstab");
+    vec_push(ops, op_write_file(str_builder_build(fpath), fstab, 420, str_from("")));
+
+    return phase_ops_new(PHASE_CONFIGURE_SYSTEM, str_from("Configure locale and timezone"), ops);
+}
+
+# ============================================================
+# Phase: Security hardening (nftables, IMA, sysctl)
+# ============================================================
+fn plan_security_ops(cfg, target_root) {
+    var sec = InstallConfig_security(cfg);
+    var ops = vec_new();
+
+    if (SecurityConfig_firewall_default(sec) == FW_DENY) {
+        var nft = str_builder_new();
+        str_builder_add_cstr(nft, "#!/usr/sbin/nft -f\nflush ruleset\ntable inet filter {\n    chain input {\n        type filter hook input priority 0; policy drop;\n        iif lo accept\n        ct state established,related accept\n        tcp dport 22 accept comment \"SSH\"\n        icmp type echo-request accept\n    }\n    chain forward {\n        type filter hook forward priority 0; policy drop;\n    }\n    chain output {\n        type filter hook output priority 0; policy accept;\n    }\n}\n");
+        var npath = str_builder_new();
+        str_builder_add(npath, target_root);
+        str_builder_add_cstr(npath, "/etc/nftables.conf");
+        vec_push(ops, op_write_file(
+            str_builder_build(npath), str_builder_build(nft), 384, str_from("root:root")));
+    }
+
+    if (SecurityConfig_enable_dmverity(sec) == 1) {
+        var idir = str_builder_new();
+        str_builder_add(idir, target_root);
+        str_builder_add_cstr(idir, "/etc/ima");
+        vec_push(ops, op_make_dir(str_builder_build(idir), 448, 1));
+        var ipath = str_builder_new();
+        str_builder_add(ipath, target_root);
+        str_builder_add_cstr(ipath, "/etc/ima/policy.conf");
+        vec_push(ops, op_write_file(
+            str_builder_build(ipath),
+            str_from("measure func=BPRM_CHECK\nmeasure func=FILE_MMAP mask=MAY_EXEC\n"),
+            384, str_from("root:root")));
+    }
+
+    var sysctl = str_from("# AGNOS security defaults\nkernel.kptr_restrict=2\nkernel.dmesg_restrict=1\nkernel.perf_event_paranoid=3\nnet.ipv4.conf.all.rp_filter=1\nnet.ipv4.conf.all.send_redirects=0\nnet.ipv4.conf.all.accept_redirects=0\nnet.ipv6.conf.all.accept_redirects=0\n");
+    var spath = str_builder_new();
+    str_builder_add(spath, target_root);
+    str_builder_add_cstr(spath, "/etc/sysctl.d/99-agnos-hardening.conf");
+    vec_push(ops, op_write_file(
+        str_builder_build(spath), sysctl, 420, str_from("root:root")));
+
+    return phase_ops_new(PHASE_SETUP_SECURITY, str_from("Configure security hardening"), ops);
+}
+
+# ============================================================
+# Phase: First-boot setup (argonaut services + marker)
+# ============================================================
+fn plan_first_boot_ops(cfg, target_root) {
+    var mode = InstallConfig_mode(cfg);
+    var ops = vec_new();
+
+    var services = vec_new();
+    if (mode == MODE_SERVER) {
+        _push_cstr(services, "daimon");
+        _push_cstr(services, "hoosh");
+        _push_cstr(services, "aegis");
+        _push_cstr(services, "nftables");
+        _push_cstr(services, "sshd");
+        _push_cstr(services, "networkmanager");
+    }
+    if (mode == MODE_DESKTOP) {
+        _push_cstr(services, "daimon");
+        _push_cstr(services, "hoosh");
+        _push_cstr(services, "aegis");
+        _push_cstr(services, "nftables");
+        _push_cstr(services, "sshd");
+        _push_cstr(services, "networkmanager");
+    }
+    if (mode == MODE_MINIMAL) {
+        _push_cstr(services, "nftables");
+        _push_cstr(services, "sshd");
+        _push_cstr(services, "networkmanager");
+    }
+    if (mode == MODE_CUSTOM) {
+        _push_cstr(services, "nftables");
+        _push_cstr(services, "sshd");
+        _push_cstr(services, "networkmanager");
+    }
+
+    var sn = vec_len(services);
+    var i = 0;
+    while (i < sn) {
+        var svc = vec_get(services, i);
+        var args = vec_new();
+        vec_push(args, str_clone(target_root));
+        _push_cstr(args, "argonaut");
+        _push_cstr(args, "enable");
+        vec_push(args, str_clone(svc));
+        var d = str_builder_new();
+        str_builder_add_cstr(d, "Enable ");
+        str_builder_add(d, svc);
+        str_builder_add_cstr(d, " service");
+        vec_push(ops, op_command(
+            str_from("chroot"), args, str_builder_build(d), 0, str_from("")));
+        i = i + 1;
+    }
+
+    if (mode == MODE_DESKTOP) {
+        var args = vec_new();
+        vec_push(args, str_clone(target_root));
+        _push_cstr(args, "argonaut");
+        _push_cstr(args, "enable");
+        _push_cstr(args, "aethersafha");
+        vec_push(ops, op_command(
+            str_from("chroot"), args,
+            str_from("Enable desktop compositor"), 0, str_from("")));
+    }
+
+    # First-boot marker file
+    var fb = str_builder_new();
+    str_builder_add(fb, target_root);
+    str_builder_add_cstr(fb, "/etc/agnos/first-boot");
+    vec_push(ops, op_write_file(
+        str_builder_build(fb), str_from("1\n"), 420, str_from("root:root")));
+
+    return phase_ops_new(PHASE_FIRST_BOOT_SETUP, str_from("Configure first-boot services"), ops);
+}
+
+# ============================================================
+# Phase: Cleanup (sync + unmount in reverse depth + close LUKS)
+# ============================================================
+fn plan_cleanup_ops(cfg, target_root) {
+    var disk = InstallConfig_disk(cfg);
+    var device = DiskLayout_target_device(disk);
+    var partitions = DiskLayout_partitions(disk);
+    var n = vec_len(partitions);
+    var ops = vec_new();
+
+    vec_push(ops, op_command(
+        str_from("sync"), vec_new(),
+        str_from("Flush filesystem buffers"), 0, str_from("")));
+
+    # Pair (idx, depth) for non-swap, sort by depth DESC (deepest first)
+    var pairs = vec_new();
+    var i = 0;
+    while (i < n) {
+        var part = vec_get(partitions, i);
+        if (PartitionSpec_filesystem(part) != FS_SWAP) {
+            var p = alloc(16);
+            store64(p, i);
+            store64(p + 8, _count_slashes(PartitionSpec_mount_point(part)));
+            vec_push(pairs, p);
+        }
+        i = i + 1;
+    }
+    var pn = vec_len(pairs);
+    i = 1;
+    while (i < pn) {
+        var k = i;
+        while (k > 0) {
+            var a = vec_get(pairs, k - 1);
+            var b = vec_get(pairs, k);
+            if (load64(a + 8) < load64(b + 8)) {
+                vec_set(pairs, k - 1, b);
+                vec_set(pairs, k, a);
+                k = k - 1;
+            } else {
+                k = 0;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < pn) {
+        var pair = vec_get(pairs, i);
+        var idx = load64(pair);
+        var part = vec_get(partitions, idx);
+        var full = _join_path(target_root, PartitionSpec_mount_point(part));
+        vec_push(ops, op_unmount(full));
+        i = i + 1;
+    }
+
+    # Deactivate swap
+    i = 0;
+    while (i < n) {
+        var part = vec_get(partitions, i);
+        if (PartitionSpec_filesystem(part) == FS_SWAP) {
+            var args = vec_new();
+            vec_push(args, partition_device(device, i));
+            vec_push(ops, op_command(
+                str_from("swapoff"), args,
+                str_from("Deactivate swap"), 0, str_from("")));
+        }
+        i = i + 1;
+    }
+
+    # Close LUKS
+    if (DiskLayout_encrypt(disk) == 1) {
+        var args = vec_new();
+        _push_cstr(args, "close");
+        _push_cstr(args, "agnos-root");
+        vec_push(ops, op_command(
+            str_from("cryptsetup"), args,
+            str_from("Close LUKS volume"), 0, str_from("")));
+    }
+
+    return phase_ops_new(PHASE_CLEANUP, str_from("Cleanup and unmount"), ops);
+}
+
+# ============================================================
+# Full execution plan: all phases in order, vec<PhaseOps>
+# ============================================================
+fn full_execution_plan(cfg, target_root, luks_passphrase) {
+    var plans = vec_new();
+    vec_push(plans, plan_partition_ops(cfg));
+    vec_push(plans, plan_encryption_ops(cfg, luks_passphrase));
+    vec_push(plans, plan_format_ops(cfg));
+    vec_push(plans, plan_mount_ops(cfg, target_root));
+    vec_push(plans, plan_install_base_ops(cfg, target_root));
+    vec_push(plans, plan_install_packages_ops(cfg, target_root));
+    vec_push(plans, plan_bootloader_ops(cfg, target_root));
+    vec_push(plans, plan_user_ops(cfg, target_root));
+    vec_push(plans, plan_network_ops(cfg, target_root));
+    vec_push(plans, plan_locale_ops(cfg, target_root));
+    vec_push(plans, plan_security_ops(cfg, target_root));
+    vec_push(plans, plan_first_boot_ops(cfg, target_root));
+    vec_push(plans, plan_cleanup_ops(cfg, target_root));
+    return plans;
+}
+
+fn total_ops_count(cfg, target_root, luks_passphrase) {
+    var plans = full_execution_plan(cfg, target_root, luks_passphrase);
+    var n = vec_len(plans);
+    var i = 0;
+    var total = 0;
+    while (i < n) {
+        var phase = vec_get(plans, i);
+        total = total + vec_len(PhaseOps_operations(phase));
+        i = i + 1;
+    }
+    return total;
+}

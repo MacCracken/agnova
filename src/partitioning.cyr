@@ -1,0 +1,271 @@
+# partitioning.cyr — disk partition / format / encryption planners
+#
+# Ported from rust-old/src/partitioning.rs
+#
+# Each `plan_*_ops` function returns a `PhaseOps` ptr (struct with
+# phase + description + vec<SystemOp>). The caller executes them via
+# the orchestrator. None of these touch disk directly.
+
+# Map a target_device + partition index to its kernel device path.
+# /dev/sda  + 0 → /dev/sda1
+# /dev/nvme0n1 + 0 → /dev/nvme0n1p1   (NVMe wants the 'p' separator)
+# /dev/mmcblk0 + 0 → /dev/mmcblk0p1
+fn partition_device(device_str, i) {
+    var sb = str_builder_new();
+    str_builder_add(sb, device_str);
+    if (str_contains_cstr(device_str, "nvme") == 1) {
+        str_builder_add_byte(sb, 112);
+    }
+    if (str_contains_cstr(device_str, "mmcblk") == 1) {
+        str_builder_add_byte(sb, 112);
+    }
+    str_builder_add_int(sb, i + 1);
+    return str_builder_build(sb);
+}
+
+# Phase 1: Partitioning (parted commands)
+fn plan_partition_ops(cfg) {
+    var disk = InstallConfig_disk(cfg);
+    var device = DiskLayout_target_device(disk);
+    var ops = vec_new();
+
+    # Create the partition table
+    var pt_args = vec_new();
+    vec_push(pt_args, str_from("-s"));
+    vec_push(pt_args, str_clone(device));
+    vec_push(pt_args, str_from("mklabel"));
+    if (DiskLayout_use_gpt(disk) == 1) {
+        vec_push(pt_args, str_from("gpt"));
+        vec_push(ops, op_command(
+            str_from("parted"), pt_args, str_from("Create GPT partition table"),
+            1, str_from("")));
+    } else {
+        vec_push(pt_args, str_from("msdos"));
+        vec_push(ops, op_command(
+            str_from("parted"), pt_args, str_from("Create MBR partition table"),
+            1, str_from("")));
+    }
+
+    # Create each partition + set flags
+    var partitions = DiskLayout_partitions(disk);
+    var n = vec_len(partitions);
+    var i = 0;
+    var start_mb = 1;
+    while (i < n) {
+        var part = vec_get(partitions, i);
+        var fs = PartitionSpec_filesystem(part);
+        var has_size = PartitionSpec_has_size(part);
+        var size_mb = PartitionSpec_size_mb(part);
+
+        # parted's --part-type token (its idea of fs hint, not the real format)
+        var fs_hint = "ext4";
+        if (fs == FS_VFAT) { fs_hint = "fat32"; }
+        if (fs == FS_SWAP) { fs_hint = "linux-swap"; }
+
+        # start..end strings
+        var start_sb = str_builder_new();
+        str_builder_add_int(start_sb, start_mb);
+        str_builder_add_cstr(start_sb, "MiB");
+        var start_str = str_builder_build(start_sb);
+
+        var end_str = str_from("100%");
+        if (has_size == 1) {
+            var end_sb = str_builder_new();
+            str_builder_add_int(end_sb, start_mb + size_mb);
+            str_builder_add_cstr(end_sb, "MiB");
+            end_str = str_builder_build(end_sb);
+        }
+
+        var mp_args = vec_new();
+        vec_push(mp_args, str_from("-s"));
+        vec_push(mp_args, str_clone(device));
+        vec_push(mp_args, str_from("mkpart"));
+        vec_push(mp_args, str_clone(PartitionSpec_label(part)));
+        vec_push(mp_args, str_from(fs_hint));
+        vec_push(mp_args, start_str);
+        vec_push(mp_args, end_str);
+
+        var desc_sb = str_builder_new();
+        str_builder_add_cstr(desc_sb, "Create partition ");
+        str_builder_add_int(desc_sb, i + 1);
+        str_builder_add_cstr(desc_sb, " (");
+        str_builder_add(desc_sb, PartitionSpec_label(part));
+        str_builder_add_cstr(desc_sb, ")");
+        var desc = str_builder_build(desc_sb);
+
+        vec_push(ops, op_command(str_from("parted"), mp_args, desc, 1, str_from("")));
+
+        # Set flags on this partition
+        var flags = PartitionSpec_flags(part);
+        var fn_count = vec_len(flags);
+        var fi = 0;
+        while (fi < fn_count) {
+            var flag = vec_get(flags, fi);
+            var flag_name = pflag_str(flag);
+
+            var f_args = vec_new();
+            vec_push(f_args, str_from("-s"));
+            vec_push(f_args, str_clone(device));
+            vec_push(f_args, str_from("set"));
+            var idx_sb = str_builder_new();
+            str_builder_add_int(idx_sb, i + 1);
+            vec_push(f_args, str_builder_build(idx_sb));
+            vec_push(f_args, str_from(flag_name));
+            vec_push(f_args, str_from("on"));
+
+            var fdesc_sb = str_builder_new();
+            str_builder_add_cstr(fdesc_sb, "Set ");
+            str_builder_add_cstr(fdesc_sb, flag_name);
+            str_builder_add_cstr(fdesc_sb, " flag on partition ");
+            str_builder_add_int(fdesc_sb, i + 1);
+
+            vec_push(ops, op_command(
+                str_from("parted"), f_args, str_builder_build(fdesc_sb),
+                1, str_from("")));
+            fi = fi + 1;
+        }
+
+        if (has_size == 1) { start_mb = start_mb + size_mb; }
+        i = i + 1;
+    }
+
+    var phase_desc_sb = str_builder_new();
+    str_builder_add_cstr(phase_desc_sb, "Partition ");
+    str_builder_add(phase_desc_sb, device);
+    return phase_ops_new(PHASE_PARTITION_DISK, str_builder_build(phase_desc_sb), ops);
+}
+
+# Phase 3: Format filesystems (mkfs.* per partition)
+fn plan_format_ops(cfg) {
+    var disk = InstallConfig_disk(cfg);
+    var device = DiskLayout_target_device(disk);
+    var partitions = DiskLayout_partitions(disk);
+    var n = vec_len(partitions);
+    var ops = vec_new();
+    var i = 0;
+    while (i < n) {
+        var part = vec_get(partitions, i);
+        var fs = PartitionSpec_filesystem(part);
+        var label = PartitionSpec_label(part);
+        var part_dev = partition_device(device, i);
+
+        var args = vec_new();
+        var binary = str_from("mkfs.ext4");
+        if (fs == FS_EXT4) {
+            binary = str_from("mkfs.ext4");
+            vec_push(args, str_from("-L"));
+            vec_push(args, str_clone(label));
+            vec_push(args, str_clone(part_dev));
+        }
+        if (fs == FS_BTRFS) {
+            binary = str_from("mkfs.btrfs");
+            vec_push(args, str_from("-L"));
+            vec_push(args, str_clone(label));
+            vec_push(args, str_from("-f"));
+            vec_push(args, str_clone(part_dev));
+        }
+        if (fs == FS_XFS) {
+            binary = str_from("mkfs.xfs");
+            vec_push(args, str_from("-L"));
+            vec_push(args, str_clone(label));
+            vec_push(args, str_clone(part_dev));
+        }
+        if (fs == FS_VFAT) {
+            binary = str_from("mkfs.vfat");
+            vec_push(args, str_from("-F"));
+            vec_push(args, str_from("32"));
+            vec_push(args, str_from("-n"));
+            vec_push(args, str_clone(label));
+            vec_push(args, str_clone(part_dev));
+        }
+        if (fs == FS_SWAP) {
+            binary = str_from("mkswap");
+            vec_push(args, str_from("-L"));
+            vec_push(args, str_clone(label));
+            vec_push(args, str_clone(part_dev));
+        }
+
+        var desc_sb = str_builder_new();
+        str_builder_add_cstr(desc_sb, "Format ");
+        str_builder_add(desc_sb, part_dev);
+        str_builder_add_cstr(desc_sb, " as ");
+        str_builder_add_cstr(desc_sb, fs_str(fs));
+        str_builder_add_cstr(desc_sb, " (");
+        str_builder_add(desc_sb, label);
+        str_builder_add_cstr(desc_sb, ")");
+
+        vec_push(ops, op_command(binary, args, str_builder_build(desc_sb), 1, str_from("")));
+        i = i + 1;
+    }
+
+    return phase_ops_new(PHASE_FORMAT_FILESYSTEMS, str_from("Format filesystems"), ops);
+}
+
+# Phase 2: LUKS encryption setup (only if disk.encrypt=1).
+# luks_passphrase is supplied by the orchestrator (NOT held on DiskLayout).
+fn plan_encryption_ops(cfg, luks_passphrase) {
+    var disk = InstallConfig_disk(cfg);
+    var device = DiskLayout_target_device(disk);
+    var ops = vec_new();
+
+    if (DiskLayout_encrypt(disk) == 0) {
+        return phase_ops_new(PHASE_SETUP_ENCRYPTION, str_from("Setup disk encryption"), ops);
+    }
+
+    var partitions = DiskLayout_partitions(disk);
+    var n = vec_len(partitions);
+    if (n == 0) {
+        return phase_ops_new(
+            PHASE_SETUP_ENCRYPTION,
+            str_from("Setup disk encryption (no partitions)"),
+            ops
+        );
+    }
+
+    # Find the root partition (mount_point == "/"); fall back to last.
+    var root_idx = n - 1;
+    var i = 0;
+    while (i < n) {
+        var part = vec_get(partitions, i);
+        if (str_eq_cstr(PartitionSpec_mount_point(part), "/") == 1) {
+            root_idx = i;
+            i = n;
+        } else {
+            i = i + 1;
+        }
+    }
+
+    var part_dev = partition_device(device, root_idx);
+
+    # cryptsetup luksFormat
+    var fmt_args = vec_new();
+    vec_push(fmt_args, str_from("--batch-mode"));
+    vec_push(fmt_args, str_from("luksFormat"));
+    vec_push(fmt_args, str_from("--type"));
+    vec_push(fmt_args, str_from("luks2"));
+    vec_push(fmt_args, str_from("--cipher"));
+    vec_push(fmt_args, str_from("aes-xts-plain64"));
+    vec_push(fmt_args, str_from("--key-size"));
+    vec_push(fmt_args, str_from("512"));
+    vec_push(fmt_args, str_from("--hash"));
+    vec_push(fmt_args, str_from("sha512"));
+    vec_push(fmt_args, str_from("--iter-time"));
+    vec_push(fmt_args, str_from("5000"));
+    vec_push(fmt_args, str_from("--key-file=-"));
+    vec_push(fmt_args, str_clone(part_dev));
+    vec_push(ops, op_command(
+        str_from("cryptsetup"), fmt_args,
+        str_from("Format LUKS2 encrypted volume"), 1, luks_passphrase));
+
+    # cryptsetup open
+    var open_args = vec_new();
+    vec_push(open_args, str_from("open"));
+    vec_push(open_args, str_from("--key-file=-"));
+    vec_push(open_args, str_clone(part_dev));
+    vec_push(open_args, str_from("agnos-root"));
+    vec_push(ops, op_command(
+        str_from("cryptsetup"), open_args,
+        str_from("Open LUKS volume as agnos-root"), 1, luks_passphrase));
+
+    return phase_ops_new(PHASE_SETUP_ENCRYPTION, str_from("Setup disk encryption"), ops);
+}

@@ -1,0 +1,496 @@
+# cli.cyr — agnova command-line interface
+#
+# Subcommands (positional argv[1]):
+#   plan       Build + print the install plan (default; no side effects)
+#   validate   Run config validation only; print errors + warnings
+#   execute    Execute the plan AGAINST THE TARGET DEVICE (DESTRUCTIVE)
+#   version    Print agnova + cyrius toolchain version
+#   help       Print usage
+#
+# Flags shared across subcommands — see _build_flags() for the full list.
+# `agnova execute` additionally requires --i-mean-it; without it the
+# command refuses to run, mirroring the CLAUDE.md "no silent destructive
+# operations" rule.
+
+var AGNOVA_VERSION = "0.1.0";
+var DEFAULT_TARGET_ROOT = "/mnt";
+
+# Indices for our flag set — populated by _build_flags(), used by the
+# getter helpers below so callers don't repeat magic numbers.
+var FLAG_DEVICE = 0;
+var FLAG_USER = 0;
+var FLAG_MODE = 0;
+var FLAG_HOSTNAME = 0;
+var FLAG_TARGET = 0;
+var FLAG_BOOTLOADER = 0;
+var FLAG_LOCALE = 0;
+var FLAG_TIMEZONE = 0;
+var FLAG_ENCRYPT = 0;
+var FLAG_PASSPHRASE = 0;
+var FLAG_VERBOSE = 0;
+var FLAG_IMEANIT = 0;
+var FLAG_HELP = 0;
+
+fn _build_flags() {
+    var h = flags_new();
+    FLAG_DEVICE     = flags_add_str(h,  100, "device",      0,        "target block device, e.g. /dev/sda");
+    FLAG_USER       = flags_add_str(h,  117, "user",        0,        "username for the new user account");
+    FLAG_MODE       = flags_add_str(h,  109, "mode",        "desktop", "server|desktop|minimal|custom");
+    FLAG_HOSTNAME   = flags_add_str(h,    0, "hostname",    "agnos",  "system hostname");
+    FLAG_TARGET     = flags_add_str(h,  116, "target",      "/mnt",   "target root mount point");
+    FLAG_BOOTLOADER = flags_add_str(h,  98,  "bootloader",  "systemd", "systemd|grub2");
+    FLAG_LOCALE     = flags_add_str(h,    0, "locale",      "en_US.UTF-8", "system locale");
+    FLAG_TIMEZONE   = flags_add_str(h,    0, "timezone",    "UTC",    "system timezone");
+    FLAG_ENCRYPT    = flags_add_bool(h,   0, "encrypt",     0,        "enable LUKS root encryption");
+    FLAG_PASSPHRASE = flags_add_str(h,    0, "passphrase",  0,        "LUKS passphrase (required for execute if --encrypt)");
+    FLAG_VERBOSE    = flags_add_bool(h, 118, "verbose",     0,        "print every operation, not just per-phase summaries");
+    FLAG_IMEANIT    = flags_add_bool(h,   0, "i-mean-it",   0,        "required to actually execute (DESTRUCTIVE)");
+    FLAG_HELP       = flags_add_bool(h,   0, "help",        0,        "print this help");
+    return h;
+}
+
+# Parse mode string → InstallMode enum. Default desktop on unknown.
+fn _parse_mode(cstr_mode) {
+    if (cstr_mode == 0) { return MODE_DESKTOP; }
+    var s = str_from(cstr_mode);
+    if (str_eq_cstr(s, "server") == 1) { return MODE_SERVER; }
+    if (str_eq_cstr(s, "desktop") == 1) { return MODE_DESKTOP; }
+    if (str_eq_cstr(s, "minimal") == 1) { return MODE_MINIMAL; }
+    if (str_eq_cstr(s, "custom") == 1) { return MODE_CUSTOM; }
+    return MODE_DESKTOP;
+}
+
+fn _parse_bootloader(cstr_bl) {
+    if (cstr_bl == 0) { return BOOT_SYSTEMD; }
+    var s = str_from(cstr_bl);
+    if (str_eq_cstr(s, "grub2") == 1) { return BOOT_GRUB2; }
+    return BOOT_SYSTEMD;
+}
+
+# Build an InstallConfig from parsed flags. Returns 0 (cstr ptr) for
+# the device flag indicates "not provided" — callers that need device
+# must check it.
+fn _config_from_flags(h) {
+    var dev_cstr = flags_get_str(h, FLAG_DEVICE);
+    var user_cstr = flags_get_str(h, FLAG_USER);
+    var mode = _parse_mode(flags_get_str(h, FLAG_MODE));
+    var encrypt = flags_get_bool(h, FLAG_ENCRYPT);
+
+    var device = str_from("");
+    if (dev_cstr != 0) { device = str_from(dev_cstr); }
+
+    var disk = agnova_default_disk_layout(device, encrypt);
+
+    var bootloader = bootloader_config_default();
+    BootloaderConfig_set_bootloader_type(bootloader, _parse_bootloader(flags_get_str(h, FLAG_BOOTLOADER)));
+
+    var network = network_config_default();
+    var hn_cstr = flags_get_str(h, FLAG_HOSTNAME);
+    if (hn_cstr != 0) { NetworkConfig_set_hostname(network, str_from(hn_cstr)); }
+
+    var user = user_config_default();
+    if (user_cstr != 0) { UserConfig_set_username(user, str_from(user_cstr)); }
+
+    var security = security_config_default();
+    # If user set --encrypt, ensure security.enable_luks reflects that
+    # so the validator's luks/encrypt mismatch warning stays meaningful.
+    SecurityConfig_set_enable_luks(security, encrypt);
+
+    var packages = default_packages(mode);
+
+    var locale_cstr = flags_get_str(h, FLAG_LOCALE);
+    var tz_cstr = flags_get_str(h, FLAG_TIMEZONE);
+    var locale_str = str_from("en_US.UTF-8");
+    var tz_str = str_from("UTC");
+    if (locale_cstr != 0) { locale_str = str_from(locale_cstr); }
+    if (tz_cstr != 0) { tz_str = str_from(tz_cstr); }
+
+    return install_config_new(
+        mode, disk, bootloader, network, user, security, packages,
+        locale_str, tz_str
+    );
+}
+
+fn _print_help() {
+    println("agnova — OS installer for AGNOS");
+    println("");
+    println("USAGE:");
+    println("    agnova <COMMAND> [OPTIONS]");
+    println("");
+    println("COMMANDS:");
+    println("    plan       Build + print the install plan (no side effects)");
+    println("    validate   Validate config; print errors + warnings");
+    println("    execute    Execute the plan (DESTRUCTIVE — requires --i-mean-it)");
+    println("    version    Print agnova + cyrius toolchain version");
+    println("    help       Print this help");
+    println("");
+    println("OPTIONS:");
+    println("    -d, --device DEV         Target block device (required for plan/execute)");
+    println("    -u, --user NAME          Username (required for execute)");
+    println("    -m, --mode MODE          server|desktop|minimal|custom (default: desktop)");
+    println("        --hostname NAME      Hostname (default: agnos)");
+    println("    -t, --target ROOT        Target root mount point (default: /mnt)");
+    println("    -b, --bootloader BL      systemd|grub2 (default: systemd)");
+    println("        --locale L           System locale (default: en_US.UTF-8)");
+    println("        --timezone TZ        System timezone (default: UTC)");
+    println("        --encrypt            Enable LUKS root encryption");
+    println("        --passphrase PASS    LUKS passphrase (required if --encrypt and execute)");
+    println("    -v, --verbose            Print every op, not just per-phase counts");
+    println("        --i-mean-it          Required to actually execute (DESTRUCTIVE)");
+    println("        --help               Print this help");
+    return 0;
+}
+
+fn _print_version() {
+    print("agnova ", 7);
+    println(AGNOVA_VERSION);
+    println("cyrius 5.7.12");
+    return 0;
+}
+
+fn _op_kind_str(op) {
+    var t = tag(op);
+    if (t == OP_COMMAND) { return "Command"; }
+    if (t == OP_WRITE_FILE) { return "Write"; }
+    if (t == OP_MAKE_DIR) { return "Mkdir"; }
+    if (t == OP_SYMLINK) { return "Symlink"; }
+    if (t == OP_MOUNT) { return "Mount"; }
+    if (t == OP_UNMOUNT) { return "Umount"; }
+    return "?";
+}
+
+# Print a single op in --verbose mode.
+fn _print_op(idx, total, op) {
+    print("    [", 5);
+    fmt_int(idx + 1);
+    print("/", 1);
+    fmt_int(total);
+    print("] ", 2);
+    print(_op_kind_str(op), strlen(_op_kind_str(op)));
+    print(" ", 1);
+
+    var t = tag(op);
+    var p = payload(op);
+    if (t == OP_COMMAND) {
+        str_print(SystemOp_Command_binary(p));
+        var args = SystemOp_Command_args(p);
+        var ai = 0;
+        while (ai < vec_len(args)) {
+            print(" ", 1);
+            str_print(vec_get(args, ai));
+            ai = ai + 1;
+        }
+        println("");
+        print("        ", 8);
+        str_println(SystemOp_Command_description(p));
+    }
+    if (t == OP_WRITE_FILE) {
+        str_print(SystemOp_WriteFile_path(p));
+        print(" (mode=", 7);
+        fmt_int(SystemOp_WriteFile_mode(p));
+        print(", ", 2);
+        fmt_int(str_len(SystemOp_WriteFile_content(p)));
+        println(" bytes)");
+    }
+    if (t == OP_MAKE_DIR) {
+        str_print(SystemOp_MakeDir_path(p));
+        print(" (mode=", 7);
+        fmt_int(SystemOp_MakeDir_mode(p));
+        if (SystemOp_MakeDir_parents(p) == 1) { print(", parents", 9); }
+        println(")");
+    }
+    if (t == OP_SYMLINK) {
+        str_print(SystemOp_Symlink_link(p));
+        print(" -> ", 4);
+        str_println(SystemOp_Symlink_target(p));
+    }
+    if (t == OP_MOUNT) {
+        str_print(SystemOp_Mount_device(p));
+        print(" on ", 4);
+        str_print(SystemOp_Mount_mount_point(p));
+        print(" (", 2);
+        str_print(SystemOp_Mount_fs_type(p));
+        println(")");
+    }
+    if (t == OP_UNMOUNT) {
+        str_println(SystemOp_Unmount_mount_point(p));
+    }
+    return 0;
+}
+
+# Print the full plan derived from a built InstallConfig.
+fn _cmd_plan(h) {
+    var cfg = _config_from_flags(h);
+    var disk = InstallConfig_disk(cfg);
+    if (str_len(DiskLayout_target_device(disk)) == 0) {
+        println("error: --device is required for plan");
+        return 2;
+    }
+
+    println("=== agnova install plan ===");
+    print("device:     ", 12);
+    str_println(DiskLayout_target_device(disk));
+    print("mode:       ", 12);
+    println(mode_str(InstallConfig_mode(cfg)));
+    print("hostname:   ", 12);
+    str_println(NetworkConfig_hostname(InstallConfig_network(cfg)));
+    print("user:       ", 12);
+    var uname = UserConfig_username(InstallConfig_user(cfg));
+    if (str_len(uname) == 0) {
+        println("(none — required for execute)");
+    } else {
+        str_println(uname);
+    }
+    print("encrypt:    ", 12);
+    if (DiskLayout_encrypt(disk) == 1) { println("yes"); } else { println("no"); }
+    print("bootloader: ", 12);
+    println(bt_str(BootloaderConfig_bootloader_type(InstallConfig_bootloader(cfg))));
+    print("target:     ", 12);
+    var target_cstr = flags_get_str(h, FLAG_TARGET);
+    var target_str = str_from(DEFAULT_TARGET_ROOT);
+    if (target_cstr != 0) { target_str = str_from(target_cstr); }
+    str_println(target_str);
+    println("");
+
+    # Validation
+    var v = validate_config(cfg);
+    if (is_ok(v) == 0) {
+        print("validation: FAILED — ", 21);
+        str_println(payload(v));
+        return 1;
+    }
+    var warns = payload(v);
+    var wn = vec_len(warns);
+    if (wn == 0) {
+        println("validation: OK");
+    } else {
+        print("validation: OK with ", 20);
+        fmt_int(wn);
+        println(" warning(s)");
+        var wi = 0;
+        while (wi < wn) {
+            print("  ! ", 4);
+            str_println(vec_get(warns, wi));
+            wi = wi + 1;
+        }
+    }
+    println("");
+
+    # Plan
+    var passphrase = str_from("");
+    var pass_cstr = flags_get_str(h, FLAG_PASSPHRASE);
+    if (pass_cstr != 0) { passphrase = str_from(pass_cstr); }
+    var plans = full_execution_plan(cfg, target_str, passphrase);
+    var verbose = flags_get_bool(h, FLAG_VERBOSE);
+
+    var total = 0;
+    var i = 0;
+    while (i < vec_len(plans)) {
+        total = total + vec_len(PhaseOps_operations(vec_get(plans, i)));
+        i = i + 1;
+    }
+    print("plan: ", 6);
+    fmt_int(vec_len(plans));
+    print(" phases, ", 9);
+    fmt_int(total);
+    println(" operations");
+    println("");
+
+    i = 0;
+    while (i < vec_len(plans)) {
+        var p = vec_get(plans, i);
+        var ops = PhaseOps_operations(p);
+        print("Phase ", 6);
+        fmt_int(i + 1);
+        print("/", 1);
+        fmt_int(vec_len(plans));
+        print(": ", 2);
+        str_print(PhaseOps_description(p));
+        print(" (", 2);
+        fmt_int(vec_len(ops));
+        println(" ops)");
+
+        if (verbose == 1) {
+            var on = vec_len(ops);
+            var oi = 0;
+            while (oi < on) {
+                _print_op(oi, on, vec_get(ops, oi));
+                oi = oi + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    return 0;
+}
+
+# Validate-only.
+fn _cmd_validate(h) {
+    var cfg = _config_from_flags(h);
+    if (str_len(DiskLayout_target_device(InstallConfig_disk(cfg))) == 0) {
+        println("error: --device is required for validate");
+        return 2;
+    }
+    var v = validate_config(cfg);
+    if (is_ok(v) == 0) {
+        print("FAILED: ", 8);
+        str_println(payload(v));
+        return 1;
+    }
+    var warns = payload(v);
+    var n = vec_len(warns);
+    print("OK with ", 8);
+    fmt_int(n);
+    println(" warning(s)");
+    var i = 0;
+    while (i < n) {
+        print("  ! ", 4);
+        str_println(vec_get(warns, i));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Execute the plan against the target device. DESTRUCTIVE.
+fn _cmd_execute(h) {
+    if (flags_get_bool(h, FLAG_IMEANIT) == 0) {
+        println("");
+        println("DANGER: agnova execute will partition + format the target device.");
+        println("        ALL DATA on the device will be DESTROYED.");
+        println("");
+        println("This subcommand requires --i-mean-it to proceed. Pass --i-mean-it");
+        println("only after reviewing `agnova plan --verbose` output for the same flags.");
+        println("");
+        return 2;
+    }
+
+    var cfg = _config_from_flags(h);
+    var disk = InstallConfig_disk(cfg);
+    if (str_len(DiskLayout_target_device(disk)) == 0) {
+        println("error: --device is required for execute");
+        return 2;
+    }
+    if (str_len(UserConfig_username(InstallConfig_user(cfg))) == 0) {
+        println("error: --user is required for execute");
+        return 2;
+    }
+    var passphrase = str_from("");
+    var pass_cstr = flags_get_str(h, FLAG_PASSPHRASE);
+    if (pass_cstr != 0) { passphrase = str_from(pass_cstr); }
+    if (DiskLayout_encrypt(disk) == 1) {
+        if (str_len(passphrase) == 0) {
+            println("error: --passphrase is required when --encrypt is set for execute");
+            return 2;
+        }
+    }
+
+    var v = validate_config(cfg);
+    if (is_ok(v) == 0) {
+        print("validation FAILED: ", 19);
+        str_println(payload(v));
+        return 1;
+    }
+
+    var target_cstr = flags_get_str(h, FLAG_TARGET);
+    var target_str = str_from(DEFAULT_TARGET_ROOT);
+    if (target_cstr != 0) { target_str = str_from(target_cstr); }
+
+    var inst = agnova_installer_new(cfg, passphrase);
+    var plans = full_execution_plan(cfg, target_str, passphrase);
+
+    println("=== executing install plan ===");
+    var rc = execute_all(inst, plans);
+
+    var res = agnova_result(inst);
+    print("phases completed: ", 18);
+    fmt_int(vec_len(InstallResult_phases_completed(res)));
+    print("/", 1);
+    fmt_int(agnova_phase_count());
+    println("");
+    print("errors:           ", 18);
+    fmt_int(vec_len(InstallResult_errors(res)));
+    println("");
+    print("duration (s):     ", 18);
+    fmt_int(InstallResult_duration_secs(res));
+    println("");
+
+    var log = AgnovaInstaller_log(inst);
+    var ln = vec_len(log);
+    if (ln > 0) {
+        println("--- log ---");
+        var li = 0;
+        while (li < ln) {
+            print("  ", 2);
+            str_println(vec_get(log, li));
+            li = li + 1;
+        }
+    }
+    return rc;
+}
+
+# Build a heap argv array from args.cyr — flags_parse expects a real
+# cstr-pointer array, not direct argc()/argv() lookups.
+fn _materialize_argv() {
+    var n = argc();
+    var arr = alloc((n + 1) * 8);
+    var i = 0;
+    while (i < n) {
+        var src = argv(i);
+        if (src == 0) {
+            store64(arr + i * 8, 0);
+        } else {
+            var slen = strlen(src);
+            var dst = alloc(slen + 1);
+            memcpy(dst, src, slen);
+            store8(dst + slen, 0);
+            store64(arr + i * 8, dst);
+        }
+        i = i + 1;
+    }
+    store64(arr + n * 8, 0);
+    return arr;
+}
+
+# Top-level dispatch. Returns process exit code.
+fn cli_main() {
+    args_init();
+    var ac = argc();
+    var av = _materialize_argv();
+    if (ac < 2) {
+        _print_help();
+        return 1;
+    }
+
+    var h = _build_flags();
+    flags_parse(h, ac, av);
+    var err = flags_error(h);
+    if (err != 0) {
+        println("flag parse error");
+        _print_help();
+        return 2;
+    }
+
+    if (flags_get_bool(h, FLAG_HELP) == 1) {
+        _print_help();
+        return 0;
+    }
+
+    var pcount = flags_positional_count(h);
+    if (pcount == 0) {
+        _print_help();
+        return 1;
+    }
+    var sub_cstr = flags_positional(h, 0);
+    var sub = str_from(sub_cstr);
+
+    if (str_eq_cstr(sub, "plan") == 1)     { return _cmd_plan(h); }
+    if (str_eq_cstr(sub, "validate") == 1) { return _cmd_validate(h); }
+    if (str_eq_cstr(sub, "execute") == 1)  { return _cmd_execute(h); }
+    if (str_eq_cstr(sub, "version") == 1)  { return _print_version(); }
+    if (str_eq_cstr(sub, "help") == 1)     { return _print_help(); }
+
+    print("unknown command: ", 17);
+    str_println(sub);
+    _print_help();
+    return 2;
+}

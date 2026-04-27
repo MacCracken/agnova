@@ -43,7 +43,8 @@ jobs:
         run: |
           cyrius deps
           mkdir -p build
-          cyrius build src/main.cyr build/${{ github.event.repository.name }}
+          cyrius build src/main.cyr build/agnova
+          ./build/agnova version
 
       - name: Create release
         uses: softprops/action-gh-release@v2

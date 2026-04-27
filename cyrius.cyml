@@ -11,4 +11,4 @@ entry = "src/main.cyr"
 output = "agnova"
 
 [deps]
-stdlib = ["string", "fmt", "alloc", "vec", "str", "syscalls", "io", "args", "assert", "tagged"]
+stdlib = ["string", "fmt", "alloc", "vec", "str", "syscalls", "io", "args", "assert", "tagged", "chrono", "flags", "process"]
