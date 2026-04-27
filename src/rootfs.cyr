@@ -768,7 +768,23 @@ fn plan_security_ops(cfg, target_root) {
 
     if (SecurityConfig_firewall_default(sec) == FW_DENY) {
         var nft = str_builder_new();
-        str_builder_add_cstr(nft, "#!/usr/sbin/nft -f\nflush ruleset\ntable inet filter {\n    chain input {\n        type filter hook input priority 0; policy drop;\n        iif lo accept\n        ct state established,related accept\n        tcp dport 22 accept comment \"SSH\"\n        icmp type echo-request accept\n    }\n    chain forward {\n        type filter hook forward priority 0; policy drop;\n    }\n    chain output {\n        type filter hook output priority 0; policy accept;\n    }\n}\n");
+        str_builder_add_cstr(nft, "#!/usr/sbin/nft -f\n");
+        str_builder_add_cstr(nft, "flush ruleset\n");
+        str_builder_add_cstr(nft, "table inet filter {\n");
+        str_builder_add_cstr(nft, "    chain input {\n");
+        str_builder_add_cstr(nft, "        type filter hook input priority 0; policy drop;\n");
+        str_builder_add_cstr(nft, "        iif lo accept\n");
+        str_builder_add_cstr(nft, "        ct state established,related accept\n");
+        str_builder_add_cstr(nft, "        tcp dport 22 accept comment \"SSH\"\n");
+        str_builder_add_cstr(nft, "        icmp type echo-request accept\n");
+        str_builder_add_cstr(nft, "    }\n");
+        str_builder_add_cstr(nft, "    chain forward {\n");
+        str_builder_add_cstr(nft, "        type filter hook forward priority 0; policy drop;\n");
+        str_builder_add_cstr(nft, "    }\n");
+        str_builder_add_cstr(nft, "    chain output {\n");
+        str_builder_add_cstr(nft, "        type filter hook output priority 0; policy accept;\n");
+        str_builder_add_cstr(nft, "    }\n");
+        str_builder_add_cstr(nft, "}\n");
         var npath = str_builder_new();
         str_builder_add(npath, target_root);
         str_builder_add_cstr(npath, "/etc/nftables.conf");
@@ -790,7 +806,16 @@ fn plan_security_ops(cfg, target_root) {
             384, str_from("root:root")));
     }
 
-    var sysctl = str_from("# AGNOS security defaults\nkernel.kptr_restrict=2\nkernel.dmesg_restrict=1\nkernel.perf_event_paranoid=3\nnet.ipv4.conf.all.rp_filter=1\nnet.ipv4.conf.all.send_redirects=0\nnet.ipv4.conf.all.accept_redirects=0\nnet.ipv6.conf.all.accept_redirects=0\n");
+    var sysctl_sb = str_builder_new();
+    str_builder_add_cstr(sysctl_sb, "# AGNOS security defaults\n");
+    str_builder_add_cstr(sysctl_sb, "kernel.kptr_restrict=2\n");
+    str_builder_add_cstr(sysctl_sb, "kernel.dmesg_restrict=1\n");
+    str_builder_add_cstr(sysctl_sb, "kernel.perf_event_paranoid=3\n");
+    str_builder_add_cstr(sysctl_sb, "net.ipv4.conf.all.rp_filter=1\n");
+    str_builder_add_cstr(sysctl_sb, "net.ipv4.conf.all.send_redirects=0\n");
+    str_builder_add_cstr(sysctl_sb, "net.ipv4.conf.all.accept_redirects=0\n");
+    str_builder_add_cstr(sysctl_sb, "net.ipv6.conf.all.accept_redirects=0\n");
+    var sysctl = str_builder_build(sysctl_sb);
     var spath = str_builder_new();
     str_builder_add(spath, target_root);
     str_builder_add_cstr(spath, "/etc/sysctl.d/99-agnos-hardening.conf");

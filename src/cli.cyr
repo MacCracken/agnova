@@ -42,8 +42,8 @@ fn _build_flags() {
     FLAG_LOCALE     = flags_add_str(h,    0, "locale",      "en_US.UTF-8", "system locale");
     FLAG_TIMEZONE   = flags_add_str(h,    0, "timezone",    "UTC",    "system timezone");
     FLAG_ENCRYPT    = flags_add_bool(h,   0, "encrypt",     0,        "enable LUKS root encryption");
-    FLAG_PASSPHRASE = flags_add_str(h,    0, "passphrase",  0,        "LUKS passphrase (required for execute if --encrypt)");
-    FLAG_VERBOSE    = flags_add_bool(h, 118, "verbose",     0,        "print every operation, not just per-phase summaries");
+    FLAG_PASSPHRASE = flags_add_str(h,    0, "passphrase",  0,        "LUKS passphrase for --encrypt+execute");
+    FLAG_VERBOSE    = flags_add_bool(h, 118, "verbose",     0,        "print every op, not just phase summaries");
     FLAG_IMEANIT    = flags_add_bool(h,   0, "i-mean-it",   0,        "required to actually execute (DESTRUCTIVE)");
     FLAG_HELP       = flags_add_bool(h,   0, "help",        0,        "print this help");
     return h;

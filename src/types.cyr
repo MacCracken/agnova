@@ -450,7 +450,8 @@ struct SecurityConfig {
     firewall_default;
 }
 
-fn security_config_new(enable_luks, enable_secureboot, enable_tpm, enable_dmverity, trust_enforcement, firewall_default) {
+fn security_config_new(enable_luks, enable_secureboot, enable_tpm, enable_dmverity,
+                       trust_enforcement, firewall_default) {
     var p = alloc(sizeof(SecurityConfig));
     store64(p, enable_luks);
     store64(p + 8, enable_secureboot);
