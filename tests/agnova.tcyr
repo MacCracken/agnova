@@ -1652,6 +1652,44 @@ fn t_generate_fstab_columns() {
     return 0;
 }
 
+fn t_mount_flags_from_options() {
+    test_group("mount_flags_from_options");
+    var empty = vec_new();
+    assert_eq(mount_flags_from_options(empty), 0, "empty -> 0");
+
+    var defs = vec_new();
+    vec_push(defs, str_from("defaults"));
+    assert_eq(mount_flags_from_options(defs), 0, "defaults -> 0");
+
+    var rw = vec_new();
+    vec_push(rw, str_from("rw"));
+    assert_eq(mount_flags_from_options(rw), 0, "rw -> 0");
+
+    var ro = vec_new();
+    vec_push(ro, str_from("ro"));
+    assert_eq(mount_flags_from_options(ro), MS_RDONLY, "ro -> MS_RDONLY");
+
+    # one option per element
+    var multi = vec_new();
+    vec_push(multi, str_from("ro"));
+    vec_push(multi, str_from("nosuid"));
+    vec_push(multi, str_from("nodev"));
+    assert_eq(mount_flags_from_options(multi),
+        MS_RDONLY | MS_NOSUID | MS_NODEV, "ro+nosuid+nodev");
+
+    # comma-separated within a single element (mount(8) style)
+    var csv = vec_new();
+    vec_push(csv, str_from("ro,nosuid,noexec"));
+    assert_eq(mount_flags_from_options(csv),
+        MS_RDONLY | MS_NOSUID | MS_NOEXEC, "comma-separated");
+
+    # flag mixed with a no-flag token
+    var mixed = vec_new();
+    vec_push(mixed, str_from("noexec,defaults"));
+    assert_eq(mount_flags_from_options(mixed), MS_NOEXEC, "noexec+defaults -> MS_NOEXEC");
+    return 0;
+}
+
 # ============================================================
 # main — calls every test, prints summary, returns failure count
 # ============================================================
@@ -1805,6 +1843,7 @@ fn main() {
     t_first_boot_ops_minimal_services();
     t_generate_machine_id_v4_bits();
     t_generate_fstab_columns();
+    t_mount_flags_from_options();
 
     # Full-plan tests
     t_full_execution_plan_has_all_phases();

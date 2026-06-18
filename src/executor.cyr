@@ -163,15 +163,15 @@ fn _exec_mount(p) {
     var device = SystemOp_Mount_device(p);
     var mount_point = SystemOp_Mount_mount_point(p);
     var fs_type = SystemOp_Mount_fs_type(p);
-    # options vec is currently informational only — kernel-level options
-    # require parsing into MS_* flag bits + a comma-separated data string.
-    # For now mount with no flags / no data; agnova only ever passes
-    # ["defaults"] (matching mount(8) defaults). Revisit when we need ro/sync/noexec.
+    # Parse the options vec into MS_* flag bits (mount_flags_from_options,
+    # helpers.cyr). Data-string options aren't threaded — agnova emits only
+    # flag/"defaults" options at mount time, so the data arg stays 0.
+    var flags = mount_flags_from_options(SystemOp_Mount_options(p));
     return sys_mount(
         str_cstr(device),
         str_cstr(mount_point),
         str_cstr(fs_type),
-        0,
+        flags,
         0
     );
 }

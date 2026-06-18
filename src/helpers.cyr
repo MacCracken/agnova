@@ -164,3 +164,59 @@ fn default_kernel_params(security) {
     vec_push(params, str_from("lsm=landlock,lockdown,yama,apparmor,bpf"));
     return params;
 }
+
+# Map a single mount-option token to its MS_* flag bit (or 0 if it carries
+# no kernel flag — e.g. "rw"/"defaults"/"suid"/"dev"/"exec", or a
+# filesystem-specific data option). Only options with a defined MS_*
+# constant in the vendored syscall table are recognised.
+fn _mount_flag_for_token(tok) {
+    if (str_eq_cstr(tok, "ro") == 1) { return MS_RDONLY; }
+    if (str_eq_cstr(tok, "nosuid") == 1) { return MS_NOSUID; }
+    if (str_eq_cstr(tok, "nodev") == 1) { return MS_NODEV; }
+    if (str_eq_cstr(tok, "noexec") == 1) { return MS_NOEXEC; }
+    if (str_eq_cstr(tok, "remount") == 1) { return MS_REMOUNT; }
+    if (str_eq_cstr(tok, "bind") == 1) { return MS_BIND; }
+    if (str_eq_cstr(tok, "move") == 1) { return MS_MOVE; }
+    return 0;
+}
+
+# Parse a vec<Str> of mount options into a combined MS_* flag word for
+# sys_mount(). Each vec element may itself be a comma-separated list
+# (mount(8) style), so "ro,nosuid" and ["ro", "nosuid"] are equivalent.
+# Options with no flag bit contribute 0; data-string options (e.g.
+# subvol=, errors=) are not threaded — agnova only emits flag/"defaults"
+# options at mount time, so the data arg stays 0. Returns the OR of bits.
+fn mount_flags_from_options(options) {
+    var flags = 0;
+    var n = vec_len(options);
+    var i = 0;
+    while (i < n) {
+        var opt = vec_get(options, i);
+        var len = str_len(opt);
+        var data = str_data(opt);
+        var start = 0;
+        var j = 0;
+        while (j <= len) {
+            var at_end = 0;
+            if (j == len) { at_end = 1; }
+            var is_comma = 0;
+            if (at_end == 0) {
+                if (load8(data + j) == 44) { is_comma = 1; }
+            }
+            if (at_end == 1) {
+                if (j > start) {
+                    flags = flags | _mount_flag_for_token(str_substr(opt, start, j));
+                }
+            }
+            if (is_comma == 1) {
+                if (j > start) {
+                    flags = flags | _mount_flag_for_token(str_substr(opt, start, j));
+                }
+                start = j + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return flags;
+}

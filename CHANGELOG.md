@@ -7,9 +7,11 @@ This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 ## [Unreleased]
 
 ### Added
+- **Mount options are now honored at execution time.** New pure helper `mount_flags_from_options(options)` (`src/helpers.cyr`) parses a `vec<Str>` of mount options — one-per-element or comma-separated, mount(8) style — into combined `MS_*` flag bits (`ro`/`nosuid`/`nodev`/`noexec`/`remount`/`bind`/`move`; no-flag tokens like `rw`/`defaults` contribute 0). `_exec_mount` now passes these flags to `sys_mount` instead of a hard-coded `0`. 7 unit tests added. (Data-string options such as `subvol=` are still not threaded — agnova emits only flag/`defaults` options at mount time.)
 - **Plan-generation benchmark harness** (`tests/agnova.bcyr`). Replaces the no-op stub with real `bench_new`/`bench_run` timings over the pure planning layer. Baseline on the default Desktop config (x86_64): `full_execution_plan` ≈ 67 µs/call, `total_ops_count` ≈ 66 µs, `validate_config` ≈ 1.7 µs, `default_packages` ≈ 4.5 µs. Run with `cyrius bench tests/agnova.bcyr`.
 
 ### Changed
+- **CI now enforces a CHANGELOG entry per PR** (`.github/workflows/ci.yml`). A new `changelog` job fails any pull request whose diff doesn't touch `CHANGELOG.md`.
 - **`cyrius.cyml` stdlib deps gain `bench` + `fnptr`**, and `lib/bench.cyr` is vendored into `./lib/` (consistent with the project's vendored stdlib) so `cyrius bench` resolves against the 6.2.21 snapshot. The main binary build is unaffected (bench symbols are dead-code-eliminated).
 
 ## [0.2.0] - 2026-06-18

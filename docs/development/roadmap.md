@@ -32,11 +32,11 @@
 ## Backlog (v0.3.0)
 
 - [ ] **End-to-end hardware test** of executor on disposable hardware (loopback file or VM). This is the v0.3.0 gate.
-- [ ] CHANGELOG entry per-PR enforced in CI
-- [ ] `cyrius fmt --check` in CI (figure out the right invocation)
+- [x] CHANGELOG entry per-PR enforced in CI (`changelog` job fails PRs whose diff omits `CHANGELOG.md`).
+- [ ] `cyrius fmt --check` in CI — **blocked on a style decision.** The right invocation is the `cyrfmt --check <file>` binary directly (the `cyrius fmt` wrapper mangles args). But cyrfmt's canonical style conflicts with the codebase's intentional 8-space continuation indent (e.g. `types.cyr` would change 58 lines), so adopting it means reformatting the whole tree. Decide: adopt cyrfmt canonical (whole-repo reformat) or keep the current hand-formatted style and drop this item.
 - [x] ~~Fix the 5 `line exceeds 120 characters` lint warnings~~ — already clean; `cyrius lint` reports 0 warnings across `src/` and `lib/`.
 - [ ] Wire `--passphrase` into LUKS encryption ops — CLI side done (`--passphrase` parsed, threaded into `full_execution_plan`/`agnova_installer_new`, and required-when-`--encrypt` validation in `execute`). Remaining: validate the executor's stdin-pipe path against real `cryptsetup` (folds into the hardware test).
-- [ ] Mount options: parse `vec<Str>` options into MS_* flag bits (currently passed as `0` to `sys_mount`; agnova only ever emits `["defaults"]` so the simplification is safe today, but bug-prone if extended)
+- [x] Mount options: `mount_flags_from_options` parses `vec<Str>` options (one-per-element or comma-separated) into `MS_*` flag bits; `_exec_mount` threads them into `sys_mount`. Data-string options (e.g. `subvol=`) still not threaded — agnova emits only flag/`defaults` options today.
 - [x] Bench harness — `tests/agnova.bcyr` exercises plan-generation throughput (`full_execution_plan`, `total_ops_count`, `validate_config`, `default_packages`) via `cyrius bench`. Baseline µs/call recorded in CHANGELOG.
 
 ## Future (v0.4.0)
