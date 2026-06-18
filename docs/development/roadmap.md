@@ -2,7 +2,7 @@
 
 ## Status
 
-**v0.1.0 (current)** — Cyrius port complete. Library + CLI build clean, plan generation byte-equivalent to the Rust scaffold, executor implemented but not yet run end-to-end on hardware.
+**v0.1.1 (current)** — Cyrius toolchain bumped to 6.2.21. Library + CLI build clean, plan generation byte-equivalent to the Rust scaffold, executor implemented but not yet run end-to-end on hardware.
 
 ## Completed (v0.1.0)
 

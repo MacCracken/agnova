@@ -1,10 +1,10 @@
 [package]
 name = "agnova"
-version = "0.1.0"
+version = "0.1.1"
 description = "agnova — Cyrius port (from 3656 lines of Rust)"
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "5.7.12"
+cyrius = "6.2.21"
 
 [build]
 entry = "src/main.cyr"

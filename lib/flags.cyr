@@ -19,10 +19,10 @@
 #   var count   = flags_get_int(fs, f_n);
 #   var i = 0;
 #   while (i < flags_positional_count(fs)) {
-    #       var path = flags_positional(fs, i);
-    #       ...
-    #       i = i + 1;
-    #   }
+#       var path = flags_positional(fs, i);
+#       ...
+#       i = i + 1;
+#   }
 #
 # Supported syntax:
 #   --name             bool flag → 1
@@ -86,7 +86,7 @@ var FLAGS_ENTRY_SIZE = 48;
 # all other flags_* functions take as their first argument. The
 # context owns its entries + positional arrays; do not free
 # individually.
-fn flags_new() {
+fn flags_new(): i64 {
     var h = alloc(FLAGS_CTX_SIZE);
     var entries = alloc(FLAGS_MAX * FLAGS_ENTRY_SIZE);
     var positional = alloc(FLAGS_POS_MAX * 8);
@@ -107,7 +107,7 @@ fn flags_new() {
     return h;
 }
 
-fn _flags_add(h, short_ch, long_name, type, default_val, help) {
+fn _flags_add(h, short_ch, long_name, type, default_val, help): i64 {
     var count = load64(h + 16);
     if (count >= FLAGS_MAX) { return 0 - 1; }
     var ep = load64(h) + count * FLAGS_ENTRY_SIZE;
@@ -125,32 +125,32 @@ fn _flags_add(h, short_ch, long_name, type, default_val, help) {
 # form), `long_name` is a cstr (0 = no long form), `default_val`
 # is 0 or 1 (used until parse sets it), `help` is a cstr printed
 # by flags_print_help. Returns the flag index for later get_*.
-fn flags_add_bool(h, short_ch, long_name, default_val, help) {
+fn flags_add_bool(h, short_ch, long_name, default_val, help): i64 {
     return _flags_add(h, short_ch, long_name, FLAG_BOOL, default_val, help);
 }
 
 # Register an int flag. Same arg shape as flags_add_bool;
 # `default_val` is the i64 used until parse sets it. Parse
 # accepts decimal with optional leading minus.
-fn flags_add_int(h, short_ch, long_name, default_val, help) {
+fn flags_add_int(h, short_ch, long_name, default_val, help): i64 {
     return _flags_add(h, short_ch, long_name, FLAG_INT, default_val, help);
 }
 
 # Register a string flag. Same arg shape as flags_add_bool;
 # `default_val` is a cstr ptr (or 0). Parse stores the argv
 # token directly — no copy.
-fn flags_add_str(h, short_ch, long_name, default_val, help) {
+fn flags_add_str(h, short_ch, long_name, default_val, help): i64 {
     return _flags_add(h, short_ch, long_name, FLAG_STR, default_val, help);
 }
 
-fn _flags_entry(h, idx) {
+fn _flags_entry(h, idx): i64 {
     return load64(h) + idx * FLAGS_ENTRY_SIZE;
 }
 
 # Read the bool flag at `idx`. Returns 0 (default / not set) or
 # 1 (parse saw the flag). Caller must have registered idx via
 # flags_add_bool.
-fn flags_get_bool(h, idx) { return load64(_flags_entry(h, idx) + 24); }
+fn flags_get_bool(h, idx): i64 { return load64(_flags_entry(h, idx) + 24); }
 
 # Read the int flag at `idx`. Returns the parsed value or the
 # registered default. Caller must have registered idx via
@@ -164,11 +164,11 @@ fn flags_get_str(h, idx)  { return load64(_flags_entry(h, idx) + 24); }
 
 # Number of positional (non-flag) args captured during parse.
 # Includes everything after a `--` terminator.
-fn flags_positional_count(h) { return load64(h + 40); }
+fn flags_positional_count(h): i64 { return load64(h + 40); }
 
 # Return positional arg at `idx` (0-indexed) as a cstr ptr.
 # Returns 0 if idx is out of range. Order matches argv order.
-fn flags_positional(h, idx) {
+fn flags_positional(h, idx): i64 {
     if (idx < 0) { return 0; }
     if (idx >= load64(h + 40)) { return 0; }
     return load64(load64(h + 24) + idx * 8);
@@ -178,12 +178,12 @@ fn flags_positional(h, idx) {
 # success; UNKNOWN / MISSING_VALUE / BAD_INT / BUNDLED on
 # specific failures. Caller checks after a non-zero return
 # from flags_parse to decide what to print.
-fn flags_error(h) { return load64(h + 56); }
+fn flags_error(h): i64 { return load64(h + 56); }
 
 # Bounded equality: compare `len` bytes of `a` against `b`, where
 # `b` must be a cstr that ends exactly at offset `len`. Avoids the
 # argv-mutation trick of temporarily NUL-terminating at '='.
-fn _flags_streq_bounded(a, b, len) {
+fn _flags_streq_bounded(a, b, len): i64 {
     var i = 0;
     while (i < len) {
         if (load8(a + i) != load8(b + i)) { return 0; }
@@ -193,7 +193,7 @@ fn _flags_streq_bounded(a, b, len) {
     return 1;
 }
 
-fn _flags_find_long(h, name, len) {
+fn _flags_find_long(h, name, len): i64 {
     var count = load64(h + 16);
     var i = 0;
     while (i < count) {
@@ -207,7 +207,7 @@ fn _flags_find_long(h, name, len) {
     return 0;
 }
 
-fn _flags_find_short(h, ch) {
+fn _flags_find_short(h, ch): i64 {
     var count = load64(h + 16);
     var i = 0;
     while (i < count) {
@@ -222,7 +222,7 @@ var _flags_pint_ok = 0;
 
 # Parse signed decimal int from cstr `s`. Sets `_flags_pint_ok` to
 # 1 on success, 0 on failure. Rejects trailing garbage.
-fn _flags_parse_int(s) {
+fn _flags_parse_int(s): i64 {
     _flags_pint_ok = 0;
     if (s == 0) { return 0; }
     var i = 0;
@@ -244,7 +244,7 @@ fn _flags_parse_int(s) {
     return n;
 }
 
-fn _flags_apply(ep, value_ptr) {
+fn _flags_apply(ep, value_ptr): i64 {
     var type = load64(ep + 16);
     if (type == FLAG_BOOL) {
         store64(ep + 24, 1);
@@ -262,7 +262,7 @@ fn _flags_apply(ep, value_ptr) {
     return FLAG_ERR_NONE;
 }
 
-fn _flags_push_positional(h, tok) {
+fn _flags_push_positional(h, tok): i64 {
     var pc = load64(h + 40);
     if (pc >= load64(h + 32)) { return 0; }
     store64(load64(h + 24) + pc * 8, tok);
@@ -273,7 +273,7 @@ fn _flags_push_positional(h, tok) {
 # Parse argv[1..] into the flags context. Returns 0 on success,
 # -1 on error; `flags_error(h)` reports the specific FlagErr.
 # argv is laid out as argc `cstr*` pointers at `argv + i*8`.
-fn flags_parse(h, argc, argv) {
+fn flags_parse(h, argc, argv): i64 {
     if (argc > 0) { store64(h + 48, load64(argv)); }
     var i = 1;
     var in_positional = 0;
@@ -369,7 +369,7 @@ fn flags_parse(h, argc, argv) {
 #   -x, --long   help text     (type)
 # Callers typically print their own "Usage: prog ..." first, then
 # call flags_print_help for the auto-enumerated flag list.
-fn flags_print_help(h) {
+fn flags_print_help(h): i64 {
     var count = load64(h + 16);
     var i = 0;
     while (i < count) {

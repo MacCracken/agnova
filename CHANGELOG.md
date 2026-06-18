@@ -6,6 +6,13 @@ This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-06-18
+
+### Changed
+- **Cyrius toolchain bumped 5.7.12 → 6.2.21.** Build, lint, and `agnova version` now target the 6.2.21 cycc. `cyrius.cyml` pin and the version banner updated accordingly.
+
+## [0.1.0]
+
 ### Added
 - **Cyrius port from Rust scaffold** (3656 LOC of Rust → 2781 LOC of Cyrius). The entire library + a real CLI now run on the Cyrius 5.7.12 toolchain with no Rust dependency.
 - **CLI**: `agnova plan|validate|execute|version|help` subcommands. `plan` prints the full install plan with optional per-operation detail (`--verbose`); `validate` runs the 28 config checks in isolation; `execute` is gated behind `--i-mean-it` to satisfy the "no silent destructive operations" rule from CLAUDE.md.

@@ -12,7 +12,7 @@
 # command refuses to run, mirroring the CLAUDE.md "no silent destructive
 # operations" rule.
 
-var AGNOVA_VERSION = "0.1.0";
+var AGNOVA_VERSION = "0.1.1";
 var DEFAULT_TARGET_ROOT = "/mnt";
 
 # Indices for our flag set — populated by _build_flags(), used by the
@@ -144,7 +144,7 @@ fn _print_help() {
 fn _print_version() {
     print("agnova ", 7);
     println(AGNOVA_VERSION);
-    println("cyrius 5.7.12");
+    println("cyrius 6.2.21");
     return 0;
 }
 
