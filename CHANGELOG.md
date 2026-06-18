@@ -6,6 +6,8 @@ This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-18
+
 ### Added
 - **`system_op_display(op)`** (`src/types.cyr`) — completes the rust-old port. The Rust `impl fmt::Display for SystemOp` (types.rs:524-544) was the one symbol an evidence-based re-review found unported; it now reproduces all six variant forms byte-for-byte (`"{desc}: {bin} {args}"`, `write {path}`, `mkdir {path}`, `symlink {link} -> {target}`, `mount {dev} on {mp}`, `umount {mp}`).
 - **Test coverage for previously-untested code paths.** Suite: 253 → 299 tests, 0 failures. Added:

@@ -12,7 +12,7 @@
 # command refuses to run, mirroring the CLAUDE.md "no silent destructive
 # operations" rule.
 
-var AGNOVA_VERSION = "0.1.1";
+var AGNOVA_VERSION = "0.2.0";
 var DEFAULT_TARGET_ROOT = "/mnt";
 
 # Indices for our flag set — populated by _build_flags(), used by the

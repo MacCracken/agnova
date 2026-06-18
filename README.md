@@ -9,7 +9,7 @@ The installer is **plan-first**: every action is materialized as a `SystemOp` de
 - **Type**: Binary (Cyrius)
 - **License**: GPL-3.0-only
 - **Toolchain**: Cyrius 6.2.21
-- **Version**: 0.1.1
+- **Version**: 0.2.0
 
 ## Build
 

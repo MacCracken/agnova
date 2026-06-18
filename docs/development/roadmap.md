@@ -2,7 +2,7 @@
 
 ## Status
 
-**v0.1.1 (current)** — Cyrius toolchain bumped to 6.2.21. Library + CLI build clean, plan generation byte-equivalent to the Rust scaffold, executor implemented but not yet run end-to-end on hardware.
+**v0.2.0 (current)** — rust-old port complete and re-verified; toolchain on Cyrius 6.2.21. Library + CLI build clean, plan generation byte-equivalent to the Rust scaffold, executor implemented but not yet run end-to-end on hardware.
 
 ## Completed (v0.1.0)
 
@@ -25,7 +25,7 @@
 - [x] CI workflow runs `cyrius deps` + `cyrius build`
 - [x] `cyrius lint` — clean (5 long-line warnings only)
 
-## Next (v0.2.0) — rust-old port
+## Completed (v0.2.0) — rust-old port
 
 - [x] Complete the `rust-old/` → Cyrius port and retire `rust-old/` as historical reference only. Evidence-based module-by-module re-audit (types/helpers/validation/partitioning/rootfs/lib) confirmed byte-for-byte parity; the lone gap — `Display for SystemOp` — is now ported as `system_op_display` with tests. `partition_device` double-separator edge case fixed. Test suite 253 → 299 (all previously-untested validation checks and planner branches now covered).
 
