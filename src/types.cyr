@@ -274,6 +274,63 @@ fn op_unmount(mount_point) {
     return tagged_new(OP_UNMOUNT, p);
 }
 
+# Human-facing one-line summary of a SystemOp.
+# Mirrors the rust-old `impl fmt::Display for SystemOp` (types.rs:524-544)
+# byte-for-byte. The CLI's --verbose dump uses its own multi-line format
+# (cli.cyr::_print_op); this is the compact single-line form for logs.
+fn system_op_display(op) {
+    var t = tag(op);
+    var p = payload(op);
+    var sb = str_builder_new();
+    if (t == OP_COMMAND) {
+        # "{description}: {binary} {args joined by ' '}"
+        str_builder_add(sb, SystemOp_Command_description(p));
+        str_builder_add_cstr(sb, ": ");
+        str_builder_add(sb, SystemOp_Command_binary(p));
+        str_builder_add_cstr(sb, " ");
+        var args = SystemOp_Command_args(p);
+        var ai = 0;
+        while (ai < vec_len(args)) {
+            if (ai > 0) { str_builder_add_cstr(sb, " "); }
+            str_builder_add(sb, vec_get(args, ai));
+            ai = ai + 1;
+        }
+        return str_builder_build(sb);
+    }
+    if (t == OP_WRITE_FILE) {
+        str_builder_add_cstr(sb, "write ");
+        str_builder_add(sb, SystemOp_WriteFile_path(p));
+        return str_builder_build(sb);
+    }
+    if (t == OP_MAKE_DIR) {
+        str_builder_add_cstr(sb, "mkdir ");
+        str_builder_add(sb, SystemOp_MakeDir_path(p));
+        return str_builder_build(sb);
+    }
+    if (t == OP_SYMLINK) {
+        # "symlink {link} -> {target}"
+        str_builder_add_cstr(sb, "symlink ");
+        str_builder_add(sb, SystemOp_Symlink_link(p));
+        str_builder_add_cstr(sb, " -> ");
+        str_builder_add(sb, SystemOp_Symlink_target(p));
+        return str_builder_build(sb);
+    }
+    if (t == OP_MOUNT) {
+        # "mount {device} on {mount_point}"
+        str_builder_add_cstr(sb, "mount ");
+        str_builder_add(sb, SystemOp_Mount_device(p));
+        str_builder_add_cstr(sb, " on ");
+        str_builder_add(sb, SystemOp_Mount_mount_point(p));
+        return str_builder_build(sb);
+    }
+    if (t == OP_UNMOUNT) {
+        str_builder_add_cstr(sb, "umount ");
+        str_builder_add(sb, SystemOp_Unmount_mount_point(p));
+        return str_builder_build(sb);
+    }
+    return str_builder_build(sb);
+}
+
 # ============================================================
 # PhaseOps — one phase's plan: phase + description + ordered list of SystemOp
 # ============================================================

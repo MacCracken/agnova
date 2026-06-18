@@ -13,10 +13,13 @@
 fn partition_device(device_str, i) {
     var sb = str_builder_new();
     str_builder_add(sb, device_str);
-    if (str_contains_cstr(device_str, "nvme") == 1) {
-        str_builder_add_byte(sb, 112);
-    }
-    if (str_contains_cstr(device_str, "mmcblk") == 1) {
+    # NVMe and MMC use a 'p' separator before the partition number. Use a
+    # single flag (not two appends) so a hypothetical device matching both
+    # substrings still gets exactly one 'p' — matches rust-old partitioning.rs.
+    var needs_p = 0;
+    if (str_contains_cstr(device_str, "nvme") == 1) { needs_p = 1; }
+    if (str_contains_cstr(device_str, "mmcblk") == 1) { needs_p = 1; }
+    if (needs_p == 1) {
         str_builder_add_byte(sb, 112);
     }
     str_builder_add_int(sb, i + 1);

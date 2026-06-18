@@ -945,6 +945,9 @@ fn t_partition_device_helper_nvme() {
     test_group("partition_device_helper_nvme");
     assert(str_eq_cstr(partition_device(str_from("/dev/nvme0n1"), 0), "/dev/nvme0n1p1"), "nvme p1");
     assert(str_eq_cstr(partition_device(str_from("/dev/mmcblk0"), 1), "/dev/mmcblk0p2"), "mmcblk p2");
+    # Regression: a device matching BOTH substrings still gets exactly one 'p'.
+    var both = partition_device(str_from("/dev/nvme-mmcblk-weird"), 0);
+    assert(str_eq_cstr(both, "/dev/nvme-mmcblk-weirdp1"), "single p");
     return 0;
 }
 
@@ -1351,8 +1354,9 @@ fn t_iso_build_command_bios() {
 }
 
 fn t_system_op_descriptors() {
-    # Replaces the Rust system_op_display test (we don't have impl Display);
-    # instead verify we can construct + read all 6 variant kinds.
+    # Verify we can construct + read all 6 variant kinds, AND that
+    # system_op_display() reproduces the rust-old Display strings
+    # (rust-old/src/tests.rs:1240-1263 + the remaining variant forms).
     test_group("system_op_descriptors");
     var args = vec_new();
     vec_push(args, str_from("-s"));
@@ -1361,26 +1365,290 @@ fn t_system_op_descriptors() {
     assert_eq(tag(c), OP_COMMAND, "Command tag");
     assert(str_eq_cstr(SystemOp_Command_binary(payload(c)), "parted"), "binary");
     assert(str_eq_cstr(SystemOp_Command_description(payload(c)), "partition disk"), "desc");
+    # Display: "{description}: {binary} {args joined by ' '}"
+    assert(str_eq_cstr(system_op_display(c), "partition disk: parted -s /dev/sda"), "display command");
 
     var w = op_write_file(str_from("/etc/hostname"), str_from("agnos\n"), 420, str_from(""));
     assert_eq(tag(w), OP_WRITE_FILE, "WriteFile tag");
     assert(str_eq_cstr(SystemOp_WriteFile_path(payload(w)), "/etc/hostname"), "wf path");
+    assert(str_eq_cstr(system_op_display(w), "write /etc/hostname"), "display write");
 
     var s = op_symlink(str_from("/usr/share/zoneinfo/UTC"), str_from("/etc/localtime"));
     assert_eq(tag(s), OP_SYMLINK, "Symlink tag");
     assert(str_eq_cstr(SystemOp_Symlink_link(payload(s)), "/etc/localtime"), "sl link");
+    assert(str_eq_cstr(system_op_display(s), "symlink /etc/localtime -> /usr/share/zoneinfo/UTC"), "display symlink");
 
     var u = op_unmount(str_from("/mnt"));
     assert_eq(tag(u), OP_UNMOUNT, "Unmount tag");
+    assert(str_eq_cstr(system_op_display(u), "umount /mnt"), "display umount");
 
     var md = op_make_dir(str_from("/mnt/etc"), 493, 1);
     assert_eq(tag(md), OP_MAKE_DIR, "MakeDir tag");
     assert_eq(SystemOp_MakeDir_parents(payload(md)), 1, "parents");
+    assert(str_eq_cstr(system_op_display(md), "mkdir /mnt/etc"), "display mkdir");
 
     var opts = vec_new();
     vec_push(opts, str_from("defaults"));
     var mn = op_mount(str_from("/dev/sda1"), str_from("/mnt"), str_from("ext4"), opts);
     assert_eq(tag(mn), OP_MOUNT, "Mount tag");
+    assert(str_eq_cstr(system_op_display(mn), "mount /dev/sda1 on /mnt"), "display mount");
+    return 0;
+}
+
+# ------------------------------------------------------------
+# Additional validation coverage — security-relevant checks that
+# the original port left untested (dev-prefix/suffix allowlists,
+# kernel-param dangerous-char path, hostname/username bounds,
+# no-root-partition, and the two non-fatal warning categories).
+# ------------------------------------------------------------
+
+# Build a Str of `n` lowercase 'a' bytes (for length-bound checks).
+fn _lower_repeat(n) {
+    var sb = str_builder_new();
+    var i = 0;
+    while (i < n) {
+        str_builder_add_byte(sb, 97);
+        i = i + 1;
+    }
+    return str_builder_build(sb);
+}
+
+fn t_validate_rejects_device_without_dev_prefix() {
+    test_group("validate_rejects_device_without_dev_prefix");
+    var c = _test_config();
+    DiskLayout_set_target_device(InstallConfig_disk(c), str_from("sda"));
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects missing /dev/ prefix");
+    assert(str_contains_cstr(payload(r), "/dev/"), "msg mentions /dev/");
+    return 0;
+}
+
+fn t_validate_rejects_device_suffix_bad_char() {
+    test_group("validate_rejects_device_suffix_bad_char");
+    var c = _test_config();
+    # '#' is not a shell-dangerous char, so it passes check 3 and trips
+    # the suffix allowlist (check 4) specifically.
+    DiskLayout_set_target_device(InstallConfig_disk(c), str_from("/dev/sda#"));
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects bad suffix char");
+    assert(str_contains_cstr(payload(r), "after /dev/"), "msg mentions suffix");
+    return 0;
+}
+
+fn t_validate_rejects_kernel_param_dangerous_char() {
+    test_group("validate_rejects_kernel_param_dangerous_char");
+    var c = _test_config();
+    var kp = vec_new();
+    vec_push(kp, str_from("foo|bar"));
+    BootloaderConfig_set_kernel_params(InstallConfig_bootloader(c), kp);
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects dangerous char in kernel param");
+    assert(str_contains_cstr(payload(r), "dangerous character"), "msg mentions dangerous character");
+    return 0;
+}
+
+fn t_validate_rejects_empty_hostname() {
+    test_group("validate_rejects_empty_hostname");
+    var c = _test_config();
+    NetworkConfig_set_hostname(InstallConfig_network(c), str_from(""));
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects empty hostname");
+    assert(str_contains_cstr(payload(r), "hostname"), "msg mentions hostname");
+    return 0;
+}
+
+fn t_validate_rejects_hostname_too_long() {
+    test_group("validate_rejects_hostname_too_long");
+    var c = _test_config();
+    NetworkConfig_set_hostname(InstallConfig_network(c), _lower_repeat(64));
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects 64-char hostname");
+    assert(str_contains_cstr(payload(r), "1-63"), "msg mentions 1-63");
+    return 0;
+}
+
+fn t_validate_rejects_username_too_long() {
+    test_group("validate_rejects_username_too_long");
+    var c = _test_config();
+    UserConfig_set_username(InstallConfig_user(c), _lower_repeat(33));
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects 33-char username");
+    assert(str_contains_cstr(payload(r), "1-32"), "msg mentions 1-32");
+    return 0;
+}
+
+fn t_validate_rejects_no_root_partition() {
+    test_group("validate_rejects_no_root_partition");
+    var c = _test_config();
+    var parts = DiskLayout_partitions(InstallConfig_disk(c));
+    # default layout: idx 0 = ESP (/boot/efi), idx 1 = root ("/"). Move root off "/".
+    PartitionSpec_set_mount_point(vec_get(parts, 1), str_from("/data"));
+    var r = validate_config(c);
+    assert(is_err_result(r), "rejects missing root partition");
+    assert(str_contains_cstr(payload(r), "root partition"), "msg mentions root partition");
+    return 0;
+}
+
+fn t_validate_warns_permissive_trust() {
+    test_group("validate_warns_permissive_trust");
+    var c = _test_config();
+    SecurityConfig_set_trust_enforcement(InstallConfig_security(c), TRUST_PERMISSIVE);
+    var r = validate_config(c);
+    assert(is_ok(r), "ok with permissive-trust warning");
+    assert(_vec_str_any_contains(payload(r), "permissive"), "warns permissive");
+    return 0;
+}
+
+fn t_validate_warns_firewall_allow() {
+    test_group("validate_warns_firewall_allow");
+    var c = _test_config();
+    SecurityConfig_set_firewall_default(InstallConfig_security(c), FW_ALLOW);
+    var r = validate_config(c);
+    assert(is_ok(r), "ok with firewall-allow warning");
+    assert(_vec_str_any_contains(payload(r), "firewall"), "warns firewall allow");
+    return 0;
+}
+
+# ------------------------------------------------------------
+# Additional planner-branch coverage — filesystem variants, MBR,
+# swap/encrypted mount paths, the IMA branch, non-Desktop first-boot
+# service lists, UUID v4 bit-stamping, and fstab column structure.
+# ------------------------------------------------------------
+
+# Build a PartitionSpec with no fixed size and no flags (size irrelevant
+# for format/mount planning).
+fn _mkpart(label_cstr, mount_cstr, fs) {
+    return partition_spec_new(
+        str_from(label_cstr), str_from(mount_cstr), fs, 0, 0, vec_new());
+}
+
+# Replace a config's disk partition list (keeps the default device/flags).
+fn _set_parts(c, parts) {
+    DiskLayout_set_partitions(InstallConfig_disk(c), parts);
+    return 0;
+}
+
+fn t_format_ops_btrfs_xfs_swap() {
+    test_group("format_ops_btrfs_xfs_swap");
+    var c = _test_config();
+    var parts = vec_new();
+    vec_push(parts, _mkpart("agnos-root", "/", FS_BTRFS));
+    vec_push(parts, _mkpart("home", "/home", FS_XFS));
+    vec_push(parts, _mkpart("swap", "none", FS_SWAP));
+    _set_parts(c, parts);
+    var ops = PhaseOps_operations(plan_format_ops(c));
+    assert(_ops_has_command_binary(ops, "mkfs.btrfs"), "btrfs mkfs");
+    assert(_ops_has_command_arg(ops, "-f"), "btrfs -f flag");
+    assert(_ops_has_command_binary(ops, "mkfs.xfs"), "xfs mkfs");
+    assert(_ops_has_command_binary(ops, "mkswap"), "swap mkswap");
+    return 0;
+}
+
+fn t_partition_ops_mbr_mklabel() {
+    test_group("partition_ops_mbr_mklabel");
+    var c = _test_config();
+    DiskLayout_set_use_gpt(InstallConfig_disk(c), 0);
+    var ops = PhaseOps_operations(plan_partition_ops(c));
+    var first = vec_get(ops, 0);
+    var args = SystemOp_Command_args(payload(first));
+    assert(_vec_str_any_eq(args, "msdos"), "mklabel msdos for MBR");
+    return 0;
+}
+
+fn t_mount_ops_activates_swap() {
+    test_group("mount_ops_activates_swap");
+    var c = _test_config();
+    var parts = vec_new();
+    vec_push(parts, _mkpart("agnos-root", "/", FS_EXT4));
+    vec_push(parts, _mkpart("swap", "none", FS_SWAP));
+    _set_parts(c, parts);
+    var ops = PhaseOps_operations(plan_mount_ops(c, str_from("/mnt")));
+    assert(_ops_has_command_binary(ops, "swapon"), "swapon emitted for swap partition");
+    return 0;
+}
+
+fn t_mount_ops_encrypted_root_uses_mapper() {
+    test_group("mount_ops_encrypted_root_uses_mapper");
+    var c = _test_config();
+    DiskLayout_set_encrypt(InstallConfig_disk(c), 1);
+    var ops = PhaseOps_operations(plan_mount_ops(c, str_from("/mnt")));
+    var m = _find_mount(ops);
+    assert(m != 0, "has mount");
+    # root is mounted first (depth 0); encrypted root uses the LUKS mapper.
+    assert(str_eq_cstr(SystemOp_Mount_device(m), "/dev/mapper/agnos-root"), "root via mapper");
+    return 0;
+}
+
+fn t_security_ops_writes_ima_when_dmverity() {
+    test_group("security_ops_writes_ima_when_dmverity");
+    var c = _test_config();
+    SecurityConfig_set_enable_dmverity(InstallConfig_security(c), 1);
+    var ops = PhaseOps_operations(plan_security_ops(c, str_from("/mnt")));
+    assert(_ops_has_write_path(ops, "ima/policy.conf"), "writes IMA policy");
+    return 0;
+}
+
+fn t_security_ops_no_ima_without_dmverity() {
+    test_group("security_ops_no_ima_without_dmverity");
+    var c = _test_config();
+    SecurityConfig_set_enable_dmverity(InstallConfig_security(c), 0);
+    var ops = PhaseOps_operations(plan_security_ops(c, str_from("/mnt")));
+    assert_eq(_ops_has_write_path(ops, "ima/policy.conf"), 0, "no IMA policy when dmverity off");
+    return 0;
+}
+
+fn t_first_boot_ops_server_services() {
+    test_group("first_boot_ops_server_services");
+    var c = _test_config();
+    InstallConfig_set_mode(c, MODE_SERVER);
+    var ops = PhaseOps_operations(plan_first_boot_ops(c, str_from("/mnt")));
+    assert(_ops_has_command_arg(ops, "daimon"), "server enables daimon");
+    assert(_ops_has_command_arg(ops, "aegis"), "server enables aegis");
+    assert_eq(_ops_has_command_arg(ops, "aethersafha"), 0, "no compositor on server");
+    return 0;
+}
+
+fn t_first_boot_ops_minimal_services() {
+    test_group("first_boot_ops_minimal_services");
+    var c = _test_config();
+    InstallConfig_set_mode(c, MODE_MINIMAL);
+    var ops = PhaseOps_operations(plan_first_boot_ops(c, str_from("/mnt")));
+    assert(_ops_has_command_arg(ops, "nftables"), "minimal enables nftables");
+    assert_eq(_ops_has_command_arg(ops, "daimon"), 0, "no daimon on minimal");
+    assert_eq(_ops_has_command_arg(ops, "aethersafha"), 0, "no compositor on minimal");
+    return 0;
+}
+
+fn t_generate_machine_id_v4_bits() {
+    test_group("generate_machine_id_v4_bits");
+    var id = generate_machine_id();
+    var d = str_data(id);
+    # 13th hex char (index 12) is the UUID version nibble — must be '4'.
+    assert_eq(load8(d + 12), 52, "version nibble is '4'");
+    # 17th hex char (index 16) is the variant nibble — must be 8/9/a/b.
+    var variant = load8(d + 16);
+    var ok = 0;
+    if (variant == 56) { ok = 1; }
+    if (variant == 57) { ok = 1; }
+    if (variant == 97) { ok = 1; }
+    if (variant == 98) { ok = 1; }
+    assert(ok, "variant nibble in {8,9,a,b}");
+    return 0;
+}
+
+fn t_generate_fstab_columns() {
+    test_group("generate_fstab_columns");
+    var parts = vec_new();
+    vec_push(parts, _mkpart("ESP", "/boot/efi", FS_VFAT));
+    vec_push(parts, _mkpart("agnos-root", "/", FS_EXT4));
+    vec_push(parts, _mkpart("swap", "none", FS_SWAP));
+    var fstab = generate_fstab(parts, 0);
+    # root: options + dump(0) + pass(1)
+    assert(str_contains_cstr(fstab, "defaults,errors=remount-ro  0  1"), "root cols");
+    # ESP vfat: defaults + dump(0) + pass(0)
+    assert(str_contains_cstr(fstab, "LABEL=ESP  /boot/efi  vfat  defaults  0  0"), "esp cols");
+    # swap: none + swap + sw + dump(0) + pass(0)
+    assert(str_contains_cstr(fstab, "none  swap  sw  0  0"), "swap cols");
     return 0;
 }
 
@@ -1440,6 +1708,15 @@ fn main() {
     t_validate_accepts_valid_partition_labels();
     t_validate_rejects_mbr_with_more_than_four_partitions();
     t_validate_accepts_mbr_with_four_partitions();
+    t_validate_rejects_device_without_dev_prefix();
+    t_validate_rejects_device_suffix_bad_char();
+    t_validate_rejects_kernel_param_dangerous_char();
+    t_validate_rejects_empty_hostname();
+    t_validate_rejects_hostname_too_long();
+    t_validate_rejects_username_too_long();
+    t_validate_rejects_no_root_partition();
+    t_validate_warns_permissive_trust();
+    t_validate_warns_firewall_allow();
 
     # Phase advancement tests
     t_phase_advancement_sequence();
@@ -1515,6 +1792,19 @@ fn main() {
     t_security_ops_writes_nft_and_sysctl();
     t_first_boot_ops_enables_services();
     t_cleanup_ops_unmounts_and_syncs();
+
+    # Planner-branch coverage (filesystem variants, MBR, swap/encrypted
+    # mount, IMA branch, non-Desktop services, UUID bits, fstab columns)
+    t_format_ops_btrfs_xfs_swap();
+    t_partition_ops_mbr_mklabel();
+    t_mount_ops_activates_swap();
+    t_mount_ops_encrypted_root_uses_mapper();
+    t_security_ops_writes_ima_when_dmverity();
+    t_security_ops_no_ima_without_dmverity();
+    t_first_boot_ops_server_services();
+    t_first_boot_ops_minimal_services();
+    t_generate_machine_id_v4_bits();
+    t_generate_fstab_columns();
 
     # Full-plan tests
     t_full_execution_plan_has_all_phases();

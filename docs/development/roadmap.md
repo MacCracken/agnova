@@ -25,10 +25,13 @@
 - [x] CI workflow runs `cyrius deps` + `cyrius build`
 - [x] `cyrius lint` — clean (5 long-line warnings only)
 
-## Backlog (v0.2.0 candidates)
+## Next (v0.2.0) — rust-old port
 
-- [ ] Port `rust-old/src/tests.rs` (1398 LOC) → `tests/agnova.tcyr`. Mostly mechanical (Rust `#[test]` → Cyrius `assert_eq` calls under `test_group()`).
-- [ ] **End-to-end hardware test** of executor on disposable hardware (loopback file or VM). This is the v0.1.0 → v0.2.0 gate.
+- [x] Complete the `rust-old/` → Cyrius port and retire `rust-old/` as historical reference only. Evidence-based module-by-module re-audit (types/helpers/validation/partitioning/rootfs/lib) confirmed byte-for-byte parity; the lone gap — `Display for SystemOp` — is now ported as `system_op_display` with tests. `partition_device` double-separator edge case fixed. Test suite 253 → 299 (all previously-untested validation checks and planner branches now covered).
+
+## Backlog (v0.3.0)
+
+- [ ] **End-to-end hardware test** of executor on disposable hardware (loopback file or VM).
 - [ ] CHANGELOG entry per-PR enforced in CI
 - [ ] `cyrius fmt --check` in CI (figure out the right invocation)
 - [ ] Fix the 5 `line exceeds 120 characters` lint warnings (cosmetic only)
@@ -36,7 +39,7 @@
 - [ ] Mount options: parse `vec<Str>` options into MS_* flag bits (currently passed as `0` to `sys_mount`; agnova only ever emits `["defaults"]` so the simplification is safe today, but bug-prone if extended)
 - [ ] Bench harness — `tests/agnova.bcyr` should exercise plan-generation throughput (microseconds per `full_execution_plan` call)
 
-## Future (v0.3.0+)
+## Future (v0.4.0)
 
 - [ ] **Resumable installs** — checkpoint `AgnovaInstaller` state to `/run/agnos/installer/state.json` after each phase advance; on restart, resume from last completed phase
 - [ ] **Hardware detection** — probe `/sys/block` for disks, `/proc/cpuinfo` for arch, `/sys/firmware/efi` for UEFI

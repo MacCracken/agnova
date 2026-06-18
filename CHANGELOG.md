@@ -6,6 +6,19 @@ This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Added
+- **`system_op_display(op)`** (`src/types.cyr`) — completes the rust-old port. The Rust `impl fmt::Display for SystemOp` (types.rs:524-544) was the one symbol an evidence-based re-review found unported; it now reproduces all six variant forms byte-for-byte (`"{desc}: {bin} {args}"`, `write {path}`, `mkdir {path}`, `symlink {link} -> {target}`, `mount {dev} on {mp}`, `umount {mp}`).
+- **Test coverage for previously-untested code paths.** Suite: 253 → 299 tests, 0 failures. Added:
+  - `system_op_display` (all 6 variants) and a `partition_device` both-substring regression.
+  - 9 security-relevant validation checks: missing `/dev/` prefix, the post-`/dev/` suffix allowlist, the kernel-param dangerous-*character* path, empty/over-length hostname, over-length username, the no-root-partition guard, and the permissive-trust + allow-firewall warnings.
+  - 10 planner-branch checks: `mkfs.btrfs`/`mkfs.xfs`/`mkswap` formatting, MBR `mklabel msdos`, swap `swapon` and encrypted-root `/dev/mapper` mount paths, the IMA-policy branch (on/off), Server + Minimal first-boot service lists, UUID v4 version/variant bit-stamping, and fstab column structure (separators, dump/pass numbers).
+
+### Fixed
+- **`partition_device` latent double-separator** (`src/partitioning.cyr`) — a device string matching *both* `nvme` and `mmcblk` appended two `p` separators (`...pp1`) instead of one. Unreachable on real hardware but a divergence from rust-old; now uses a single flag so exactly one `p` is emitted. Regression test added.
+
+### Verified
+- **Full rust-old → Cyrius port re-audit.** Module-by-module behavioral comparison (types, helpers, validation, partitioning, rootfs, lib/orchestrator) confirms the port is faithful: package lists, install-time estimates, the non-recoverable phase set, all shell-injection character sets, GRUB/systemd-boot configs, nftables/IMA/sysctl, fstab, and kernel cmdline all match the Rust source. Sole gap was `Display for SystemOp` (now closed).
+
 ## [0.1.1] - 2026-06-18
 
 ### Changed
