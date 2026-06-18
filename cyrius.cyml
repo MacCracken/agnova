@@ -1,6 +1,6 @@
 [package]
 name = "agnova"
-version = "0.2.0"
+version = "${file:VERSION}"
 description = "agnova — Cyrius port (from 3656 lines of Rust)"
 license = "GPL-3.0-only"
 language = "cyrius"
