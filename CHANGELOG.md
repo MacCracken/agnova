@@ -6,6 +6,8 @@ This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-18
+
 ### Added
 - **`execute --until <phase>`** stops the install after a named phase (`partition|encryption|format|mount|base|packages|configure|bootloader|user|security|firstboot|cleanup`). Enables a clean disk-only run (`--until mount`) for loopback/VM testing without needing the AGNOS base-system artifacts. (`src/cli.cyr`, `execute_all` in `src/executor.cyr`)
 - **Mount options are now honored at execution time.** New pure helper `mount_flags_from_options(options)` (`src/helpers.cyr`) parses a `vec<Str>` of mount options — one-per-element or comma-separated, mount(8) style — into combined `MS_*` flag bits (`ro`/`nosuid`/`nodev`/`noexec`/`remount`/`bind`/`move`; no-flag tokens like `rw`/`defaults` contribute 0). `_exec_mount` now passes these flags to `sys_mount` instead of a hard-coded `0`. 7 unit tests added. (Data-string options such as `subvol=` are still not threaded — agnova emits only flag/`defaults` options at mount time.)

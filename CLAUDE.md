@@ -7,7 +7,7 @@
 - **Type**: Binary
 - **License**: GPL-3.0-only
 - **MSRV**: 1.89
-- **Version**: SemVer 0.2.0
+- **Version**: SemVer 0.3.0
 - **Genesis repo**: [agnosticos](https://github.com/MacCracken/agnosticos)
 - **Philosophy**: [AGNOS Philosophy & Intention](https://github.com/MacCracken/agnosticos/blob/main/docs/philosophy.md)
 - **First-party standards**: [First-Party Application Standards](https://github.com/MacCracken/agnosticos/blob/main/docs/development/applications/first-party-standards.md)

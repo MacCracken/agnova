@@ -2,7 +2,7 @@
 
 ## Status
 
-**v0.2.0 (current)** — rust-old port complete and re-verified; toolchain on Cyrius 6.2.21. Library + CLI build clean, plan generation byte-equivalent to the Rust scaffold, executor implemented but not yet run end-to-end on hardware.
+**v0.3.0 (current)** — executor disk path validated on real (loopback) hardware: partition → format → mount run clean end-to-end. Three execution-only bugs found and fixed (PATH/exec, loop-device naming, phase attribution). Mount-option `MS_*` parsing, `execute --until <phase>` staging, a plan-generation benchmark harness, and CI gates (CHANGELOG-per-PR, `cyrfmt --check`) added. 307 tests, lint + fmt clean. Full multi-phase install pass (base tarball, packages, LUKS, bootloader) deferred to v0.7.0 — needs a VM with AGNOS artifacts.
 
 ## Completed (v0.1.0)
 
@@ -29,15 +29,26 @@
 
 - [x] Complete the `rust-old/` → Cyrius port and retire `rust-old/` as historical reference only. Evidence-based module-by-module re-audit (types/helpers/validation/partitioning/rootfs/lib) confirmed byte-for-byte parity; the lone gap — `Display for SystemOp` — is now ported as `system_op_display` with tests. `partition_device` double-separator edge case fixed. Test suite 253 → 299 (all previously-untested validation checks and planner branches now covered).
 
-## Backlog (v0.3.0)
+## Completed (v0.3.0)
 
-- [~] **End-to-end hardware test** of executor on disposable hardware (loopback file or VM). Disk path **validated on a loopback device**: partition (GPT, ESP+root, boot/esp flags) → format (`mkfs.vfat`/`mkfs.ext4`) → mount all execute correctly. The run surfaced and fixed three real executor bugs (PATH resolution, loop-device naming, phase attribution). Still open: a full install needs the AGNOS base-system tarball + `ark` (not present on a dev box), and the LUKS/cryptsetup path is untested. `execute --until mount` now makes the disk-path run a clean pass (added). Remaining for full close: LUKS/cryptsetup path + a real base-system tarball (VM with AGNOS artifacts).
+- [x] **End-to-end executor disk path validated on real (loopback) hardware** — partition (GPT, ESP+root, boot/esp flags) → format (`mkfs.vfat`/`mkfs.ext4`) → mount all execute clean (`phases completed: 4/14, errors: 0`). The run found + fixed three execution-only bugs: PATH resolution in `_exec_with_stdin` (`rc=127`), loop-device partition naming (`/dev/loop0p1`), and phase/recoverability misattribution in `execute_all`.
+- [x] `execute --until <phase>` — staged execution; `--until mount` gives a clean disk-only pass without AGNOS artifacts.
+- [x] Mount options: `mount_flags_from_options` parses `vec<Str>` options (one-per-element or comma-separated) into `MS_*` flag bits; `_exec_mount` threads them into `sys_mount`. (Data-string options like `subvol=` not threaded — agnova emits only flag/`defaults` options today.)
+- [x] Bench harness — `tests/agnova.bcyr` exercises plan-generation throughput (`full_execution_plan`, `total_ops_count`, `validate_config`, `default_packages`) via `cyrius bench`. Baseline µs/call in CHANGELOG.
 - [x] CHANGELOG entry per-PR enforced in CI (`changelog` job fails PRs whose diff omits `CHANGELOG.md`).
-- [x] `cyrfmt --check` in CI — whole tree reformatted to cyrfmt canonical and a `Format check` step added to the `build` job (runs `cyrfmt --check` over `src/*.cyr` + `tests/*`). (The `cyrius fmt` wrapper mangles args; the `cyrfmt` binary is invoked directly.)
-- [x] ~~Fix the 5 `line exceeds 120 characters` lint warnings~~ — already clean; `cyrius lint` reports 0 warnings across `src/` and `lib/`.
-- [ ] Wire `--passphrase` into LUKS encryption ops — CLI side done (`--passphrase` parsed, threaded into `full_execution_plan`/`agnova_installer_new`, and required-when-`--encrypt` validation in `execute`). Remaining: validate the executor's stdin-pipe path against real `cryptsetup` (folds into the hardware test).
-- [x] Mount options: `mount_flags_from_options` parses `vec<Str>` options (one-per-element or comma-separated) into `MS_*` flag bits; `_exec_mount` threads them into `sys_mount`. Data-string options (e.g. `subvol=`) still not threaded — agnova emits only flag/`defaults` options today.
-- [x] Bench harness — `tests/agnova.bcyr` exercises plan-generation throughput (`full_execution_plan`, `total_ops_count`, `validate_config`, `default_packages`) via `cyrius bench`. Baseline µs/call recorded in CHANGELOG.
+- [x] `cyrfmt --check` in CI — whole tree reformatted to cyrfmt canonical + a `Format check` step in the `build` job. (The `cyrius fmt` wrapper mangles args; the `cyrfmt` binary is invoked directly.)
+- [x] ~~Fix the 5 `line exceeds 120 characters` lint warnings~~ — already clean; `cyrius lint` is 0 warnings across `src/` and `lib/`.
+
+## Deferred to v0.7.0 — full multi-phase install pass
+
+The disk path (partition/format/mount) is proven. A *complete* `agnova execute` (no `--until`) reaching `PHASE_COMPLETE` with `errors: 0` is **blocked on AGNOS runtime artifacts that don't exist on a dev box** — so it's deferred to v0.7.0. **What is needed to close it:**
+
+- **A VM (or real machine) running AGNOS-built media**, since the install shells out to AGNOS tooling and expects AGNOS files in place. Specifically:
+  - **Base-system tarball** present at `/run/agnos/installer/base-system.tar.zst` — the `INSTALL_BASE` phase `tar`-extracts it (this is exactly where the dev-box run stops). Produced by the AGNOS image build (zugot recipes).
+  - **`ark` package manager** on `PATH` — `INSTALL_PACKAGES` runs `ark` (and `plan_install_base_ops` references `ark-install.sh`).
+- **LUKS/cryptsetup execution validated** — run `execute --encrypt --passphrase … --i-mean-it` against a loopback/VM and confirm the stdin-piped `cryptsetup luksFormat` + `open` work. The planner ops and the executor's stdin-pipe are implemented and unit-covered; only *real-cryptsetup execution* is unverified. (Closes the old "wire `--passphrase`" item — CLI side is done; this is the remaining execution check.)
+- **Bootloader install validated on a UEFI VM** — `bootctl install` (systemd-boot) and `grub-install` (GRUB) actually writing to the ESP.
+- **Full matrix** — `execute` to `PHASE_COMPLETE`, `errors: 0`, across UEFI+BIOS × encrypted+unencrypted × all 4 modes. Satisfying this also satisfies the v1.0 "one full install succeeds end-to-end" criterion.
 
 ## Future (v0.4.0)
 
