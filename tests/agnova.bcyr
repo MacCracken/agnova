@@ -1,10 +1,81 @@
-# agnova benchmarks
+# tests/agnova.bcyr — agnova plan-generation benchmarks
+#
+# Run: cyrius bench tests/agnova.bcyr
+#
+# Measures the throughput of the pure planning layer (no disk I/O):
+# building the full install plan, counting ops, validating a config,
+# and resolving per-mode package lists. These are the hot paths the
+# CLI exercises on every `plan`/`validate` invocation.
+#
+# Memory note: the stdlib bump allocator (lib/alloc.cyr) never frees
+# individual allocations and bench_run() does not reset between
+# iterations, and alloc_reset() cannot be used mid-run (it would wipe
+# the live fixture + bench objects, which share the global heap). So
+# the fixture is built once and iteration counts are kept modest; the
+# heap grows to ~(sum of iterations x per-call bytes) ≈ 150 MB for the
+# whole run, then is reclaimed on process exit.
 
-fn bench_noop() { return 0; }
+include "src/types.cyr"
+include "src/helpers.cyr"
+include "src/validation.cyr"
+include "src/partitioning.cyr"
+include "src/rootfs.cyr"
+include "src/orchestrator.cyr"
+
+# Fixture (rebuilt after every alloc_reset). A valid Desktop config on
+# /dev/sda with the default ESP+root layout — the same shape _test_config
+# uses in the test suite.
+var BCFG = 0;
+var BTGT = 0;
+var BPASS = 0;
+
+fn _bench_fixture() {
+    BCFG = install_config_default();
+    InstallConfig_set_disk(BCFG, agnova_default_disk_layout(str_from("/dev/sda"), 0));
+    BTGT = str_from("/mnt");
+    BPASS = str_from("");
+    return 0;
+}
+
+fn bench_full_execution_plan() {
+    full_execution_plan(BCFG, BTGT, BPASS);
+    return 0;
+}
+
+fn bench_total_ops_count() {
+    total_ops_count(BCFG, BTGT, BPASS);
+    return 0;
+}
+
+fn bench_validate_config() {
+    validate_config(BCFG);
+    return 0;
+}
+
+fn bench_default_packages() {
+    default_packages(MODE_DESKTOP);
+    return 0;
+}
+
+# Time `n` iterations of `fp` and report.
+fn _run(name, fp, n) {
+    var b = bench_new(name);
+    bench_run(b, fp, n);
+    bench_report(b);
+    return 0;
+}
 
 fn main() {
     alloc_init();
-    bench("noop", &bench_noop, 1000000);
+    _bench_fixture();
+    println("=== agnova plan-generation benchmarks ===");
+    # ~31 KB/call.
+    _run("full_execution_plan", &bench_full_execution_plan, 2000);
+    _run("total_ops_count", &bench_total_ops_count, 2000);
+    # ~216 B/call.
+    _run("validate_config", &bench_validate_config, 30000);
+    # ~1.5 KB/call.
+    _run("default_packages", &bench_default_packages, 15000);
     return 0;
 }
 

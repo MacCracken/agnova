@@ -6,6 +6,12 @@ This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Added
+- **Plan-generation benchmark harness** (`tests/agnova.bcyr`). Replaces the no-op stub with real `bench_new`/`bench_run` timings over the pure planning layer. Baseline on the default Desktop config (x86_64): `full_execution_plan` ≈ 67 µs/call, `total_ops_count` ≈ 66 µs, `validate_config` ≈ 1.7 µs, `default_packages` ≈ 4.5 µs. Run with `cyrius bench tests/agnova.bcyr`.
+
+### Changed
+- **`cyrius.cyml` stdlib deps gain `bench` + `fnptr`**, and `lib/bench.cyr` is vendored into `./lib/` (consistent with the project's vendored stdlib) so `cyrius bench` resolves against the 6.2.21 snapshot. The main binary build is unaffected (bench symbols are dead-code-eliminated).
+
 ## [0.2.0] - 2026-06-18
 
 ### Added

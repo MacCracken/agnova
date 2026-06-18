@@ -31,13 +31,13 @@
 
 ## Backlog (v0.3.0)
 
-- [ ] **End-to-end hardware test** of executor on disposable hardware (loopback file or VM).
+- [ ] **End-to-end hardware test** of executor on disposable hardware (loopback file or VM). This is the v0.3.0 gate.
 - [ ] CHANGELOG entry per-PR enforced in CI
 - [ ] `cyrius fmt --check` in CI (figure out the right invocation)
-- [ ] Fix the 5 `line exceeds 120 characters` lint warnings (cosmetic only)
-- [ ] Wire `--passphrase` into LUKS encryption ops (currently flag is parsed but stdin-piping path needs validation)
+- [x] ~~Fix the 5 `line exceeds 120 characters` lint warnings~~ — already clean; `cyrius lint` reports 0 warnings across `src/` and `lib/`.
+- [ ] Wire `--passphrase` into LUKS encryption ops — CLI side done (`--passphrase` parsed, threaded into `full_execution_plan`/`agnova_installer_new`, and required-when-`--encrypt` validation in `execute`). Remaining: validate the executor's stdin-pipe path against real `cryptsetup` (folds into the hardware test).
 - [ ] Mount options: parse `vec<Str>` options into MS_* flag bits (currently passed as `0` to `sys_mount`; agnova only ever emits `["defaults"]` so the simplification is safe today, but bug-prone if extended)
-- [ ] Bench harness — `tests/agnova.bcyr` should exercise plan-generation throughput (microseconds per `full_execution_plan` call)
+- [x] Bench harness — `tests/agnova.bcyr` exercises plan-generation throughput (`full_execution_plan`, `total_ops_count`, `validate_config`, `default_packages`) via `cyrius bench`. Baseline µs/call recorded in CHANGELOG.
 
 ## Future (v0.4.0)
 
@@ -55,7 +55,7 @@
 - [ ] One full install from `agnova execute` succeeds end-to-end on real hardware (UEFI + BIOS, encrypted + unencrypted, all 4 modes)
 - [ ] Test suite ports the Rust scaffold's coverage and adds executor-path coverage via loopback
 - [ ] Resumable installs proven across simulated kernel panic mid-install
-- [ ] All 5 long-line lint warnings cleaned up; `cyrius lint` is 0/0
+- [x] `cyrius lint` is 0/0 across `src/` and `lib/`
 - [ ] CHANGELOG follows Keep a Changelog strictly; every PR adds an entry
 - [ ] `docs/architecture/overview.md` reflects every public symbol's contract
 - [ ] An ADR exists for every interface decision that's hard to reverse (currently 1 — the port itself)
