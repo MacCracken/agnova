@@ -484,12 +484,12 @@ fn user_config_default() {
     vec_push(groups, str_from("wheel"));
     vec_push(groups, str_from("agents"));
     return user_config_new(
-        str_from(""),
-        str_from(""),
-        str_from("/usr/bin/agnoshi"),
-        groups,
-        vec_new(),
-        1
+    str_from(""),
+    str_from(""),
+    str_from("/usr/bin/agnoshi"),
+    groups,
+    vec_new(),
+    1
     );
 }
 
@@ -508,7 +508,7 @@ struct SecurityConfig {
 }
 
 fn security_config_new(enable_luks, enable_secureboot, enable_tpm, enable_dmverity,
-                       trust_enforcement, firewall_default) {
+trust_enforcement, firewall_default) {
     var p = alloc(sizeof(SecurityConfig));
     store64(p, enable_luks);
     store64(p + 8, enable_secureboot);
@@ -549,8 +549,8 @@ fn package_selection_empty() {
 
 fn package_selection_total_count(ps) {
     return vec_len(PackageSelection_base_packages(ps))
-         + vec_len(PackageSelection_mode_packages(ps))
-         + vec_len(PackageSelection_extra_packages(ps));
+    + vec_len(PackageSelection_mode_packages(ps))
+    + vec_len(PackageSelection_extra_packages(ps));
 }
 
 # ============================================================
@@ -585,15 +585,15 @@ fn install_config_new(mode, disk, bootloader, network, user, security, packages,
 
 fn install_config_default() {
     return install_config_new(
-        MODE_DESKTOP,
-        disk_layout_default(),
-        bootloader_config_default(),
-        network_config_default(),
-        user_config_default(),
-        security_config_default(),
-        package_selection_empty(),
-        str_from("en_US.UTF-8"),
-        str_from("UTC")
+    MODE_DESKTOP,
+    disk_layout_default(),
+    bootloader_config_default(),
+    network_config_default(),
+    user_config_default(),
+    security_config_default(),
+    package_selection_empty(),
+    str_from("en_US.UTF-8"),
+    str_from("UTC")
     );
 }
 
@@ -696,12 +696,12 @@ fn iso_config_new(output_path, volume_label, root_tree, uefi, bios, compression)
 
 fn iso_config_default() {
     return iso_config_new(
-        str_from("agnos-install.iso"),
-        str_from("AGNOS"),
-        str_from("/tmp/agnos-iso-tree"),
-        1,
-        0,
-        str_from("zstd")
+    str_from("agnos-install.iso"),
+    str_from("AGNOS"),
+    str_from("/tmp/agnos-iso-tree"),
+    1,
+    0,
+    str_from("zstd")
     );
 }
 

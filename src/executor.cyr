@@ -21,6 +21,32 @@ fn _build_argv(args) {
     return argv;
 }
 
+# Resolve a command name to an absolute executable path. execve() does
+# NOT search PATH, and we hand the child a minimal env, so a bare name
+# like "parted" must be turned into "/usr/bin/parted" first. An already-
+# absolute name is returned unchanged; if nothing is found we return the
+# bare name (execve then fails, surfacing as rc=127 — the old behaviour).
+fn _resolve_binary(name) {
+    if (str_len(name) > 0) {
+        if (load8(str_data(name)) == 47) { return str_cstr(name); }
+    }
+    var dirs = vec_new();
+    vec_push(dirs, "/usr/bin/");
+    vec_push(dirs, "/usr/sbin/");
+    vec_push(dirs, "/bin/");
+    vec_push(dirs, "/sbin/");
+    var i = 0;
+    while (i < vec_len(dirs)) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, vec_get(dirs, i));
+        str_builder_add(sb, name);
+        var cand = str_cstr(str_builder_build(sb));
+        if (sys_access(cand, 0) == 0) { return cand; }
+        i = i + 1;
+    }
+    return str_cstr(name);
+}
+
 # Spawn a command, optionally piping stdin_str into the child's stdin.
 # stdin_str empty == no stdin (just runs the command). Returns child
 # exit status (0 = success).
@@ -28,9 +54,13 @@ fn _exec_with_stdin(args, stdin_str) {
     var n = vec_len(args);
     if (n < 1) { return 0 - 1; }
     var argv = _build_argv(args);
-    var cmd_cstr = load64(argv);
-    var envp = alloc(8);
-    store64(envp, 0);
+    # Resolve argv[0] to an absolute path (execve does not search PATH).
+    var cmd_cstr = _resolve_binary(vec_get(args, 0));
+    # Hand the child a PATH so tools that re-exec helpers (parted, mkfs)
+    # can find them.
+    var envp = alloc(16);
+    store64(envp, str_cstr(str_from("PATH=/usr/sbin:/usr/bin:/sbin:/bin")));
+    store64(envp + 8, 0);
 
     var has_stdin = 0;
     if (str_len(stdin_str) > 0) { has_stdin = 1; }
@@ -168,11 +198,11 @@ fn _exec_mount(p) {
     # flag/"defaults" options at mount time, so the data arg stays 0.
     var flags = mount_flags_from_options(SystemOp_Mount_options(p));
     return sys_mount(
-        str_cstr(device),
-        str_cstr(mount_point),
-        str_cstr(fs_type),
-        flags,
-        0
+    str_cstr(device),
+    str_cstr(mount_point),
+    str_cstr(fs_type),
+    flags,
+    0
     );
 }
 
@@ -240,15 +270,27 @@ fn execute_phase(inst, phase_ops) {
 # Execute the entire planned install: every PhaseOps in order, advancing
 # the orchestrator's phase between successful runs. Returns 0 on full
 # success, -1 if any fatal op failed (orchestrator state holds details).
-fn execute_all(inst, plans) {
+fn execute_all(inst, plans, until_phase) {
     var n = vec_len(plans);
     var i = 0;
     while (i < n) {
         var phase_ops = vec_get(plans, i);
+        var phase = PhaseOps_phase(phase_ops);
+        # Mirror the phase actually being executed BEFORE running its ops,
+        # so a failure is attributed to the correct phase (and gets the
+        # correct recoverability). The orchestrator otherwise starts at
+        # PHASE_VALIDATE_CONFIG and would lag by one.
+        agnova_set_phase(inst, phase);
         var rc = execute_phase(inst, phase_ops);
         if (rc != 0) { return 0 - 1; }
-        agnova_advance_phase(inst);
+        vec_push(AgnovaInstaller_completed_phases(inst), phase);
+        # Stop early if the caller asked to halt after this phase (e.g.
+        # `--until mount` for a disk-only loopback run). PHASE_COMPLETE is
+        # never a plan phase, so the default (run everything) never matches.
+        if (phase == until_phase) { return 0; }
         i = i + 1;
     }
+    # All phases ran: land on PHASE_COMPLETE so agnova_is_complete() is true.
+    agnova_set_phase(inst, PHASE_COMPLETE);
     return 0;
 }

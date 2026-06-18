@@ -29,6 +29,7 @@ var FLAG_ENCRYPT = 0;
 var FLAG_PASSPHRASE = 0;
 var FLAG_VERBOSE = 0;
 var FLAG_IMEANIT = 0;
+var FLAG_UNTIL = 0;
 var FLAG_HELP = 0;
 
 fn _build_flags() {
@@ -45,6 +46,7 @@ fn _build_flags() {
     FLAG_PASSPHRASE = flags_add_str(h,    0, "passphrase",  0,        "LUKS passphrase for --encrypt+execute");
     FLAG_VERBOSE    = flags_add_bool(h, 118, "verbose",     0,        "print every op, not just phase summaries");
     FLAG_IMEANIT    = flags_add_bool(h,   0, "i-mean-it",   0,        "required to actually execute (DESTRUCTIVE)");
+    FLAG_UNTIL      = flags_add_str(h,    0, "until",       0,        "execute: stop after this phase (e.g. mount)");
     FLAG_HELP       = flags_add_bool(h,   0, "help",        0,        "print this help");
     return h;
 }
@@ -65,6 +67,27 @@ fn _parse_bootloader(cstr_bl) {
     var s = str_from(cstr_bl);
     if (str_eq_cstr(s, "grub2") == 1) { return BOOT_GRUB2; }
     return BOOT_SYSTEMD;
+}
+
+# Parse the --until phase name into a phase enum. Returns PHASE_COMPLETE
+# (run everything) when unset or unrecognised — PHASE_COMPLETE is never a
+# plan phase, so execute_all runs to the end.
+fn _parse_until_phase(cstr) {
+    if (cstr == 0) { return PHASE_COMPLETE; }
+    var s = str_from(cstr);
+    if (str_eq_cstr(s, "partition") == 1) { return PHASE_PARTITION_DISK; }
+    if (str_eq_cstr(s, "encryption") == 1) { return PHASE_SETUP_ENCRYPTION; }
+    if (str_eq_cstr(s, "format") == 1) { return PHASE_FORMAT_FILESYSTEMS; }
+    if (str_eq_cstr(s, "mount") == 1) { return PHASE_MOUNT_FILESYSTEMS; }
+    if (str_eq_cstr(s, "base") == 1) { return PHASE_INSTALL_BASE; }
+    if (str_eq_cstr(s, "packages") == 1) { return PHASE_INSTALL_PACKAGES; }
+    if (str_eq_cstr(s, "configure") == 1) { return PHASE_CONFIGURE_SYSTEM; }
+    if (str_eq_cstr(s, "bootloader") == 1) { return PHASE_INSTALL_BOOTLOADER; }
+    if (str_eq_cstr(s, "user") == 1) { return PHASE_CREATE_USER; }
+    if (str_eq_cstr(s, "security") == 1) { return PHASE_SETUP_SECURITY; }
+    if (str_eq_cstr(s, "firstboot") == 1) { return PHASE_FIRST_BOOT_SETUP; }
+    if (str_eq_cstr(s, "cleanup") == 1) { return PHASE_CLEANUP; }
+    return PHASE_COMPLETE;
 }
 
 # Build an InstallConfig from parsed flags. Returns 0 (cstr ptr) for
@@ -106,8 +129,8 @@ fn _config_from_flags(h) {
     if (tz_cstr != 0) { tz_str = str_from(tz_cstr); }
 
     return install_config_new(
-        mode, disk, bootloader, network, user, security, packages,
-        locale_str, tz_str
+    mode, disk, bootloader, network, user, security, packages,
+    locale_str, tz_str
     );
 }
 
@@ -137,6 +160,7 @@ fn _print_help() {
     println("        --passphrase PASS    LUKS passphrase (required if --encrypt and execute)");
     println("    -v, --verbose            Print every op, not just per-phase counts");
     println("        --i-mean-it          Required to actually execute (DESTRUCTIVE)");
+    println("        --until PHASE        execute: stop after PHASE (partition|format|mount|base|...)");
     println("        --help               Print this help");
     return 0;
 }
@@ -398,8 +422,10 @@ fn _cmd_execute(h) {
     var inst = agnova_installer_new(cfg, passphrase);
     var plans = full_execution_plan(cfg, target_str, passphrase);
 
+    var until_phase = _parse_until_phase(flags_get_str(h, FLAG_UNTIL));
+
     println("=== executing install plan ===");
-    var rc = execute_all(inst, plans);
+    var rc = execute_all(inst, plans, until_phase);
 
     var res = agnova_result(inst);
     print("phases completed: ", 18);

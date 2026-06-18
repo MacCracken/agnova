@@ -42,6 +42,13 @@ jobs:
             cyrius lint "$f"
           done
 
+      - name: Format check
+        run: |
+          set -e
+          for f in src/*.cyr tests/*.tcyr tests/*.bcyr tests/*.fcyr; do
+            cyrfmt --check "$f"
+          done
+
       - name: Build
         run: |
           mkdir -p build

@@ -32,9 +32,9 @@ fn agnova_installer_new(config, luks_passphrase) {
     var p = alloc(sizeof(AgnovaInstaller));
     store64(p, config);
     store64(p + 8, install_progress_new(
-        PHASE_VALIDATE_CONFIG,
-        str_from("Preparing installation"),
-        clock_epoch_secs()));
+    PHASE_VALIDATE_CONFIG,
+    str_from("Preparing installation"),
+    clock_epoch_secs()));
     store64(p + 16, vec_new());
     store64(p + 24, vec_new());
     store64(p + 32, vec_new());
@@ -49,9 +49,9 @@ fn agnova_default_disk_layout(device, encrypt) {
     vec_push(esp_flags, PFLAG_BOOT);
     vec_push(esp_flags, PFLAG_ESP);
     vec_push(parts, partition_spec_new(
-        str_from("ESP"), str_from("/boot/efi"), FS_VFAT, 512, 1, esp_flags));
+    str_from("ESP"), str_from("/boot/efi"), FS_VFAT, 512, 1, esp_flags));
     vec_push(parts, partition_spec_new(
-        str_from("agnos-root"), str_from("/"), FS_EXT4, 0, 0, vec_new()));
+    str_from("agnos-root"), str_from("/"), FS_EXT4, 0, 0, vec_new()));
     return disk_layout_new(device, parts, 1, encrypt);
 }
 
@@ -101,6 +101,20 @@ fn agnova_advance_phase(inst) {
     return 1;
 }
 
+# Set the current phase directly (used by the executor to mirror the
+# phase whose ops are running, so errors + recoverability are attributed
+# to the right phase). Unlike advance_phase this does not push to
+# completed_phases or walk sequentially — the caller drives the order.
+fn agnova_set_phase(inst, phase) {
+    var prog = AgnovaInstaller_progress(inst);
+    InstallProgress_set_current_phase(prog, phase);
+    var pct = (phase * 10000) / PHASE_COUNT;
+    InstallProgress_set_overall_progress(prog, pct);
+    InstallProgress_set_phase_progress(prog, 0);
+    InstallProgress_set_message(prog, str_from(phase_str(phase)));
+    return 0;
+}
+
 # Record a failure at the current phase; recoverability is per-phase.
 fn agnova_fail_phase(inst, message) {
     var phase = agnova_current_phase(inst);
@@ -132,12 +146,12 @@ fn agnova_result(inst) {
     var packages = InstallConfig_packages(cfg);
 
     return install_result_new(
-        success,
-        AgnovaInstaller_completed_phases(inst),
-        AgnovaInstaller_errors(inst),
-        elapsed,
-        package_selection_total_count(packages),
-        PackageSelection_total_size_mb(packages)
+    success,
+    AgnovaInstaller_completed_phases(inst),
+    AgnovaInstaller_errors(inst),
+    elapsed,
+    package_selection_total_count(packages),
+    PackageSelection_total_size_mb(packages)
     );
 }
 

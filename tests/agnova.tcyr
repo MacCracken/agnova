@@ -282,7 +282,7 @@ fn t_install_phase_next() {
 fn t_phase_ordering_encryption_before_format() {
     test_group("phase_ordering_encryption_before_format");
     assert(PHASE_SETUP_ENCRYPTION < PHASE_FORMAT_FILESYSTEMS,
-        "SetupEncryption must come before FormatFilesystems");
+    "SetupEncryption must come before FormatFilesystems");
     return 0;
 }
 
@@ -340,9 +340,9 @@ fn t_default_packages_desktop_more_than_server() {
     var d = default_packages(MODE_DESKTOP);
     var s = default_packages(MODE_SERVER);
     assert(vec_len(PackageSelection_mode_packages(d)) > vec_len(PackageSelection_mode_packages(s)),
-        "desktop > server mode pkgs");
+    "desktop > server mode pkgs");
     assert(PackageSelection_total_size_mb(d) > PackageSelection_total_size_mb(s),
-        "desktop > server total size");
+    "desktop > server total size");
     return 0;
 }
 
@@ -557,7 +557,7 @@ fn t_validate_rejects_fill_remaining_not_last() {
     PartitionSpec_set_size_mb(p0, 0);
     # Add a third partition so first is no longer last
     var extra = partition_spec_new(
-        str_from("extra"), str_from("/data"), FS_EXT4, 1024, 1, vec_new());
+    str_from("extra"), str_from("/data"), FS_EXT4, 1024, 1, vec_new());
     vec_push(DiskLayout_partitions(InstallConfig_disk(c)), extra);
     var r = validate_config(c);
     assert(is_err_result(r), "rejects fill-remaining-not-last");
@@ -616,8 +616,8 @@ fn t_validate_rejects_mbr_with_more_than_four_partitions() {
         var size = 1024;
         if (i == 5) { has_size = 0; size = 0; }
         vec_push(parts, partition_spec_new(
-            str_builder_build(label_sb), str_builder_build(mp_sb),
-            FS_EXT4, size, has_size, vec_new()));
+        str_builder_build(label_sb), str_builder_build(mp_sb),
+        FS_EXT4, size, has_size, vec_new()));
         i = i + 1;
     }
     DiskLayout_set_partitions(disk, parts);
@@ -649,8 +649,8 @@ fn t_validate_accepts_mbr_with_four_partitions() {
         var size = 1024;
         if (i == 4) { has_size = 0; size = 0; }
         vec_push(parts, partition_spec_new(
-            str_builder_build(label_sb), str_builder_build(mp_sb),
-            FS_EXT4, size, has_size, vec_new()));
+        str_builder_build(label_sb), str_builder_build(mp_sb),
+        FS_EXT4, size, has_size, vec_new()));
         i = i + 1;
     }
     DiskLayout_set_partitions(disk, parts);
@@ -752,10 +752,10 @@ fn t_generate_fstab_basic() {
     test_group("generate_fstab_basic");
     var parts = vec_new();
     vec_push(parts, partition_spec_new(
-        str_from("ESP"), str_from("/boot/efi"), FS_VFAT, 512, 1,
-        vec_new()));
+    str_from("ESP"), str_from("/boot/efi"), FS_VFAT, 512, 1,
+    vec_new()));
     vec_push(parts, partition_spec_new(
-        str_from("agnos-root"), str_from("/"), FS_EXT4, 0, 0, vec_new()));
+    str_from("agnos-root"), str_from("/"), FS_EXT4, 0, 0, vec_new()));
     var fstab = generate_fstab(parts, 0);
     assert(str_contains_cstr(fstab, "LABEL=ESP"), "has LABEL=ESP");
     assert(str_contains_cstr(fstab, "LABEL=agnos-root"), "has LABEL=agnos-root");
@@ -768,10 +768,10 @@ fn t_generate_fstab_with_encryption() {
     test_group("generate_fstab_with_encryption");
     var parts = vec_new();
     vec_push(parts, partition_spec_new(
-        str_from("agnos-root"), str_from("/"), FS_EXT4, 0, 0, vec_new()));
+    str_from("agnos-root"), str_from("/"), FS_EXT4, 0, 0, vec_new()));
     var fstab = generate_fstab(parts, 1);
     assert(str_contains_cstr(fstab, "/dev/mapper/agnos-root"),
-        "encrypted root uses /dev/mapper");
+    "encrypted root uses /dev/mapper");
     return 0;
 }
 
@@ -858,8 +858,8 @@ fn t_network_config_static_ip() {
     var dns = vec_new();
     vec_push(dns, str_from("192.168.1.1"));
     var n = network_config_new(
-        str_from("server1"), 0,
-        str_from("192.168.1.100/24"), str_from("192.168.1.1"), dns);
+    str_from("server1"), 0,
+    str_from("192.168.1.100/24"), str_from("192.168.1.1"), dns);
     assert_eq(NetworkConfig_use_dhcp(n), 0, "not dhcp");
     assert(str_len(NetworkConfig_static_ip(n)) > 0, "has static_ip");
     assert(str_len(NetworkConfig_gateway(n)) > 0, "has gateway");
@@ -945,6 +945,7 @@ fn t_partition_device_helper_nvme() {
     test_group("partition_device_helper_nvme");
     assert(str_eq_cstr(partition_device(str_from("/dev/nvme0n1"), 0), "/dev/nvme0n1p1"), "nvme p1");
     assert(str_eq_cstr(partition_device(str_from("/dev/mmcblk0"), 1), "/dev/mmcblk0p2"), "mmcblk p2");
+    assert(str_eq_cstr(partition_device(str_from("/dev/loop0"), 0), "/dev/loop0p1"), "loop p1");
     # Regression: a device matching BOTH substrings still gets exactly one 'p'.
     var both = partition_device(str_from("/dev/nvme-mmcblk-weird"), 0);
     assert(str_eq_cstr(both, "/dev/nvme-mmcblk-weirdp1"), "single p");
@@ -1039,7 +1040,7 @@ fn t_bootloader_ops_grub() {
     var ops = PhaseOps_operations(phase);
     assert_eq(vec_len(ops), 3, "3 ops (grub-install + mkdir + cfg)");
     assert(str_eq_cstr(SystemOp_Command_binary(payload(vec_get(ops, 0))), "grub-install"),
-        "first is grub-install");
+    "first is grub-install");
     var cfg_op = vec_get(ops, 2);
     assert_eq(tag(cfg_op), OP_WRITE_FILE, "third is WriteFile");
     assert(str_contains_cstr(SystemOp_WriteFile_path(payload(cfg_op)), "grub.cfg"), "path grub.cfg");
@@ -1198,7 +1199,7 @@ fn t_plan_network_ops_dhcp_no_static_file() {
     test_group("plan_network_ops_dhcp_no_static_file");
     var ops = PhaseOps_operations(plan_network_ops(_test_config(), str_from("/mnt/target")));
     assert_eq(_ops_has_write_path(ops, "10-static.network"), 0,
-        "DHCP mode should NOT write static.network");
+    "DHCP mode should NOT write static.network");
     return 0;
 }
 
@@ -1519,7 +1520,7 @@ fn t_validate_warns_firewall_allow() {
 # for format/mount planning).
 fn _mkpart(label_cstr, mount_cstr, fs) {
     return partition_spec_new(
-        str_from(label_cstr), str_from(mount_cstr), fs, 0, 0, vec_new());
+    str_from(label_cstr), str_from(mount_cstr), fs, 0, 0, vec_new());
 }
 
 # Replace a config's disk partition list (keeps the default device/flags).
@@ -1675,13 +1676,13 @@ fn t_mount_flags_from_options() {
     vec_push(multi, str_from("nosuid"));
     vec_push(multi, str_from("nodev"));
     assert_eq(mount_flags_from_options(multi),
-        MS_RDONLY | MS_NOSUID | MS_NODEV, "ro+nosuid+nodev");
+    MS_RDONLY | MS_NOSUID | MS_NODEV, "ro+nosuid+nodev");
 
     # comma-separated within a single element (mount(8) style)
     var csv = vec_new();
     vec_push(csv, str_from("ro,nosuid,noexec"));
     assert_eq(mount_flags_from_options(csv),
-        MS_RDONLY | MS_NOSUID | MS_NOEXEC, "comma-separated");
+    MS_RDONLY | MS_NOSUID | MS_NOEXEC, "comma-separated");
 
     # flag mixed with a no-flag token
     var mixed = vec_new();

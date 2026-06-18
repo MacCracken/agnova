@@ -13,12 +13,16 @@
 fn partition_device(device_str, i) {
     var sb = str_builder_new();
     str_builder_add(sb, device_str);
-    # NVMe and MMC use a 'p' separator before the partition number. Use a
-    # single flag (not two appends) so a hypothetical device matching both
-    # substrings still gets exactly one 'p' — matches rust-old partitioning.rs.
+    # NVMe, MMC, and loop devices use a 'p' separator before the partition
+    # number (e.g. nvme0n1p1, mmcblk0p1, loop0p1). Use a single flag (not
+    # one append per match) so a device matching more than one substring
+    # still gets exactly one 'p'. (rust-old only handled nvme/mmcblk; loop
+    # is added here so loopback targets — used for the e2e test and the
+    # planned loopback install mode — name partitions correctly.)
     var needs_p = 0;
     if (str_contains_cstr(device_str, "nvme") == 1) { needs_p = 1; }
     if (str_contains_cstr(device_str, "mmcblk") == 1) { needs_p = 1; }
+    if (str_contains_cstr(device_str, "loop") == 1) { needs_p = 1; }
     if (needs_p == 1) {
         str_builder_add_byte(sb, 112);
     }
@@ -40,13 +44,13 @@ fn plan_partition_ops(cfg) {
     if (DiskLayout_use_gpt(disk) == 1) {
         vec_push(pt_args, str_from("gpt"));
         vec_push(ops, op_command(
-            str_from("parted"), pt_args, str_from("Create GPT partition table"),
-            1, str_from("")));
+        str_from("parted"), pt_args, str_from("Create GPT partition table"),
+        1, str_from("")));
     } else {
         vec_push(pt_args, str_from("msdos"));
         vec_push(ops, op_command(
-            str_from("parted"), pt_args, str_from("Create MBR partition table"),
-            1, str_from("")));
+        str_from("parted"), pt_args, str_from("Create MBR partition table"),
+        1, str_from("")));
     }
 
     # Create each partition + set flags
@@ -123,8 +127,8 @@ fn plan_partition_ops(cfg) {
             str_builder_add_int(fdesc_sb, i + 1);
 
             vec_push(ops, op_command(
-                str_from("parted"), f_args, str_builder_build(fdesc_sb),
-                1, str_from("")));
+            str_from("parted"), f_args, str_builder_build(fdesc_sb),
+            1, str_from("")));
             fi = fi + 1;
         }
 
@@ -219,9 +223,9 @@ fn plan_encryption_ops(cfg, luks_passphrase) {
     var n = vec_len(partitions);
     if (n == 0) {
         return phase_ops_new(
-            PHASE_SETUP_ENCRYPTION,
-            str_from("Setup disk encryption (no partitions)"),
-            ops
+        PHASE_SETUP_ENCRYPTION,
+        str_from("Setup disk encryption (no partitions)"),
+        ops
         );
     }
 
@@ -257,8 +261,8 @@ fn plan_encryption_ops(cfg, luks_passphrase) {
     vec_push(fmt_args, str_from("--key-file=-"));
     vec_push(fmt_args, str_clone(part_dev));
     vec_push(ops, op_command(
-        str_from("cryptsetup"), fmt_args,
-        str_from("Format LUKS2 encrypted volume"), 1, luks_passphrase));
+    str_from("cryptsetup"), fmt_args,
+    str_from("Format LUKS2 encrypted volume"), 1, luks_passphrase));
 
     # cryptsetup open
     var open_args = vec_new();
@@ -267,8 +271,8 @@ fn plan_encryption_ops(cfg, luks_passphrase) {
     vec_push(open_args, str_clone(part_dev));
     vec_push(open_args, str_from("agnos-root"));
     vec_push(ops, op_command(
-        str_from("cryptsetup"), open_args,
-        str_from("Open LUKS volume as agnos-root"), 1, luks_passphrase));
+    str_from("cryptsetup"), open_args,
+    str_from("Open LUKS volume as agnos-root"), 1, luks_passphrase));
 
     return phase_ops_new(PHASE_SETUP_ENCRYPTION, str_from("Setup disk encryption"), ops);
 }
