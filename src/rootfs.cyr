@@ -55,18 +55,28 @@ fn _push_cstr(v, c) {
 # default_packages(mode) — the package selection per InstallMode
 # (Ported from rust-old/src/lib.rs::default_packages.)
 # ============================================================
+# Reconciled 2026-07-03 against zugot recipe names (the resolve key for
+# `ark install <name>` → nous RecipeDb): Debian-ism names mapped to the actual
+# AGNOS project recipes (agnos-init→kybernet, agnos-sys→agnosys,
+# agnos-common→agnostik, linux-kernel→agnos-kernel, nano→cyim, evince→zathura,
+# fail2ban→phylax, fonts-noto→noto-fonts), server/desktop `*-server` variants
+# collapse to their base project (hoosh/daimon are already in base), and the
+# non-sovereign Debian tools with no AGNOS equivalent (systemd, zsh, iputils,
+# tmux, xdg-utils, nautilus, fonts-jetbrains-mono, prometheus-node-exporter) are
+# dropped toward a lean sovereign base — added back on demand, not baked in.
+# Every name below resolves to a zugot recipe.
 fn default_packages(mode) {
     var base = vec_new();
-    _push_cstr(base, "linux-kernel");
+    _push_cstr(base, "agnos-kernel");
+    _push_cstr(base, "gnoboot");
     _push_cstr(base, "linux-firmware");
-    _push_cstr(base, "agnos-init");
-    _push_cstr(base, "agnos-sys");
-    _push_cstr(base, "agnos-common");
+    _push_cstr(base, "kybernet");
+    _push_cstr(base, "agnosys");
+    _push_cstr(base, "agnostik");
     _push_cstr(base, "agnoshi");
     _push_cstr(base, "shakti");
     _push_cstr(base, "daimon");
     _push_cstr(base, "hoosh");
-    _push_cstr(base, "systemd");
     _push_cstr(base, "dbus");
     _push_cstr(base, "networkmanager");
     _push_cstr(base, "nftables");
@@ -74,7 +84,6 @@ fn default_packages(mode) {
     _push_cstr(base, "coreutils");
     _push_cstr(base, "util-linux");
     _push_cstr(base, "bash");
-    _push_cstr(base, "zsh");
     _push_cstr(base, "curl");
     _push_cstr(base, "wget");
     _push_cstr(base, "ca-certificates");
@@ -84,21 +93,16 @@ fn default_packages(mode) {
     _push_cstr(base, "xz");
     _push_cstr(base, "bzip2");
     _push_cstr(base, "iproute2");
-    _push_cstr(base, "iputils");
     _push_cstr(base, "less");
-    _push_cstr(base, "nano");
+    _push_cstr(base, "cyim");
     _push_cstr(base, "man-pages");
 
     var mode_pkgs = vec_new();
     var size = 1200;
     if (mode == MODE_SERVER) {
-        _push_cstr(mode_pkgs, "hoosh-server");
-        _push_cstr(mode_pkgs, "daimon-server");
         _push_cstr(mode_pkgs, "ark");
         _push_cstr(mode_pkgs, "nous");
-        _push_cstr(mode_pkgs, "prometheus-node-exporter");
-        _push_cstr(mode_pkgs, "fail2ban");
-        _push_cstr(mode_pkgs, "tmux");
+        _push_cstr(mode_pkgs, "phylax");
         size = 2400;
     }
     if (mode == MODE_DESKTOP) {
@@ -107,15 +111,10 @@ fn default_packages(mode) {
         _push_cstr(mode_pkgs, "wireplumber");
         _push_cstr(mode_pkgs, "mesa");
         _push_cstr(mode_pkgs, "vulkan-loader");
-        _push_cstr(mode_pkgs, "fonts-noto");
-        _push_cstr(mode_pkgs, "fonts-jetbrains-mono");
+        _push_cstr(mode_pkgs, "noto-fonts");
         _push_cstr(mode_pkgs, "ark");
         _push_cstr(mode_pkgs, "nous");
-        _push_cstr(mode_pkgs, "hoosh-server");
-        _push_cstr(mode_pkgs, "daimon-server");
-        _push_cstr(mode_pkgs, "xdg-utils");
-        _push_cstr(mode_pkgs, "nautilus");
-        _push_cstr(mode_pkgs, "evince");
+        _push_cstr(mode_pkgs, "zathura");
         _push_cstr(mode_pkgs, "firefox");
         size = 4800;
     }
@@ -395,7 +394,7 @@ fn plan_install_packages_ops(cfg, target_root) {
 }
 
 # ============================================================
-# Phase: Install bootloader (GRUB2 or systemd-boot)
+# Phase: Install bootloader (gnoboot [default, sovereign] / systemd-boot / GRUB2)
 # ============================================================
 fn plan_bootloader_ops(cfg, target_root) {
     var boot = InstallConfig_bootloader(cfg);
@@ -536,6 +535,55 @@ fn plan_bootloader_ops(cfg, target_root) {
         vec_push(ops, op_write_file(
         str_builder_build(rpath), str_builder_build(rentry),
         420, str_from("root:root")));
+    }
+
+    if (bt == BOOT_GNOBOOT) {
+        # Sovereign UEFI boot: gnoboot IS the bootloader — no GRUB, no
+        # systemd-boot, no loader config (gnoboot needs none). UEFI firmware
+        # loads EFI/BOOT/BOOTX64.EFI (= gnoboot) directly; gnoboot loads the
+        # agnos kernel from the ESP at /boot/agnos. Mirrors the canonical
+        # agnosticos/scripts/install-media.sh ESP layout. Sources: the `gnoboot`
+        # base package installs its EFI to /usr/lib/gnoboot/BOOTX64.EFI; the
+        # kernel is agnos-kernel's /boot/agnos. `cmdline`/`kver` are unused here —
+        # gnoboot builds the sovereign boot params itself and the kernel mounts
+        # the agnos-fs from disk (no GRUB vmlinuz/initramfs layout).
+        var gbdir = str_builder_new();
+        str_builder_add(gbdir, target_root);
+        str_builder_add_cstr(gbdir, "/boot/efi/EFI/BOOT");
+        vec_push(ops, op_make_dir(str_builder_build(gbdir), 493, 1));
+
+        var gkdir = str_builder_new();
+        str_builder_add(gkdir, target_root);
+        str_builder_add_cstr(gkdir, "/boot/efi/boot");
+        vec_push(ops, op_make_dir(str_builder_build(gkdir), 493, 1));
+
+        # Stage gnoboot -> ESP EFI/BOOT/BOOTX64.EFI
+        var gsrc = str_builder_new();
+        str_builder_add(gsrc, target_root);
+        str_builder_add_cstr(gsrc, "/usr/lib/gnoboot/BOOTX64.EFI");
+        var gdst = str_builder_new();
+        str_builder_add(gdst, target_root);
+        str_builder_add_cstr(gdst, "/boot/efi/EFI/BOOT/BOOTX64.EFI");
+        var gargs = vec_new();
+        vec_push(gargs, str_builder_build(gsrc));
+        vec_push(gargs, str_builder_build(gdst));
+        vec_push(ops, op_command(
+        str_from("cp"), gargs,
+        str_from("Stage gnoboot to ESP (EFI/BOOT/BOOTX64.EFI)"), 1, str_from("")));
+
+        # Stage the agnos kernel -> ESP /boot/agnos
+        var ksrc = str_builder_new();
+        str_builder_add(ksrc, target_root);
+        str_builder_add_cstr(ksrc, "/boot/agnos");
+        var kdst = str_builder_new();
+        str_builder_add(kdst, target_root);
+        str_builder_add_cstr(kdst, "/boot/efi/boot/agnos");
+        var kargs = vec_new();
+        vec_push(kargs, str_builder_build(ksrc));
+        vec_push(kargs, str_builder_build(kdst));
+        vec_push(ops, op_command(
+        str_from("cp"), kargs,
+        str_from("Stage agnos kernel to ESP (/boot/agnos)"), 1, str_from("")));
     }
 
     return phase_ops_new(PHASE_INSTALL_BOOTLOADER, str_from("Install bootloader"), ops);

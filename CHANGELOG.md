@@ -6,6 +6,39 @@ This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-03 — sovereign reconciliation: gnoboot default + zugot-resolvable packages
+
+### Changed
+- **Bootloader default reconciled to sovereign `gnoboot`** (`src/types.cyr`,
+  `src/cli.cyr`, `src/rootfs.cyr`). AGNOS boots via **gnoboot** (a PE32+ EFI
+  Application, replaces GRUB/systemd-boot), so agnova now defaults there. New
+  `BOOT_GNOBOOT` enum + `bt_str`, `--bootloader gnoboot|systemd|grub2` (default
+  `gnoboot`), and a `plan_bootloader_ops` gnoboot branch that mirrors the
+  canonical `agnosticos/scripts/install-media.sh` ESP layout: stage
+  `/usr/lib/gnoboot/BOOTX64.EFI` → `ESP/EFI/BOOT/BOOTX64.EFI` and the kernel →
+  `ESP/boot/agnos`, no GRUB/bootctl, no loader config (gnoboot needs none —
+  UEFI firmware loads it directly and it loads the kernel from the ESP).
+  systemd-boot/grub2 are kept as fallback options (interop seam), not deleted.
+  `gnoboot` added to the base package set (resolves to the new zugot recipe).
+  Suite green (313/0, +gnoboot bt_str/default/ops tests).
+- **`default_packages` reconciled against zugot recipe names** (`src/rootfs.cyr`) —
+  the names agnova hands to `ark install <name>` must resolve in nous's zugot
+  RecipeDb, but the ported list carried Debian-slanted names that didn't exist as
+  recipes. Now every name resolves (verified against the 535-recipe corpus, 0
+  unresolved):
+  - **Mapped to the real AGNOS project recipe:** `linux-kernel`→`agnos-kernel`,
+    `agnos-init`→`kybernet`, `agnos-sys`→`agnosys`, `agnos-common`→`agnostik`,
+    `nano`→`cyim`, `evince`→`zathura`, `fail2ban`→`phylax`, `fonts-noto`→`noto-fonts`.
+  - **`*-server` variants collapsed to the base project** (`hoosh-server`/
+    `daimon-server` → the `hoosh`/`daimon` already in base — server-vs-base is a
+    runtime mode, not a separate package).
+  - **Dropped toward a lean sovereign base** (non-sovereign Debian tools with no
+    AGNOS equivalent, added back on demand not baked in): `systemd` (kybernet is
+    the init), `zsh`, `iputils` (iproute2 covers it), `tmux`, `xdg-utils`,
+    `nautilus`, `fonts-jetbrains-mono`, `prometheus-node-exporter`.
+  Every name resolves against the zugot corpus. (The bootloader default is
+  reconciled to gnoboot in this same 0.4.1 release — see the entry above.)
+
 ## [0.4.0] - 2026-07-02 — cyrius 6.3.35 migration + base install drives real ark (`--dir`)
 
 ### Changed

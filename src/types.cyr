@@ -75,9 +75,11 @@ fn pflag_str(p) {
 enum BootloaderType {
     BOOT_SYSTEMD = 0;
     BOOT_GRUB2 = 1;
+    BOOT_GNOBOOT = 2;
 }
 
 fn bt_str(b) {
+    if (b == BOOT_GNOBOOT) { return "gnoboot"; }
     if (b == BOOT_SYSTEMD) { return "systemd-boot"; }
     if (b == BOOT_GRUB2) { return "GRUB 2"; }
     return "unknown";
@@ -423,7 +425,7 @@ fn bootloader_config_new(bootloader_type, timeout_secs, default_entry, kernel_pa
 fn bootloader_config_default() {
     var kp = vec_new();
     vec_push(kp, str_from("quiet"));
-    return bootloader_config_new(BOOT_SYSTEMD, 5, str_from("agnos"), kp);
+    return bootloader_config_new(BOOT_GNOBOOT, 5, str_from("agnos"), kp);
 }
 
 # ============================================================

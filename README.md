@@ -2,14 +2,14 @@
 
 > The guided OS installer for [AGNOS](https://github.com/MacCracken/agnosticos).
 
-`agnova` partitions disks, optionally encrypts the root volume with LUKS, deploys the AGNOS base system, installs mode-specific packages, lays down the bootloader (systemd-boot or GRUB 2), creates the initial user, configures network/locale/security, and prepares first-boot — all from a single command.
+`agnova` partitions disks, optionally encrypts the root volume with LUKS, deploys the AGNOS base system, installs mode-specific packages, lays down the sovereign bootloader (gnoboot by default; systemd-boot / GRUB 2 optional), creates the initial user, configures network/locale/security, and prepares first-boot — all from a single command.
 
 The installer is **plan-first**: every action is materialized as a `SystemOp` descriptor and the orchestrator can dump the entire plan before touching disk. Destructive execution is gated behind an explicit `--i-mean-it` flag.
 
 - **Type**: Binary (Cyrius)
 - **License**: GPL-3.0-only
-- **Toolchain**: Cyrius 6.2.21
-- **Version**: 0.3.0
+- **Toolchain**: Cyrius 6.3.35
+- **Version**: 0.4.1
 
 ## Build
 
@@ -37,7 +37,7 @@ OPTIONS:
   -m, --mode MODE          server|desktop|minimal|custom (default: desktop)
       --hostname NAME      Hostname (default: agnos)
   -t, --target ROOT        Target root mount point (default: /mnt)
-  -b, --bootloader BL      systemd|grub2 (default: systemd)
+  -b, --bootloader BL      gnoboot|systemd|grub2 (default: gnoboot)
       --locale L           System locale (default: en_US.UTF-8)
       --timezone TZ        System timezone (default: UTC)
       --encrypt            Enable LUKS root encryption

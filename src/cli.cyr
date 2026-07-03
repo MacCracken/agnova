@@ -12,7 +12,7 @@
 # command refuses to run, mirroring the CLAUDE.md "no silent destructive
 # operations" rule.
 
-var AGNOVA_VERSION = "0.4.0";
+var AGNOVA_VERSION = "0.4.1";
 var DEFAULT_TARGET_ROOT = "/mnt";
 
 # Indices for our flag set — populated by _build_flags(), used by the
@@ -39,7 +39,7 @@ fn _build_flags() {
     FLAG_MODE       = flags_add_str(h,  109, "mode",        "desktop", "server|desktop|minimal|custom");
     FLAG_HOSTNAME   = flags_add_str(h,    0, "hostname",    "agnos",  "system hostname");
     FLAG_TARGET     = flags_add_str(h,  116, "target",      "/mnt",   "target root mount point");
-    FLAG_BOOTLOADER = flags_add_str(h,  98,  "bootloader",  "systemd", "systemd|grub2");
+    FLAG_BOOTLOADER = flags_add_str(h,  98,  "bootloader",  "gnoboot", "gnoboot|systemd|grub2");
     FLAG_LOCALE     = flags_add_str(h,    0, "locale",      "en_US.UTF-8", "system locale");
     FLAG_TIMEZONE   = flags_add_str(h,    0, "timezone",    "UTC",    "system timezone");
     FLAG_ENCRYPT    = flags_add_bool(h,   0, "encrypt",     0,        "enable LUKS root encryption");
@@ -63,10 +63,11 @@ fn _parse_mode(cstr_mode) {
 }
 
 fn _parse_bootloader(cstr_bl) {
-    if (cstr_bl == 0) { return BOOT_SYSTEMD; }
+    if (cstr_bl == 0) { return BOOT_GNOBOOT; }
     var s = str_from(cstr_bl);
     if (str_eq_cstr(s, "grub2") == 1) { return BOOT_GRUB2; }
-    return BOOT_SYSTEMD;
+    if (str_eq_cstr(s, "systemd") == 1) { return BOOT_SYSTEMD; }
+    return BOOT_GNOBOOT;
 }
 
 # Parse the --until phase name into a phase enum. Returns PHASE_COMPLETE
@@ -153,7 +154,7 @@ fn _print_help() {
     println("    -m, --mode MODE          server|desktop|minimal|custom (default: desktop)");
     println("        --hostname NAME      Hostname (default: agnos)");
     println("    -t, --target ROOT        Target root mount point (default: /mnt)");
-    println("    -b, --bootloader BL      systemd|grub2 (default: systemd)");
+    println("    -b, --bootloader BL      gnoboot|systemd|grub2 (default: gnoboot)");
     println("        --locale L           System locale (default: en_US.UTF-8)");
     println("        --timezone TZ        System timezone (default: UTC)");
     println("        --encrypt            Enable LUKS root encryption");
