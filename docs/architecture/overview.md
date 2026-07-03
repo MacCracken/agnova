@@ -69,14 +69,14 @@ types
 | 5  | Installing base system | 20 (mkdirs + tar + ark) | **no** |
 | 6  | Installing packages | 1 (ark per mode) | yes |
 | 7  | Configuring system | (network + locale, 7 ops) | yes |
-| 8  | Installing bootloader | 6 (systemd-boot) or 7 (GRUB2) | **no** |
+| 8  | Installing bootloader | 4 (gnoboot, default) / 6 (systemd-boot) / 7 (GRUB2) | **no** |
 | 9  | Creating user | 2 | yes |
 | 10 | Setting up security | 4 (nftables + IMA + sysctl) | yes |
 | 11 | Preparing first boot | 8 (Desktop) / 7 (Server) / 4 (Minimal) | yes |
 | 12 | Cleaning up | 3 (or 4 with LUKS close) | yes |
 | 13 | Installation complete | 0 | yes |
 
-Default `agnova plan --device /dev/sda --user X` produces **62 operations** across 13 phases.
+Default `agnova plan --device /dev/sda --user X` produces **60 operations** across 13 phases (the sovereign gnoboot bootloader phase is 4 ops vs systemd-boot's 6).
 
 ## SystemOp tagged union
 

@@ -76,7 +76,8 @@ jobs:
           cat /tmp/plan.txt
           echo "--- assertions ---"
           grep -q "validation: OK" /tmp/plan.txt
-          grep -q "13 phases, 62 operations" /tmp/plan.txt
+          grep -q "13 phases, 60 operations" /tmp/plan.txt
+          grep -q "bootloader: gnoboot" /tmp/plan.txt
 
       - name: Smoke test (execute gate)
         run: |

@@ -20,7 +20,11 @@ This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
   UEFI firmware loads it directly and it loads the kernel from the ESP).
   systemd-boot/grub2 are kept as fallback options (interop seam), not deleted.
   `gnoboot` added to the base package set (resolves to the new zugot recipe).
-  Suite green (313/0, +gnoboot bt_str/default/ops tests).
+  Suite green (313/0, +gnoboot bt_str/default/ops tests). The default `plan`
+  drops from **62 → 60 operations** (the gnoboot bootloader phase is 4 ops vs
+  systemd-boot's 6); the CI plan smoke (`.github/workflows/ci.yml`) + the
+  architecture doc op-count were updated, and the smoke now also asserts
+  `bootloader: gnoboot`.
 - **`default_packages` reconciled against zugot recipe names** (`src/rootfs.cyr`) —
   the names agnova hands to `ark install <name>` must resolve in nous's zugot
   RecipeDb, but the ported list carried Debian-slanted names that didn't exist as
