@@ -319,14 +319,22 @@ fn plan_install_base_ops(cfg, target_root) {
     vec_push(ops, op_command(
     str_from("tar"), tar_args, str_from("Extract base system tarball"), 1, str_from("")));
 
-    # Fallback: ark install of base packages (non-fatal if tarball worked)
+    # Fallback: ark install of the pre-staged base .ark packages (non-fatal if
+    # the tarball worked). Drives the real `ark` binary's batch --dir mode —
+    # `ark install --apply --no-confirm --root <target> --dir <pkgdir>` installs
+    # every .ark in the dir into the target root (files staged under it + recorded
+    # in the target's OWN /var/lib/agnos/ark DB). Replaces the never-existent
+    # `ark-install.sh` / `--packages` (ark has no such script or flag).
     var ark_args = vec_new();
+    _push_cstr(ark_args, "install");
+    _push_cstr(ark_args, "--apply");
+    _push_cstr(ark_args, "--no-confirm");
     _push_cstr(ark_args, "--root");
     vec_push(ark_args, str_clone(target_root));
-    _push_cstr(ark_args, "--packages");
+    _push_cstr(ark_args, "--dir");
     _push_cstr(ark_args, "/run/agnos/installer/packages/");
     vec_push(ops, op_command(
-    str_from("ark-install.sh"), ark_args,
+    str_from("ark"), ark_args,
     str_from("Install base .ark packages (fallback)"), 0, str_from("")));
 
     return phase_ops_new(PHASE_INSTALL_BASE, str_from("Deploy AGNOS base system"), ops);

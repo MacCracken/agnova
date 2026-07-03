@@ -6,6 +6,29 @@ This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-02 — cyrius 6.3.35 migration + base install drives real ark (`--dir`)
+
+### Changed
+- **Toolchain: cyrius pin `6.2.21` → `6.3.35`** (current toolchain). Suite green (308
+  passed) on 6.3.35; `lib/` re-vendored. The `agnova version` banner's toolchain line
+  updated to match (`src/cli.cyr`).
+
+### Fixed
+- **Stack smash in `run_command`'s waitpid (`src/executor.cyr`).** The wait-status
+  buffer was `var stbuf[1]` — 1 u64 slot (8 B) under the pre-6.3.13 heap-local model,
+  but 1 **byte** on the stack since cyrius 6.3.13 moved function-local `var X[N]` onto
+  the stack, so `waitpid`'s 4-byte status write (read back via `load32`) overran it.
+  Sized to `var stbuf[8]`. (`buf[16]` UUID / `pipefd[16]` pipe buffers are correctly
+  byte-sized and unaffected.)
+- **Base-system `.ark` install now drives the real `ark` binary (`src/rootfs.cyr`).**
+  The base fallback shelled a never-existent `ark-install.sh --root <t> --packages
+  <dir>`; neither the script nor a `--packages` flag exists in ark. It now calls
+  `ark install --apply --no-confirm --root <target> --dir /run/agnos/installer/packages/`
+  (ark's batch `--dir` mode, **requires ark ≥ 1.3.0**), which installs every
+  pre-staged base `.ark` into the target root and records them in the target's own
+  package DB. (The mode/extra name-based `ark install <names>` calls still await the
+  sovereign producer chain to resolve base names → `.ark`s.)
+
 ## [0.3.0] - 2026-06-18
 
 ### Added

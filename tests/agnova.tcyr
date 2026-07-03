@@ -1259,6 +1259,9 @@ fn t_install_base_ops_creates_dirs_and_extracts() {
     var ops = PhaseOps_operations(phase);
     assert(vec_len(ops) >= 3, ">=3 ops");
     assert(_ops_has_command_binary(ops, "tar"), "tar extraction");
+    # The base .ark fallback drives the REAL `ark` binary (batch --dir mode), not
+    # the never-existent `ark-install.sh`.
+    assert(_ops_has_command_binary(ops, "ark"), "ark --dir base install");
     return 0;
 }
 

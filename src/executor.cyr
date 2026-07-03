@@ -94,7 +94,11 @@ fn _exec_with_stdin(args, stdin_str) {
         sys_write(wfd, str_data(stdin_str), str_len(stdin_str));
         sys_close(wfd);
     }
-    var stbuf[1];
+    # waitpid writes a 4-byte status int (read via load32 below). At function
+    # scope `var X[N]` is N BYTES since cyrius 6.3.13, so [1] (1 byte) lets the
+    # 4-byte write overrun the stack — the [1] was "1 u64 slot = 8 B" under the
+    # old heap-local model (the [[feedback_cyrius_var_array_u64_units]] var-bomb).
+    var stbuf[8];
     sys_waitpid(pid, &stbuf, 0);
     var st = load32(&stbuf);
     if (WIFEXITED(st) == 1) { return WEXITSTATUS(st); }
