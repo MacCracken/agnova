@@ -1176,6 +1176,36 @@ fn df_ext2_stage(dst_cstr, src_fd) {
     return df_ext2_add_file(df_ext2_rp_parent, df_ext2_rp_base, df_ext2_rp_blen, src_fd);
 }
 
+# Write an in-memory blob (`buf`, `len` bytes) into the ext2 root at absolute path `dst_cstr`,
+# creating intermediate directories. The config-file sink for the native installer (fstab,
+# hostname, machine-id, …) — no temp file, no fd. Returns 0 / -1.
+fn df_ext2_write_mem(dst_cstr, buf, len) {
+    if (df_ext2_resolve(dst_cstr) != 0) { return 0 - 1; }
+    if (df_ext2_rp_blen == 0) { return 0 - 1; }
+    df_ext2_src_set_mem(buf, len);
+    return df_ext2_add_file_sz(df_ext2_rp_parent, df_ext2_rp_base, df_ext2_rp_blen, len);
+}
+
+# Create a directory (mkdir_p) at absolute path `dst_cstr` in the ext2 root. Returns 0 / -1.
+fn df_ext2_mkdir_p(dst_cstr) {
+    if (df_ext2_resolve(dst_cstr) != 0) { return 0 - 1; }
+    if (df_ext2_rp_blen == 0) { return 0; }                    # path was the root — already exists
+    if (df_ext2_lookup(df_ext2_rp_parent, df_ext2_rp_base, df_ext2_rp_blen) != 0) { return 0; }
+    if (df_ext2_mkdir(df_ext2_rp_parent, df_ext2_rp_base, df_ext2_rp_blen) < 0) { return 0 - 1; }
+    return 0;
+}
+
+# Create a symlink at absolute path `link_cstr` pointing at `target_cstr` (fast symlink, target
+# < 60 bytes), creating intermediate directories. Returns 0 / -1 (incl. target too long).
+fn df_ext2_symlink_p(link_cstr, target_cstr) {
+    var tl = 0;                                                # strlen(target_cstr)
+    while ((load8(target_cstr + tl) & 0xFF) != 0) { tl = tl + 1; }
+    if (tl >= 60) { return 0 - 1; }                            # slow (data-block) symlink unsupported
+    if (df_ext2_resolve(link_cstr) != 0) { return 0 - 1; }
+    if (df_ext2_rp_blen == 0) { return 0 - 1; }
+    return df_ext2_add_symlink(df_ext2_rp_parent, df_ext2_rp_base, df_ext2_rp_blen, target_cstr, tl);
+}
+
 # --- tar extraction into the ext2 root (via the shared sankoch tar cursor) ------------------
 # The ustar/v7 parser, PAX + GNU long names, checksum validation, envelope sniff + RAM decompress
 # (gzip/xz/bzip2/zstd), and path/symlink traversal safety all live in sankoch's tar.cyr (2.5.x).

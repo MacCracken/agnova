@@ -6,6 +6,39 @@ This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-10 — sovereign native install: whole base system + config, zero host tools
+
+### Added
+- **The native install plan now lays down a whole, configured, bootable base system — with zero
+  host tools.** `--disk-backend=native-file|native-block` previously fulfilled only the disk-shaping
+  slice (GPT + FAT32 ESP + ext2 root + staging `/bin/agnsh`); it now runs a complete install
+  in-process, no `tar` / `mkfs` / `parted` / `unzstd` / `chroot` / `grub` fork-exec:
+  - **Base-system extraction** — `--base-tarball <archive>` extracts a full base system
+    (`.tar` / `.tar.gz` / `.tar.xz` / `.tar.bz2` / `.tar.zst`, envelope sniffed) into the ext2 root
+    via the sankoch cursor (`op_untar_ext2` → `STAGE_TARGET_UNTAR` → `df_ext2_untar`). Replaces the
+    shell path's `tar -xf base-system.tar.zst --zstd`. When unset, the single-`/bin/agnsh` stage is
+    kept (minimal boot-to-shell payload).
+  - **Config files written straight into the ext2 image** — `/etc/fstab`, `/etc/hostname`,
+    `/etc/hosts`, `/etc/resolv.conf`, `/etc/machine-id`, `/etc/locale.conf`, the `/etc/localtime`
+    symlink, `/etc/nftables.conf`, IMA policy, sysctl hardening, and the `/etc/agnos/first-boot`
+    marker. On a native backend `execute_op` routes `OP_WRITE_FILE` / `OP_MAKE_DIR` / `OP_SYMLINK`
+    to a native ext2 sink (`df_ext2_write_mem` / `df_ext2_mkdir_p` / `df_ext2_symlink_p`) — no mount,
+    no host fs. The shared config planners (`plan_network_ops` / `plan_locale_ops` /
+    `plan_security_ops`) are reused with an empty `target_root` so they emit root-relative paths.
+  - gnoboot needs no boot config (it opens `\boot\agnos` by fixed path), so the staged kernel makes
+    the disk bootable as-is.
+  - `scripts/native-base-smoke.sh` proves the full path: a `.tar.zst` base + all config files land
+    in an e2fsck-clean ext2 with a byte-identical large file, preserved symlinks, and a fresh
+    machine-id — no shell-out. A full native run completes 8/8 emitted phases, 0 errors.
+  - **Residual (still shell-only, deliberately omitted from the native plan):** user accounts
+    (`useradd`/`usermod` → sovereign `/etc/passwd`,`/shadow`,`/group` gen is a follow-on capability),
+    package install (`ark` into the offline image), and service enablement (`chroot argonaut enable`).
+
+### Changed
+- `plan_native_disk_ops` moved from `src/disk_backend.cyr` to a new `src/disk_plan.cyr`, included
+  after `helpers`/`rootfs` so it can reuse the shared config planners. `disk_backend.cyr` keeps the
+  backend selector, source vars, and native op handlers (which depend on nothing past `diskfmt`).
+
 ## [0.6.1] - 2026-07-10 — complete multi-group ext2 + shared sankoch tar (incl. .tar.zst)
 
 Rounds out the sovereign ext2 root writer (multi-block-group, double-indirect, lost+found,

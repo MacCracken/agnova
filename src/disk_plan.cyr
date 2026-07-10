@@ -1,0 +1,80 @@
+# disk_plan.cyr — the native (sovereign) install-plan BUILDER.
+#
+# Copyright (C) 2026 the AGNOS authors.
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Included AFTER helpers.cyr + rootfs.cyr so it can reuse the shared config planners. On a native
+# backend the shell planners' parted/mkfs/cp/tar/grub OP_COMMANDs are NOT used; instead this emits
+# the structured disk ops (partition / format / stage / untar) plus the config FILE ops, all
+# fulfilled in-process by the native handlers in disk_backend.cyr + executor.cyr:
+#
+#   PARTITION_DISK      GPT (protective MBR + primary/backup header + entry array)
+#   FORMAT_FILESYSTEMS  FAT32 ESP (partition 0) + sovereign ext2 root (partition 1)
+#   INSTALL_BASE        extract the base-system archive into the ext2 root (or stage /bin/agnsh)
+#   CONFIGURE_SYSTEM    hostname/hosts/resolv + locale/timezone/machine-id/fstab into ext2
+#   SETUP_SECURITY      nftables/IMA/sysctl hardening into ext2
+#   FIRST_BOOT_SETUP    the /etc/agnos/first-boot marker
+#   INSTALL_BOOTLOADER  gnoboot + kernel staged into the ESP
+#
+# The config planners are called with an EMPTY target_root, so they emit ROOT-RELATIVE paths
+# (/etc/fstab, not <mnt>/etc/fstab) — exactly what the ext2 sink expects. Only the pure-file
+# planners are reused (network / locale / security); the command-bearing phases are NOT sovereign
+# yet and are deliberately omitted here (see the tail note).
+
+fn plan_native_disk_ops(cfg, target_root) {
+    var plans = vec_new();
+    var disk = InstallConfig_disk(cfg);
+    var parts = DiskLayout_partitions(disk);
+    var dev = DiskLayout_target_device(disk);
+    var root_rel = str_from("");                     # config planners emit /etc/... (no prefix)
+
+    # PHASE_PARTITION_DISK — write the GPT for the whole layout.
+    var pops = vec_new();
+    vec_push(pops, op_partition_disk(disk));
+    vec_push(plans, phase_ops_new(PHASE_PARTITION_DISK, str_from("Partition disk (native GPT)"), pops));
+
+    # PHASE_FORMAT_FILESYSTEMS — FAT32 the ESP (partition 0) + sovereign ext2 the root (partition 1).
+    var fops = vec_new();
+    vec_push(fops, op_format_fs(0, vec_get(parts, 0), dev));
+    vec_push(fops, op_format_fs(1, vec_get(parts, 1), dev));
+    vec_push(plans, phase_ops_new(PHASE_FORMAT_FILESYSTEMS, str_from("Format ESP (FAT32) + root (ext2)"), fops));
+
+    # PHASE_INSTALL_BASE — populate the ext2 root. With --base-tarball, extract the whole base
+    # system archive (sankoch sniffs the envelope, writes the tree, dirs auto-created); otherwise
+    # stage the single /bin/agnsh (the minimal boot-to-shell payload for the no-tarball smoke).
+    var bops = vec_new();
+    if (df_native_base != 0) {
+        vec_push(bops, op_untar_ext2(str_from(df_native_base)));
+    } else {
+        vec_push(bops, op_stage_file(str_from(df_native_agnsh), str_from("/bin/agnsh"), STAGE_TARGET_EXT2));
+    }
+    vec_push(plans, phase_ops_new(PHASE_INSTALL_BASE, str_from("Install base system (native ext2 root)"), bops));
+
+    # PHASE_CONFIGURE_SYSTEM — network + locale config written straight into the ext2 root. These
+    # planners emit only OP_WRITE_FILE / OP_MAKE_DIR / OP_SYMLINK, which execute_op routes to the
+    # native ext2 sink on a native backend.
+    vec_push(plans, plan_network_ops(cfg, root_rel));
+    vec_push(plans, plan_locale_ops(cfg, root_rel));
+
+    # PHASE_SETUP_SECURITY — nftables / IMA / sysctl hardening (pure file ops).
+    vec_push(plans, plan_security_ops(cfg, root_rel));
+
+    # PHASE_FIRST_BOOT_SETUP — the first-boot marker (the shell path also enables services via
+    # chroot+argonaut; that command step is not sovereign yet, so only the marker is written here).
+    var fbops = vec_new();
+    vec_push(fbops, op_write_file(str_from("/etc/agnos/first-boot"), str_from("1\n"), 420, str_from("")));
+    vec_push(plans, phase_ops_new(PHASE_FIRST_BOOT_SETUP, str_from("Write first-boot marker (native)"), fbops));
+
+    # PHASE_INSTALL_BOOTLOADER — stage gnoboot + kernel into the ESP (replaces the cp/mkdir ops).
+    var sops = vec_new();
+    vec_push(sops, op_stage_file(str_from(df_native_gnoboot), str_from("/EFI/BOOT/BOOTX64.EFI"), STAGE_TARGET_ESP));
+    vec_push(sops, op_stage_file(str_from(df_native_kernel), str_from("/boot/agnos"), STAGE_TARGET_ESP));
+    vec_push(plans, phase_ops_new(PHASE_INSTALL_BOOTLOADER, str_from("Stage bootloader + kernel (native)"), sops));
+
+    # NOT YET sovereign (still command-bearing on the shell path, deliberately omitted here):
+    #   - user accounts (useradd/usermod → /etc/passwd,/shadow,/group) — needs sovereign account gen
+    #   - package install (ark into the offline image root)
+    #   - service enablement (chroot argonaut enable)
+    # These are the residual gaps between a native disk-shaped base and a fully-configured install.
+    return plans;
+}

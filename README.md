@@ -9,7 +9,7 @@ The installer is **plan-first**: every action is materialized as a `SystemOp` de
 - **Type**: Binary (Cyrius)
 - **License**: GPL-3.0-only
 - **Toolchain**: Cyrius 6.4.43
-- **Version**: 0.6.1
+- **Version**: 0.7.0
 
 ## Build
 
@@ -45,6 +45,17 @@ OPTIONS:
   -v, --verbose            Print every operation, not just per-phase summaries
       --i-mean-it          Required to actually execute (DESTRUCTIVE)
       --help               Print this help
+
+  Native (sovereign) backend — shape the disk entirely in-process, no host tools:
+      --disk-backend B     shell|native-file|native-block (default: shell)
+      --base-tarball PATH  Base-system archive extracted into the ext2 root
+                           (.tar / .gz / .xz / .bz2 / .zst; envelope sniffed)
+      --gnoboot-src PATH   BOOTX64.EFI source staged into the ESP
+      --kernel-src PATH    Kernel source staged into the ESP (\boot\agnos)
+      --agnsh-src PATH     /bin/agnsh source (used when --base-tarball is absent)
+      --until PHASE        Stop after PHASE (e.g. bootloader)
+      --scratch-base LBA   Write into the disk tail at LBA (imaging affordance)
+      --disk-sectors N     Override the layout disk size (sectors)
 ```
 
 ### Examples
@@ -75,15 +86,18 @@ agnova execute --device /dev/sda --user alice --i-mean-it
 
 ## Architecture
 
-13 ordered install phases, each materialized as a `PhaseOps { phase, description, operations: vec<SystemOp> }`. `SystemOp` is a tagged union over six action variants (Command / WriteFile / MakeDir / Symlink / Mount / Unmount). The library never touches disk itself — `executor.cyr` is the sole side-effect surface, gated behind the CLI's `--i-mean-it` flag.
+13 ordered install phases, each materialized as a `PhaseOps { phase, description, operations: vec<SystemOp> }`. `SystemOp` is a tagged union over nine action variants — six shell/file (Command / WriteFile / MakeDir / Symlink / Mount / Unmount) plus three structured disk ops (PartitionDisk / FormatFs / StageFile). On the default **shell** backend the library never touches disk itself — `executor.cyr` shells out (parted/mkfs/tar/grub) and is the sole side-effect surface. On a **native** backend (`--disk-backend native-file|native-block`) it shapes the disk entirely in-process — GPT + FAT32 ESP + sovereign multi-group ext2 root + base-system extraction + config, no host tools. Both are gated behind the CLI's `--i-mean-it` flag.
 
 - `src/types.cyr` — enums, structs, `SystemOp` variants, factories, `IsoConfig`
 - `src/helpers.cyr` — pure generators (machine-id v4, fstab, hostname, kernel params)
 - `src/validation.cyr` — 28 config checks with shell-injection guards
-- `src/partitioning.cyr` — partition / format / encryption phase planners
-- `src/rootfs.cyr` — mount / install / bootloader / user / network / locale / security / first-boot / cleanup planners
+- `src/partitioning.cyr` — partition / format / encryption phase planners (shell)
+- `src/rootfs.cyr` — mount / install / bootloader / user / network / locale / security / first-boot / cleanup planners (shell)
+- `src/diskfmt.cyr` — sovereign disk builders: GPT, FAT32 ESP, multi-group ext2 writer + sankoch untar sink (raw sector I/O)
+- `src/disk_backend.cyr` — native backend selector + op handlers (partition / format / stage / ext2 file-sink), no fork-exec
+- `src/disk_plan.cyr` — the native (sovereign) install-plan builder (reuses the config planners for the ext2 root)
 - `src/orchestrator.cyr` — `AgnovaInstaller` state machine (phase advancement, recoverable vs non-recoverable failures)
-- `src/executor.cyr` — `SystemOp` dispatchers (fork+exec, file I/O, mount/umount syscalls)
+- `src/executor.cyr` — `SystemOp` dispatchers (shell fork+exec + file I/O, or the native ext2 sink on a native backend)
 - `src/cli.cyr` — flag parsing + subcommand dispatch
 - `src/main.cyr` — thin entry point
 

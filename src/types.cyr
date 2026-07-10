@@ -327,6 +327,20 @@ fn op_stage_file(src_path, dst_fat_path, target_fs) {
     return tagged_new(OP_STAGE_FILE, p);
 }
 
+# target_fs selector for OP_STAGE_FILE's native handler:
+#   STAGE_TARGET_ESP  (0) — stream one file into the FAT32 ESP
+#   STAGE_TARGET_EXT2 (1) — stream one file into the ext2 root at an absolute path
+#   STAGE_TARGET_UNTAR(2) — extract a (optionally gz/xz/bz2/zst) archive into the ext2 root
+var STAGE_TARGET_ESP = 0;
+var STAGE_TARGET_EXT2 = 1;
+var STAGE_TARGET_UNTAR = 2;
+
+# Untar `src_path` (a base-system tarball, envelope sniffed) into the ext2 root. Modeled as a
+# StageFile op with target_fs = STAGE_TARGET_UNTAR; dst is the root, unused by the untar sink.
+fn op_untar_ext2(src_path) {
+    return op_stage_file(src_path, str_from("/"), STAGE_TARGET_UNTAR);
+}
+
 # Human-facing one-line summary of a SystemOp.
 # Mirrors the rust-old `impl fmt::Display for SystemOp` (types.rs:524-544)
 # byte-for-byte. The CLI's --verbose dump uses its own multi-line format

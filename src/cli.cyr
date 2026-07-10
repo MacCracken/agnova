@@ -12,7 +12,7 @@
 # command refuses to run, mirroring the CLAUDE.md "no silent destructive
 # operations" rule.
 
-var AGNOVA_VERSION = "0.6.1";
+var AGNOVA_VERSION = "0.7.0";
 var DEFAULT_TARGET_ROOT = "/mnt";
 
 # Indices for our flag set — populated by _build_flags(), used by the
@@ -35,6 +35,7 @@ var FLAG_DISK_BACKEND = 0;
 var FLAG_GNOBOOT_SRC = 0;
 var FLAG_KERNEL_SRC = 0;
 var FLAG_AGNSH_SRC = 0;
+var FLAG_BASE_TARBALL = 0;
 var FLAG_SCRATCH_BASE = 0;
 var FLAG_DISK_SECTORS = 0;
 
@@ -58,6 +59,7 @@ fn _build_flags() {
     FLAG_GNOBOOT_SRC  = flags_add_str(h,  0, "gnoboot-src",  0,       "native: BOOTX64.EFI source path");
     FLAG_KERNEL_SRC   = flags_add_str(h,  0, "kernel-src",   0,       "native: kernel source path");
     FLAG_AGNSH_SRC    = flags_add_str(h,  0, "agnsh-src",    0,       "native: /bin/agnsh source path");
+    FLAG_BASE_TARBALL = flags_add_str(h,  0, "base-tarball", 0,       "native: base-system archive -> ext2 root");
     FLAG_SCRATCH_BASE = flags_add_str(h,  0, "scratch-base", "0",     "native: image LBA offset (0=whole disk)");
     FLAG_DISK_SECTORS = flags_add_str(h,  0, "disk-sectors", "0",     "native: disk-size override, sectors (0=real)");
     return h;
@@ -554,6 +556,7 @@ fn cli_main() {
     set_disk_backend(_parse_disk_backend(flags_get_str(h, FLAG_DISK_BACKEND)));
     set_native_sources(flags_get_str(h, FLAG_GNOBOOT_SRC), flags_get_str(h, FLAG_KERNEL_SRC),
     flags_get_str(h, FLAG_AGNSH_SRC));
+    set_native_base(flags_get_str(h, FLAG_BASE_TARBALL));
     df_set_geometry(atoi(flags_get_str(h, FLAG_SCRATCH_BASE)), atoi(flags_get_str(h, FLAG_DISK_SECTORS)));
 
     var pcount = flags_positional_count(h);

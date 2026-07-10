@@ -49,6 +49,10 @@ var df_native_gnoboot = "/usr/lib/gnoboot/BOOTX64.EFI";
 var df_native_kernel  = "/boot/agnos";
 # Base-system payload staged into the ext2 root (/bin/agnsh) — overridable via --agnsh-src.
 var df_native_agnsh   = "/usr/lib/agnos/agnsh";
+# Full base-system archive (tar / tar.gz / tar.xz / tar.bz2 / tar.zst) extracted into the ext2 root
+# via the sovereign sankoch cursor. When set (--base-tarball), it REPLACES the single-agnsh stage:
+# the tarball is the whole base filesystem. 0 = unset (fall back to the single /bin/agnsh stage).
+var df_native_base = 0;
 # Target device path captured on the format op (OP_STAGE_FILE doesn't carry the device).
 var df_target_dev = 0;
 
@@ -56,6 +60,11 @@ fn set_native_sources(gnoboot_cstr, kernel_cstr, agnsh_cstr) {
     if (gnoboot_cstr != 0) { df_native_gnoboot = gnoboot_cstr; }
     if (kernel_cstr != 0)  { df_native_kernel = kernel_cstr; }
     if (agnsh_cstr != 0)   { df_native_agnsh = agnsh_cstr; }
+    return 0;
+}
+
+fn set_native_base(base_cstr) {
+    if (base_cstr != 0) { df_native_base = base_cstr; }
     return 0;
 }
 
@@ -74,39 +83,10 @@ fn df_name_agnos() {                                         # "AGNOS      "
 }
 
 # --- Native plan --------------------------------------------------------------------
-# On a native backend the shell planners (parted/mkfs/cp OP_COMMANDs) are NOT used;
-# instead we emit the structured disk ops and SUPPRESS the phases that cannot run
-# natively (mount / base-tarball / packages / grub — no fork/exec on agnos), so the
-# plan runs to the disk-shaping phases without aborting. ESP-only slice (Phase-5 scope).
-fn plan_native_disk_ops(cfg, target_root) {
-    var plans = vec_new();
-    var disk = InstallConfig_disk(cfg);
-    var parts = DiskLayout_partitions(disk);
-    var dev = DiskLayout_target_device(disk);
-
-    # PHASE_PARTITION_DISK — write the GPT for the whole layout.
-    var pops = vec_new();
-    vec_push(pops, op_partition_disk(disk));
-    vec_push(plans, phase_ops_new(PHASE_PARTITION_DISK, str_from("Partition disk (native GPT)"), pops));
-
-    # PHASE_FORMAT_FILESYSTEMS — FAT32 the ESP (partition 0) + sovereign ext2 the root (partition 1).
-    var fops = vec_new();
-    vec_push(fops, op_format_fs(0, vec_get(parts, 0), dev));
-    vec_push(fops, op_format_fs(1, vec_get(parts, 1), dev));
-    vec_push(plans, phase_ops_new(PHASE_FORMAT_FILESYSTEMS, str_from("Format ESP (FAT32) + root (ext2)"), fops));
-
-    # PHASE_INSTALL_BASE — stage the base system into the ext2 root (/bin/agnsh; dirs auto-created).
-    var bops = vec_new();
-    vec_push(bops, op_stage_file(str_from(df_native_agnsh), str_from("/bin/agnsh"), 1));
-    vec_push(plans, phase_ops_new(PHASE_INSTALL_BASE, str_from("Install base system (native ext2 root)"), bops));
-
-    # PHASE_INSTALL_BOOTLOADER — stage gnoboot + kernel into the ESP (replaces the cp/mkdir ops).
-    var sops = vec_new();
-    vec_push(sops, op_stage_file(str_from(df_native_gnoboot), str_from("/EFI/BOOT/BOOTX64.EFI"), 0));
-    vec_push(sops, op_stage_file(str_from(df_native_kernel), str_from("/boot/agnos"), 0));
-    vec_push(plans, phase_ops_new(PHASE_INSTALL_BOOTLOADER, str_from("Stage bootloader + kernel (native)"), sops));
-    return plans;
-}
+# The native install-plan BUILDER (plan_native_disk_ops) lives in src/disk_plan.cyr — it is
+# included AFTER helpers/rootfs so it can reuse the shared config planners (plan_network_ops /
+# plan_locale_ops / plan_security_ops) for the config phase. This file owns only the backend
+# selector, source vars, and the native op HANDLERS (which depend on nothing past diskfmt).
 
 # --- Native op handlers ---------------------------------------------------------------
 # Each receives the full SystemOp. The GPT/FAT/staging is built by the vendored diskfmt
@@ -183,8 +163,9 @@ fn native_format(op) {
 }
 
 # OP_STAGE_FILE: stream a source file into a formatted partition. target_fs selects the writer:
-#   0 -> ESP FAT (two known dsts: \EFI\BOOT\BOOTX64.EFI and \boot\agnos)
-#   1 -> ext2 root (arbitrary absolute path, intermediate dirs auto-created)
+#   STAGE_TARGET_ESP  (0) -> ESP FAT (two known dsts: \EFI\BOOT\BOOTX64.EFI and \boot\agnos)
+#   STAGE_TARGET_EXT2 (1) -> ext2 root (arbitrary absolute path, intermediate dirs auto-created)
+#   STAGE_TARGET_UNTAR(2) -> extract the source archive (envelope sniffed) into the ext2 root
 # The staging state (df_esp_* / df_ext2_*) was set by the matching native_format call.
 fn native_stage(op) {
     var src = SystemOp_StageFile_src_path(payload(op));
@@ -197,7 +178,12 @@ fn native_stage(op) {
     if (sfd < 0) { df_close_target(); return 0 - 1; }
 
     var rc = 0;
-    if (target == 1) {
+    if (target == STAGE_TARGET_UNTAR) {
+        # Extract the whole base-system archive into the ext2 root (sankoch sniffs gz/xz/bz2/zst,
+        # inflates in RAM, writes the tree via df_ext2_*). df_ext2_untar returns the entry count.
+        var n = df_ext2_untar(sfd);
+        if (n < 0) { rc = 0 - 1; }
+    } elif (target == STAGE_TARGET_EXT2) {
         rc = df_ext2_stage(str_cstr(dst), sfd);                                # ext2 root
     } else {
         if (str_contains_cstr(dst, "/EFI/BOOT/") == 1) {
@@ -209,6 +195,45 @@ fn native_stage(op) {
         }
     }
     df_close_src(sfd);
+    df_close_target();
+    return rc;
+}
+
+# --- Native config-file handlers (OP_WRITE_FILE / OP_MAKE_DIR / OP_SYMLINK on a native backend) --
+# The install plan's config phases (network / locale / security / first-boot marker) emit the same
+# structured file ops the shell path does, but with ROOT-RELATIVE paths (/etc/fstab, not
+# <target_root>/etc/fstab). On a native backend execute_op routes them here, writing into the ext2
+# image via df_ext2_* — no mount, no host fs. The ext2 allocator state was set up by native_format
+# and persists across these re-opens (process globals); every write self-flushes the metadata.
+
+fn native_ext2_write(op) {
+    var p = payload(op);
+    var path = SystemOp_WriteFile_path(p);
+    var content = SystemOp_WriteFile_content(p);
+    if (df_target_dev == 0) { return 0 - 1; }             # a native format op must have run first
+    if (df_open_target(df_target_dev) != 0) { return 0 - 1; }
+    var rc = df_ext2_write_mem(str_cstr(path), str_data(content), str_len(content));
+    df_close_target();
+    return rc;
+}
+
+fn native_ext2_mkdir(op) {
+    var p = payload(op);
+    var path = SystemOp_MakeDir_path(p);
+    if (df_target_dev == 0) { return 0 - 1; }
+    if (df_open_target(df_target_dev) != 0) { return 0 - 1; }
+    var rc = df_ext2_mkdir_p(str_cstr(path));
+    df_close_target();
+    return rc;
+}
+
+fn native_ext2_symlink(op) {
+    var p = payload(op);
+    var link = SystemOp_Symlink_link(p);
+    var target = SystemOp_Symlink_target(p);
+    if (df_target_dev == 0) { return 0 - 1; }
+    if (df_open_target(df_target_dev) != 0) { return 0 - 1; }
+    var rc = df_ext2_symlink_p(str_cstr(link), str_cstr(target));
     df_close_target();
     return rc;
 }

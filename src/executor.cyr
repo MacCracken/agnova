@@ -229,6 +229,14 @@ fn _exec_unmount(p) {
 fn execute_op(op) {
     var t = tag(op);
     var p = payload(op);
+    # On a native backend the config file/dir/symlink ops write into the ext2 IMAGE (no mount, no
+    # host fs), so they route to the native ext2 sink on BOTH targets — this branch precedes (and on
+    # agnos replaces) the Linux shell-out handlers below. The native plan emits root-relative paths.
+    if (get_disk_backend() != DISK_BACKEND_SHELL) {
+        if (t == OP_WRITE_FILE) { return native_ext2_write(op); }
+        if (t == OP_MAKE_DIR) { return native_ext2_mkdir(op); }
+        if (t == OP_SYMLINK) { return native_ext2_symlink(op); }
+    }
     #ifndef CYRIUS_TARGET_AGNOS
     if (t == OP_COMMAND) { return _exec_command(p); }
     if (t == OP_WRITE_FILE) { return _exec_write_file(p); }
