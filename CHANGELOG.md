@@ -6,6 +6,42 @@ This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-10 — dual-target native disk backend: agnova shapes a disk with no shell-out
+
+Phase 5 of the AGNOS native-install arc. agnova now partitions, formats, and stages an ESP
+**natively** — no `parted`/`mkfs.fat`/`mcopy` — via the same gptwr-proven on-disk format logic,
+and the **same binary runs on agnos** (writing through `sys_blk_*`) as well as on the Linux
+host. The Linux-hosted shell path stays the default and is byte-identical to before.
+
+### Added
+- **Structured disk ops** `OP_PARTITION_DISK` / `OP_FORMAT_FS` / `OP_STAGE_FILE` (`types.cyr`)
+  dispatched under `execute_op` to a new **native disk backend** (`src/disk_backend.cyr`) —
+  behind the existing SystemOp seam, so the shell planners are untouched (ADR-0002).
+- **`src/diskfmt.cyr`** — sovereign GPT + FAT32 + file-staging builders (vendored from the
+  gptwr proof tool, parameterized): a byte-accurate protective MBR + primary/backup GPT header
+  + 128-entry array (CRC32, UTF-16 partition names), a FAT32 ESP (BPB + FSInfo + dual FAT +
+  `\EFI\BOOT` / `\boot` tree, parametric volume label), and streamed cluster-chain file staging.
+  Validated by `sgdisk` + `fsck.fat` + byte-identical `mcopy` (`scripts/native-disk-smoke.sh`).
+- **`--disk-backend=shell|native-file|native-block`** plus `--gnoboot-src` / `--kernel-src`
+  (ESP payload sources) and `--scratch-base` / `--disk-sectors` (bounded-image / QEMU-proof mode).
+- **Dual-target build**: Linux (shell + `native-file` file-offset sector I/O) and agnos
+  (`native-block`, `sys_blk_*` behind the `BLK_RW_ARM_MAGIC` gate). The whole Linux shell/mount
+  surface is `#ifndef CYRIUS_TARGET_AGNOS`-compiled-out; one target-gated I/O seam in `diskfmt`.
+- **agnos install-slice proof**: `agnos/scripts/agnova-install-smoke.sh` — the real `--agnos`
+  agnova binary runs ring-3 on agnos, enumerates the NVMe, arms the gate, and writes a valid
+  GPT via `sys_blk_*` (sgdisk-clean, no faults).
+
+### Changed
+- **Toolchain pin 6.3.35 → 6.4.39** (for the `sys_blk_*` wrappers), `cyrius lib sync --full` to
+  materialize the agnos syscall variant into `lib/`. `main.cyr` uses a bare `_entry()` call
+  (agnos argv capture). Source-file opens go through `io.cyr`'s portable `xopen`.
+- **CI lint hardened** to fail on warnings / untracked deferrals (`.github/workflows/ci.yml`).
+
+### Notes
+- The native path is **ESP-only**: `mkfs.ext4`/xfs/btrfs for the root filesystem, the
+  base-system tarball, LUKS, and `mount` remain on the shell backend (`native_format` returns
+  `E_NOT_IMPL` for non-VFAT). A full agnos-on-agnos install still needs those to land.
+
 ## [0.4.1] - 2026-07-03 — sovereign reconciliation: gnoboot default + zugot-resolvable packages
 
 ### Changed
