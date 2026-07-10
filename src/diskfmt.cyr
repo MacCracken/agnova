@@ -199,3 +199,266 @@ fn df_self_verify(n) {
     if (bc != bsaved) { return 86; }
     return 0;
 }
+
+# ======================================================================================
+# FAT32 mkfs + directory tree + file staging (ported from gptwr Bites 6-8c; parametric
+# on the 11-byte volume label). SecPerClus=1, RsvdSecCnt=32, NumFATs=2. Sector I/O via
+# df_write/df_read. Staging is stateful across ops (df_esp_* module globals).
+# ======================================================================================
+var df_fatbs[64];    #   512 B — FAT32 boot sector (BPB)
+var df_fsinfo[64];   #   512 B — FSInfo
+var df_fatsec[64];   #   512 B — FAT sector RMW scratch
+var df_rootbuf[64];  #   512 B — root cluster (vol label + \EFI + \boot dirents)
+var df_efidir[64];   #   512 B — \EFI cluster
+var df_ebdir[64];    #   512 B — \EFI\BOOT cluster
+var df_btdir[64];    #   512 B — \boot cluster
+var df_z32[2048];    # 16384 B — zero buffer (metadata-region zeroing)
+var df_batch[2048];  # 16384 B — 32-cluster file-stream batch
+var df_nm[8];        #    64 B — 8.3 name scratch
+
+# Staging state — set by df_format_esp, consumed by df_stage_file across ops.
+var df_esp_abs = 0;         # ESP partition first LBA (absolute)
+var df_esp_fatsz = 0;       # FATSz32
+var df_esp_root_start = 0;  # partition-relative sector of the root cluster (= data_start)
+var df_esp_coc = 0;         # CountOfClusters
+var df_esp_nfree = 6;       # next free cluster (2=root, 3=\EFI, 4=\EFI\BOOT, 5=\boot)
+
+fn df_fat32_fatsz(total, reserved, spc, numfats) {
+    var tmpval1 = total - reserved;
+    var tmpval2 = (256 * spc + numfats) / 2;
+    return (tmpval1 + tmpval2 - 1) / tmpval2;
+}
+
+# Write an 11-byte, space-padded 8.3 name/label from label_ptr (label_len chars) into dst.
+fn df_wr_label(dst, label_ptr, label_len) {
+    var i = 0;
+    while (i < 11) {
+        if (i < label_len) { store8(dst + i, load8(label_ptr + i) & 0xFF); }
+        else               { store8(dst + i, 0x20); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn df_read_fill(fd, buf, want) {
+    var got = 0;
+    while (got < want) {
+        var n = sys_read(fd, buf + got, want - got);
+        if (n <= 0) { return got; }
+        got = got + n;
+    }
+    return got;
+}
+
+fn df_build_dir_cluster(buf, self_clus, parent_clus) {
+    df_zero(buf, 512);
+    store8(buf + 0, 0x2E);
+    var i = 1;
+    while (i < 11) { store8(buf + i, 0x20); i = i + 1; }
+    store8(buf + 11, 0x10);
+    store16(buf + 20, (self_clus >> 16) & 0xFFFF);
+    store16(buf + 26, self_clus & 0xFFFF);
+    store8(buf + 32, 0x2E); store8(buf + 33, 0x2E);
+    i = 34;
+    while (i < 43) { store8(buf + i, 0x20); i = i + 1; }
+    store8(buf + 43, 0x10);
+    store16(buf + 52, (parent_clus >> 16) & 0xFFFF);
+    store16(buf + 58, parent_clus & 0xFFFF);
+    return 0;
+}
+
+fn df_put_dir_dirent(pbuf, slot, clus, n0, n1, n2, n3, n4, n5, n6, n7) {
+    var o = pbuf + slot * 32;
+    store8(o + 0, n0); store8(o + 1, n1); store8(o + 2, n2); store8(o + 3, n3);
+    store8(o + 4, n4); store8(o + 5, n5); store8(o + 6, n6); store8(o + 7, n7);
+    store8(o + 8, 0x20); store8(o + 9, 0x20); store8(o + 10, 0x20);
+    store8(o + 11, 0x10);
+    store16(o + 20, (clus >> 16) & 0xFFFF);
+    store16(o + 26, clus & 0xFFFF);
+    store32(o + 28, 0);
+    return 0;
+}
+
+fn df_put_dirent(pbuf, slot, name_ptr, attr, clus, size) {
+    var o = pbuf + slot * 32;
+    var i = 0;
+    while (i < 11) { store8(o + i, load8(name_ptr + i) & 0xFF); i = i + 1; }
+    store8(o + 11, attr);
+    store16(o + 20, (clus >> 16) & 0xFFFF);
+    store16(o + 26, clus & 0xFFFF);
+    store32(o + 28, size);
+    return 0;
+}
+
+# Contiguous FAT32 chain [first..last] to BOTH FATs, RMW per touched FAT sector. Returns 0/-1.
+fn df_fat_write_chain(esp_abs, fatsz, first, last) {
+    var s = (first * 4) / 512;
+    var slast = (last * 4) / 512;
+    while (s <= slast) {
+        if (df_read(esp_abs + 32 + s, &df_fatsec, 1) != 1) { return 0 - 1; }
+        var c = s * 128;
+        if (c < first) { c = first; }
+        var cend = s * 128 + 127;
+        if (cend > last) { cend = last; }
+        while (c <= cend) {
+            var val = c + 1;
+            if (c == last) { val = 0x0FFFFFFF; }
+            store32(&df_fatsec + (c * 4 - s * 512), val);
+            c = c + 1;
+        }
+        if (df_write(esp_abs + 32 + s, &df_fatsec, 1) != 1)         { return 0 - 1; }
+        if (df_write(esp_abs + 32 + fatsz + s, &df_fatsec, 1) != 1) { return 0 - 1; }
+        s = s + 1;
+    }
+    return 0;
+}
+
+# Build the BPB + FSInfo + FAT-sector-0 + root cluster (with the volume-label dirent) for an
+# empty FAT32 volume of `esp_sectors` sectors, labeled `label_ptr`/`label_len`. Returns FATSz32.
+fn df_build_fat(esp_sectors, label_ptr, label_len) {
+    var fatsz = df_fat32_fatsz(esp_sectors, 32, 1, 2);
+
+    df_zero(&df_fatbs, 512);
+    store8(&df_fatbs + 0, 0xEB); store8(&df_fatbs + 1, 0x58); store8(&df_fatbs + 2, 0x90);
+    store8(&df_fatbs + 3, 0x41); store8(&df_fatbs + 4, 0x47); store8(&df_fatbs + 5, 0x4E);   # OEM "AGNOS   "
+    store8(&df_fatbs + 6, 0x4F); store8(&df_fatbs + 7, 0x53); store8(&df_fatbs + 8, 0x20);
+    store8(&df_fatbs + 9, 0x20); store8(&df_fatbs + 10, 0x20);
+    store16(&df_fatbs + 11, 512);
+    store8(&df_fatbs + 13, 1);
+    store16(&df_fatbs + 14, 32);
+    store8(&df_fatbs + 16, 2);
+    store16(&df_fatbs + 17, 0);
+    store16(&df_fatbs + 19, 0);
+    store8(&df_fatbs + 21, 0xF8);
+    store16(&df_fatbs + 22, 0);
+    store16(&df_fatbs + 24, 32);
+    store16(&df_fatbs + 26, 8);
+    store32(&df_fatbs + 28, 0);
+    store32(&df_fatbs + 32, esp_sectors);
+    store32(&df_fatbs + 36, fatsz);
+    store16(&df_fatbs + 40, 0);
+    store16(&df_fatbs + 42, 0);
+    store32(&df_fatbs + 44, 2);
+    store16(&df_fatbs + 48, 1);
+    store16(&df_fatbs + 50, 6);
+    store8(&df_fatbs + 64, 0x80);
+    store8(&df_fatbs + 66, 0x29);
+    store32(&df_fatbs + 67, 0x41474E53);
+    df_wr_label(&df_fatbs + 71, label_ptr, label_len);   # VolLab (parametric)
+    store8(&df_fatbs + 82, 0x46); store8(&df_fatbs + 83, 0x41); store8(&df_fatbs + 84, 0x54);  # "FAT32   "
+    store8(&df_fatbs + 85, 0x33); store8(&df_fatbs + 86, 0x32); store8(&df_fatbs + 87, 0x20);
+    store8(&df_fatbs + 88, 0x20); store8(&df_fatbs + 89, 0x20);
+    store8(&df_fatbs + 510, 0x55); store8(&df_fatbs + 511, 0xAA);
+
+    var coc = esp_sectors - (32 + 2 * fatsz);
+
+    df_zero(&df_fsinfo, 512);
+    store32(&df_fsinfo + 0,   0x41615252);
+    store32(&df_fsinfo + 484, 0x61417272);
+    store32(&df_fsinfo + 488, coc - 1);
+    store32(&df_fsinfo + 492, 3);
+    store32(&df_fsinfo + 508, 0xAA550000);
+
+    df_zero(&df_fatsec, 512);
+    store32(&df_fatsec + 0, 0x0FFFFFF8);
+    store32(&df_fatsec + 4, 0x0FFFFFFF);
+    store32(&df_fatsec + 8, 0x0FFFFFFF);
+
+    df_zero(&df_rootbuf, 512);
+    df_wr_label(&df_rootbuf + 0, label_ptr, label_len);   # root volume-label dirent (parametric)
+    store8(&df_rootbuf + 11, 0x08);                        # ATTR_VOLUME_ID
+    return fatsz;
+}
+
+# Format the ESP partition [esp_abs, esp_abs+esp_sectors) as FAT32 with the given label AND
+# create the \EFI, \EFI\BOOT, \boot directory skeleton. Sets the staging state. Returns 0/-1.
+fn df_format_esp(esp_abs, esp_sectors, label_ptr, label_len) {
+    var fatsz = df_build_fat(esp_sectors, label_ptr, label_len);
+    var root_start = 32 + 2 * fatsz;
+    var coc = esp_sectors - root_start;
+    if (coc < 65525) { return 0 - 1; }                    # would be FAT16
+
+    # Zero the metadata region [0..root_start] (reserved + both FATs + root cluster).
+    df_zero(&df_z32, 16384);
+    var zs = 0;
+    while (zs <= root_start) {
+        var zn = root_start - zs + 1;
+        if (zn > 32) { zn = 32; }
+        if (df_write(esp_abs + zs, &df_z32, zn) != zn) { return 0 - 1; }
+        zs = zs + zn;
+    }
+
+    # Directory tree: \EFI (3, parent root), \EFI\BOOT (4, parent \EFI), \boot (5, parent root).
+    df_build_dir_cluster(&df_efidir, 3, 0);
+    df_build_dir_cluster(&df_ebdir, 4, 3);
+    df_build_dir_cluster(&df_btdir, 5, 0);
+    store32(&df_fatsec + 12, 0x0FFFFFFF);                 # FAT[3] EOC
+    store32(&df_fatsec + 16, 0x0FFFFFFF);                 # FAT[4] EOC
+    store32(&df_fatsec + 20, 0x0FFFFFFF);                 # FAT[5] EOC
+    df_put_dir_dirent(&df_rootbuf, 1, 3, 0x45, 0x46, 0x49, 0x20, 0x20, 0x20, 0x20, 0x20);  # "EFI" in root
+    df_put_dir_dirent(&df_efidir,  2, 4, 0x42, 0x4F, 0x4F, 0x54, 0x20, 0x20, 0x20, 0x20);  # "BOOT" in \EFI
+    df_put_dir_dirent(&df_rootbuf, 2, 5, 0x42, 0x4F, 0x4F, 0x54, 0x20, 0x20, 0x20, 0x20);  # "BOOT" (\boot) in root
+
+    # FSInfo: clusters 2,3,4,5 used.
+    store32(&df_fsinfo + 488, coc - 4);
+    store32(&df_fsinfo + 492, 6);
+
+    # Write everything: boot(+backup), FSInfo(+backup), both FATs' sector 0, root + 3 dir clusters.
+    if (df_write(esp_abs + 0, &df_fatbs, 1) != 1)          { return 0 - 1; }
+    if (df_write(esp_abs + 6, &df_fatbs, 1) != 1)          { return 0 - 1; }
+    if (df_write(esp_abs + 1, &df_fsinfo, 1) != 1)         { return 0 - 1; }
+    if (df_write(esp_abs + 7, &df_fsinfo, 1) != 1)         { return 0 - 1; }
+    if (df_write(esp_abs + 32, &df_fatsec, 1) != 1)        { return 0 - 1; }
+    if (df_write(esp_abs + 32 + fatsz, &df_fatsec, 1) != 1) { return 0 - 1; }
+    if (df_write(esp_abs + root_start, &df_rootbuf, 1) != 1)     { return 0 - 1; }
+    if (df_write(esp_abs + root_start + 1, &df_efidir, 1) != 1)  { return 0 - 1; }
+    if (df_write(esp_abs + root_start + 2, &df_ebdir, 1) != 1)   { return 0 - 1; }
+    if (df_write(esp_abs + root_start + 3, &df_btdir, 1) != 1)   { return 0 - 1; }
+
+    df_esp_abs = esp_abs;
+    df_esp_fatsz = fatsz;
+    df_esp_root_start = root_start;
+    df_esp_coc = coc;
+    df_esp_nfree = 6;
+    return 0;
+}
+
+# Stream an open source fd into the ESP: allocate a contiguous cluster run from df_esp_nfree,
+# write the body, chain both FATs, and publish the 8.3 dirent (name_ptr) into dir_buf at
+# dir_slot (the dir cluster's partition-relative sector = dir_rel_sec). Returns 0/-1.
+fn df_stage_file(dir_buf, dir_rel_sec, dir_slot, name_ptr, src_fd) {
+    var esp_abs = df_esp_abs;
+    var fatsz = df_esp_fatsz;
+    var root_start = df_esp_root_start;
+    var first = df_esp_nfree;
+
+    var size = syscall(SYS_LSEEK, src_fd, 0, 2);          # SEEK_END -> size
+    if (size <= 0) { return 0 - 1; }
+    syscall(SYS_LSEEK, src_fd, 0, 0);                     # rewind
+    var nclus = (size + 511) / 512;
+    if ((first + nclus) > (df_esp_coc + 2)) { return 0 - 1; }
+
+    var wi = 0;
+    var total = 0;
+    while (wi < nclus) {
+        var chunk = nclus - wi;
+        if (chunk > 32) { chunk = 32; }
+        df_zero(&df_batch, 16384);
+        total = total + df_read_fill(src_fd, &df_batch, chunk * 512);
+        if (df_write(esp_abs + root_start + (first + wi - 2), &df_batch, chunk) != chunk) { return 0 - 1; }
+        wi = wi + chunk;
+    }
+    if (total != size) { return 0 - 1; }
+
+    if (df_fat_write_chain(esp_abs, fatsz, first, first + nclus - 1) != 0) { return 0 - 1; }
+
+    df_put_dirent(dir_buf, dir_slot, name_ptr, 0x20, first, size);
+    if (df_write(esp_abs + dir_rel_sec, dir_buf, 1) != 1) { return 0 - 1; }
+
+    df_esp_nfree = first + nclus;
+    store32(&df_fsinfo + 488, df_esp_coc - (df_esp_nfree - 2));
+    store32(&df_fsinfo + 492, df_esp_nfree);
+    if (df_write(esp_abs + 1, &df_fsinfo, 1) != 1) { return 0 - 1; }
+    if (df_write(esp_abs + 7, &df_fsinfo, 1) != 1) { return 0 - 1; }
+    return 0;
+}

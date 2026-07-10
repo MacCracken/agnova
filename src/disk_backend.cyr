@@ -42,6 +42,34 @@ fn get_disk_backend() {
     return disk_backend;
 }
 
+# Live install-media source paths for the ESP payloads (bootloader + kernel), overridable via
+# --gnoboot-src / --kernel-src. Defaults are placeholder installer-medium locations (the agnos
+# source paths are an open decision — the smoke passes real dev-box files).
+var df_native_gnoboot = "/usr/lib/gnoboot/BOOTX64.EFI";
+var df_native_kernel  = "/boot/agnos";
+# Target device path captured on the format op (OP_STAGE_FILE doesn't carry the device).
+var df_target_dev = 0;
+
+fn set_native_sources(gnoboot_cstr, kernel_cstr) {
+    if (gnoboot_cstr != 0) { df_native_gnoboot = gnoboot_cstr; }
+    if (kernel_cstr != 0)  { df_native_kernel = kernel_cstr; }
+    return 0;
+}
+
+# 8.3 short names for the two staged files, written into diskfmt's df_nm scratch.
+fn df_name_bootx64() {
+    store8(&df_nm + 0, 0x42); store8(&df_nm + 1, 0x4F); store8(&df_nm + 2, 0x4F); store8(&df_nm + 3, 0x54);  # "BOOTX64 EFI"
+    store8(&df_nm + 4, 0x58); store8(&df_nm + 5, 0x36); store8(&df_nm + 6, 0x34); store8(&df_nm + 7, 0x20);
+    store8(&df_nm + 8, 0x45); store8(&df_nm + 9, 0x46); store8(&df_nm + 10, 0x49);
+    return 0;
+}
+fn df_name_agnos() {
+    store8(&df_nm + 0, 0x41); store8(&df_nm + 1, 0x47); store8(&df_nm + 2, 0x4E); store8(&df_nm + 3, 0x4F);  # "AGNOS      "
+    store8(&df_nm + 4, 0x53); store8(&df_nm + 5, 0x20); store8(&df_nm + 6, 0x20); store8(&df_nm + 7, 0x20);
+    store8(&df_nm + 8, 0x20); store8(&df_nm + 9, 0x20); store8(&df_nm + 10, 0x20);
+    return 0;
+}
+
 # --- Native plan --------------------------------------------------------------------
 # On a native backend the shell planners (parted/mkfs/cp OP_COMMANDs) are NOT used;
 # instead we emit the structured disk ops and SUPPRESS the phases that cannot run
@@ -50,14 +78,24 @@ fn get_disk_backend() {
 fn plan_native_disk_ops(cfg, target_root) {
     var plans = vec_new();
     var disk = InstallConfig_disk(cfg);
+    var parts = DiskLayout_partitions(disk);
+    var dev = DiskLayout_target_device(disk);
 
-    # PHASE_PARTITION_DISK — one structured op carrying the whole DiskLayout.
+    # PHASE_PARTITION_DISK — write the GPT for the whole layout.
     var pops = vec_new();
     vec_push(pops, op_partition_disk(disk));
     vec_push(plans, phase_ops_new(PHASE_PARTITION_DISK, str_from("Partition disk (native GPT)"), pops));
 
-    # Bites 4-5 append: PHASE_FORMAT_DISK (OP_FORMAT_FS for the ESP) and
-    # PHASE_INSTALL_BOOTLOADER (OP_STAGE_FILE for BOOTX64.EFI + the kernel).
+    # PHASE_FORMAT_FILESYSTEMS — FAT32 the ESP (partition 0) only; ext4 root is deferred.
+    var fops = vec_new();
+    vec_push(fops, op_format_fs(0, vec_get(parts, 0), dev));
+    vec_push(plans, phase_ops_new(PHASE_FORMAT_FILESYSTEMS, str_from("Format ESP (native FAT32)"), fops));
+
+    # PHASE_INSTALL_BOOTLOADER — stage gnoboot + kernel into the ESP (replaces the cp/mkdir ops).
+    var sops = vec_new();
+    vec_push(sops, op_stage_file(str_from(df_native_gnoboot), str_from("/EFI/BOOT/BOOTX64.EFI"), 0));
+    vec_push(sops, op_stage_file(str_from(df_native_kernel), str_from("/boot/agnos"), 0));
+    vec_push(plans, phase_ops_new(PHASE_INSTALL_BOOTLOADER, str_from("Stage bootloader + kernel (native)"), sops));
     return plans;
 }
 
@@ -102,10 +140,50 @@ fn native_partition(op) {
     return rc;
 }
 
+# OP_FORMAT_FS: format partition `part_index` as FAT32 (ESP only; ext4/xfs/btrfs deferred).
+# Locates the partition's LBA range by reading the just-written GPT entry array (stateless).
 fn native_format(op) {
-    return E_NOT_IMPL;
+    var pi = SystemOp_FormatFs_part_index(payload(op));
+    var spec = SystemOp_FormatFs_spec(payload(op));
+    var dev = SystemOp_FormatFs_device(payload(op));
+    if (PartitionSpec_filesystem(spec) != FS_VFAT) { return E_NOT_IMPL; }   # rootfs-mkfs gap
+
+    df_target_dev = str_cstr(dev);
+    var fd = sys_open(df_target_dev, O_RDWR, 0);
+    if (fd < 0) { return 0 - 1; }
+    df_set_fd(fd);
+    if (df_read(2, &df_pea, 32) != 32) { sys_close(fd); return 0 - 1; }     # partition entry array
+    var e = &df_pea + pi * 128;
+    var first = load64(e + 32);
+    var last = load64(e + 40);
+    var label = PartitionSpec_label(spec);
+    var rc = df_format_esp(first, last - first + 1, str_cstr(label), str_len(label));
+    sys_close(fd);
+    return rc;
 }
 
+# OP_STAGE_FILE: stream a source file into the ESP's FAT at the dst path. Two known targets:
+# \EFI\BOOT\BOOTX64.EFI and \boot\agnos (the staging state was set by native_format).
 fn native_stage(op) {
-    return E_NOT_IMPL;
+    var src = SystemOp_StageFile_src_path(payload(op));
+    var dst = SystemOp_StageFile_dst_fat_path(payload(op));
+    if (df_target_dev == 0) { return 0 - 1; }              # format must have run first
+
+    var fd = sys_open(df_target_dev, O_RDWR, 0);
+    if (fd < 0) { return 0 - 1; }
+    df_set_fd(fd);
+    var sfd = sys_open(str_cstr(src), O_RDONLY, 0);
+    if (sfd < 0) { sys_close(fd); return 0 - 1; }
+
+    var rc = 0;
+    if (str_contains_cstr(dst, "/EFI/BOOT/") == 1) {
+        df_name_bootx64();
+        rc = df_stage_file(&df_ebdir, df_esp_root_start + 2, 2, &df_nm, sfd);   # \EFI\BOOT (cluster 4)
+    } else {
+        df_name_agnos();
+        rc = df_stage_file(&df_btdir, df_esp_root_start + 3, 2, &df_nm, sfd);   # \boot (cluster 5)
+    }
+    sys_close(sfd);
+    sys_close(fd);
+    return rc;
 }
