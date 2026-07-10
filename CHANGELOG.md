@@ -6,6 +6,13 @@ This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-10 — sovereign ext2 root: agnova installs AGNOS natively and boots what it wrote
+
+Closes the AGNOS native-install arc. agnova now writes the **whole boot medium** — GPT + FAT32 ESP
++ a journal-less **ext2 root** — with no `parted`/`mkfs.fat`/`mkfs.ext2`/`mcopy`, and a production
+kernel boots that medium to `/bin/agnsh`. The 0.5.0 backend shaped the ESP only; 0.6.0 adds the
+root filesystem, so a native install is now end-to-end.
+
 ### Added
 - **Sovereign ext2 root writer** (`src/diskfmt.cyr`) — a journal-less ext2 mkfs + populate engine,
   so agnova now writes the **root filesystem** natively, not just the ESP. Classic ext2 (4096-byte
@@ -27,6 +34,11 @@ This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 - **Arc-closer boot proof** (`agnos/scripts/agnova-boot-smoke.sh`): a production kernel boots the
   agnova-written medium and kybernet execs `/bin/agnsh` from the agnova-written ext2 root — AGNOS
   installs AGNOS natively and boots what it wrote.
+
+### Changed
+- **Toolchain pin 6.4.39 → 6.4.43** (latest; `cyrius lib sync --full` to re-materialize the full
+  lib snapshot incl. the agnos syscall variant). No agnova-facing API change — the 6.4.40–6.4.43
+  deltas are async-runtime / aarch64 / Windows-IOCP only, none of which agnova uses.
 
 ## [0.5.0] - 2026-07-10 — dual-target native disk backend: agnova shapes a disk with no shell-out
 

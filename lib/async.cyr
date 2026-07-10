@@ -31,19 +31,33 @@
 include "lib/async_agnos.cyr"
 #endif
 
+# v6.4.43: Windows (PE) has no epoll/timerfd/fork either — route to an IOCP backend
+# (lib/async_win.cyr), the same per-target split as agnos. The epoll body below is
+# gated NOT-agnos AND NOT-win. Nested-guard precedent: lib/fs.cyr. Resolves
+# docs/development/issues/2026-07-08-async-epoll-only-blocks-win-transport.md.
+#ifdef CYRIUS_TARGET_WIN
+include "lib/async_win.cyr"
+#endif
+
 #ifndef CYRIUS_TARGET_AGNOS
+#ifndef CYRIUS_TARGET_WIN
 
 # Task states
 var TASK_READY = 0;
 var TASK_WAITING = 1;
 var TASK_DONE = 2;
 
-# Task struct: { fp, arg, state, next, wait_fd, result } = 48 bytes.
+# Task struct: { fp, arg, state, next, wait_fd, result, owned_fd } = 56 bytes.
 # wait_fd (@32, v6.4.33 F1) = the fd a parked task is blocked on, so async_run's
 # reactor can EPOLL_CTL_DEL it on wake; -1 when the task is not fd-waiting.
 # result (@40, v6.4.34 F2) = the task fn's return value, captured on completion so
 # task_join(rt, handle) can hand it back (the JoinHandle primitive).
-var TASK_SIZE = 48;
+# owned_fd (@48, v6.4.42) = an fd the task itself opened and must close if it is
+# RETIRED without resuming (connect socket / resolve UDP fd); -1 when the task owns
+# no fd. _async_retire closes it — without this a timed-out/retired connect or resolve
+# leaks its socket every time (CHANGELOG [6.4.42]). recv/send park on a CALLER-owned
+# fd so they leave owned_fd = -1; process cleanup is handled by async_run_process.
+var TASK_SIZE = 56;
 
 # Runtime struct: { epfd, tasks, task_count, active, allocator, current } = 48 bytes.
 # v6.1.22 — +allocator slot @32: async_new_in threads a caller-owned Allocator
@@ -65,7 +79,7 @@ var RT_SIZE = 48;
 fn async_new_in(a): i64 {
     var rt = alloc_via(a, RT_SIZE);
     if (rt == 0) { return 0; }
-    var epfd = syscall(SYS_EPOLL_CREATE1, 0);
+    var epfd = syscall(SYS_EPOLL_CREATE1, EPOLL_CLOEXEC);   # CLOEXEC: a fork-in-reactor child (v6.4.43)
     store64(rt, epfd);
     store64(rt + 8, 0);
     store64(rt + 16, 0);
@@ -97,6 +111,7 @@ fn async_spawn(rt, fp, arg): i64 {
     store64(t + 24, load64(rt + 8));
     store64(t + 32, 0 - 1);          # wait_fd: not fd-waiting (F1)
     store64(t + 40, 0);              # result: task fn's return, captured on done (F2)
+    store64(t + 48, 0 - 1);          # owned_fd: no task-owned fd to reclaim on retire (v6.4.42)
     store64(rt + 8, t);
     store64(rt + 16, load64(rt + 16) + 1);
     store64(rt + 24, load64(rt + 24) + 1);
@@ -137,7 +152,15 @@ fn _async_step(rt): i64 {
             var evbuf[16];
             var nr = sys_epoll_wait(epfd, &evbuf, 1, 0 - 1);
             if (nr > 0) {
+                # epoll_event.data offset is ABI-dependent: x86_64 has EPOLL_PACKED
+                # (data @4); aarch64 leaves the struct unpacked so the u64 aligns to @8.
+                # Must match the write in _async_wait_events. (CHANGELOG [6.4.42])
+                #ifdef CYRIUS_ARCH_AARCH64
+                var wtask = load64(&evbuf + 8);
+                #endif
+                #ifndef CYRIUS_ARCH_AARCH64
                 var wtask = load64(&evbuf + 4);
+                #endif
                 var wfd = load64(wtask + 32);
                 syscall(SYS_EPOLL_CTL, epfd, 2, wfd, 0);   # EPOLL_CTL_DEL
                 store64(wtask + 32, 0 - 1);
@@ -200,10 +223,23 @@ fn async_select(rt, handles, n): i64 {
     while (1 == 1) {
         var i = 0;
         while (i < n) {
-            if (load64(load64(handles + i * 8) + 16) == TASK_DONE) { return i; }
+            var hnd = load64(handles + i * 8);          # null-guard: OOM-failed spawn → 0
+            if (hnd != 0) { if (load64(hnd + 16) == TASK_DONE) { return i; } }
             i = i + 1;
         }
-        if (_async_step(rt) == 0) { return 0 - 1; }
+        if (_async_step(rt) == 0) {
+            # The step that idled the runtime may itself have completed a watched handle
+            # (a task that runs to DONE and drives active→0 in the SAME sweep is not
+            # counted as active). Re-scan once before reporting "none done" — otherwise a
+            # select over the last/only live task returns -1 instead of its index.
+            i = 0;
+            while (i < n) {
+                var hd = load64(handles + i * 8);
+                if (hd != 0) { if (load64(hd + 16) == TASK_DONE) { return i; } }
+                i = i + 1;
+            }
+            return 0 - 1;
+        }
     }
 }
 
@@ -221,7 +257,15 @@ fn _async_wait_events(rt, fd, events): i64 {
     var epfd = load64(rt);
     var ev[16];
     store32(&ev, events);            # EPOLLIN (1) / EPOLLOUT (4)
-    store64(&ev + 4, cur);           # epoll_data = task ptr (packed @4)
+    # epoll_data = task ptr. Offset is ABI-dependent: x86_64 packs the struct
+    # (EPOLL_PACKED → data @4); aarch64 leaves it unpacked so the u64 aligns to @8.
+    # The wake read in _async_step must use the same offset. (CHANGELOG [6.4.42])
+    #ifdef CYRIUS_ARCH_AARCH64
+    store64(&ev + 8, cur);
+    #endif
+    #ifndef CYRIUS_ARCH_AARCH64
+    store64(&ev + 4, cur);
+    #endif
     syscall(SYS_EPOLL_CTL, epfd, 1, fd, &ev);   # EPOLL_CTL_ADD
     store64(cur + 32, fd);           # remember fd for EPOLL_CTL_DEL on wake
     store64(cur + 16, TASK_WAITING); # park
@@ -240,6 +284,16 @@ fn async_wait_writable(rt, fd): i64 {
     return _async_wait_events(rt, fd, 4);       # EPOLLOUT — wait for writable
 }
 
+# Record `fd` as owned by the CURRENT task, so _async_retire closes it if the task is
+# retired (timed out / select loser) without ever resuming. A task that opens its own
+# fd and parks on it (connect socket, resolve UDP fd) calls this right after parking;
+# recv/send park on a caller-owned fd and must NOT call it. v6.4.42 (retire fd-leak fix).
+fn _async_own_fd(rt, fd): i64 {
+    var cur = load64(rt + 40);
+    if (cur != 0) { store64(cur + 48, fd); }
+    return 0;
+}
+
 # ================================================================
 # Async net client (v6.4.38) — non-blocking connect on the reactor.
 # ================================================================
@@ -249,7 +303,7 @@ fn async_wait_writable(rt, fd): i64 {
 # socket syscalls (async.cyr stays net.cyr-free). ctx = { step, addr, port, fd, rt }.
 fn _async_connect_task(ctx): i64 {
     if (load64(ctx) == 0) {
-        var fd = syscall(SYS_SOCKET, 2, 1, 0);          # AF_INET, SOCK_STREAM
+        var fd = syscall(SYS_SOCKET, 2, 1 | 524288, 0);  # AF_INET, SOCK_STREAM|SOCK_CLOEXEC (v6.4.43)
         if (fd < 0) { return 0 - 1; }
         var fl = syscall(SYS_FCNTL, fd, 3, 0);          # F_GETFL
         syscall(SYS_FCNTL, fd, 4, fl | 2048);           # F_SETFL O_NONBLOCK
@@ -263,6 +317,7 @@ fn _async_connect_task(ctx): i64 {
         if (syscall(SYS_CONNECT, fd, &sa, 16) == 0) { return fd; }   # connected immediately
         store64(ctx, 1);
         async_wait_writable(load64(ctx + 32), fd);      # EINPROGRESS → park on writable
+        _async_own_fd(load64(ctx + 32), fd);             # retire closes the socket on timeout
         return 0;
     }
     # resumed (writable): getsockopt(SOL_SOCKET, SO_ERROR)
@@ -284,7 +339,7 @@ fn _async_connect_task(ctx): i64 {
 # other tasks run concurrently. Linux only (agnos/macOS degrade). v6.4.38 (async net
 # client — connect).
 fn async_connect(rt, addr, port): i64 {
-    var ctx = alloc(40);
+    var ctx = alloc_via(load64(rt + 32), 40);       # rt's allocator (arena-reclaimable)
     store64(ctx, 0);
     store64(ctx + 8, addr);
     store64(ctx + 16, port);
@@ -309,7 +364,7 @@ fn _async_recv_task(ctx): i64 {
 # count (0 = EOF, <0 = error). One read per call — a full-message read re-spawns per
 # chunk (streaming with backpressure awaits the mid-body-suspend follow-on). v6.4.39.
 fn async_recv(rt, fd, buf, len): i64 {
-    var ctx = alloc(40);
+    var ctx = alloc_via(load64(rt + 32), 40);       # rt's allocator (arena-reclaimable)
     store64(ctx, 0);
     store64(ctx + 8, fd);
     store64(ctx + 16, buf);
@@ -333,7 +388,7 @@ fn _async_send_task(ctx): i64 {
 # `len` bytes from `buf`. Returns a task handle whose result (via task_join) is the byte
 # count written (<0 = error). One write per call. v6.4.39.
 fn async_send(rt, fd, buf, len): i64 {
-    var ctx = alloc(40);
+    var ctx = alloc_via(load64(rt + 32), 40);       # rt's allocator (arena-reclaimable)
     store64(ctx, 0);
     store64(ctx + 8, fd);
     store64(ctx + 16, buf);
@@ -453,7 +508,7 @@ fn _async_dns_parse_a(buf, blen, expected_id): i64 {
 # parse it. ctx = { step, host, ns_addr, ns_port, fd, id, rt }.
 fn _async_resolve_task(ctx): i64 {
     if (load64(ctx) == 0) {
-        var fd = syscall(SYS_SOCKET, 2, 2, 0);          # AF_INET, SOCK_DGRAM
+        var fd = syscall(SYS_SOCKET, 2, 2 | 524288, 0);  # AF_INET, SOCK_DGRAM|SOCK_CLOEXEC (v6.4.43)
         if (fd < 0) { return 0 - 1; }
         var sa[16];
         store16(&sa, 2);
@@ -469,6 +524,7 @@ fn _async_resolve_task(ctx): i64 {
         store64(ctx + 32, fd);
         store64(ctx, 1);
         async_wait_fd(load64(ctx + 48), fd);            # park for the response
+        _async_own_fd(load64(ctx + 48), fd);             # retire closes the UDP fd on timeout
         return 0;
     }
     var fd = load64(ctx + 32);
@@ -485,7 +541,7 @@ fn _async_resolve_task(ctx): i64 {
 # async_connect — or -1 on failure. The reactor parks on the UDP reply, so other tasks
 # run concurrently. Linux only. v6.4.40 (async DNS).
 fn async_resolve(rt, ns_addr, ns_port, host): i64 {
-    var ctx = alloc(56);
+    var ctx = alloc_via(load64(rt + 32), 56);       # rt's allocator (arena-reclaimable)
     store64(ctx, 0);
     store64(ctx + 8, host);
     store64(ctx + 16, ns_addr);
@@ -503,7 +559,7 @@ fn async_resolve(rt, ns_addr, ns_port, host): i64 {
 # Create a CLOCK_MONOTONIC timerfd that first fires after value_ms and then every
 # interval_ms (interval_ms == 0 = one-shot). Returns the fd, or -1 on failure.
 fn _async_timerfd(value_ms, interval_ms): i64 {
-    var tfd = syscall(SYS_TIMERFD_CREATE, 1, 0);
+    var tfd = syscall(SYS_TIMERFD_CREATE, 1, TFD_CLOEXEC);   # CLOEXEC (v6.4.43)
     if (tfd < 0) { return 0 - 1; }
     # itimerspec: { interval_sec, interval_nsec, value_sec, value_nsec }
     var spec[32];
@@ -525,6 +581,14 @@ fn _async_retire(rt, t): i64 {
     if (wfd >= 0) {
         syscall(SYS_EPOLL_CTL, load64(rt), 2, wfd, 0);   # EPOLL_CTL_DEL
         store64(t + 32, 0 - 1);
+    }
+    # Close any fd the task itself opened (connect socket / resolve UDP fd). Its resume
+    # body — the only other close site — never runs once the task is retired, so without
+    # this the fd leaks on every timeout/select-loser. -1 = task owns none. (v6.4.42)
+    var ofd = load64(t + 48);
+    if (ofd >= 0) {
+        syscall(SYS_CLOSE, ofd);
+        store64(t + 48, 0 - 1);
     }
     store64(t + 16, TASK_DONE);
     return 0;
@@ -554,7 +618,7 @@ fn async_with_timeout(rt, handle, ms): i64 {
     if (load64(handle + 16) == TASK_DONE) { return 1; }
     var tfd = _async_timerfd(ms, 0);
     if (tfd < 0) { return 0 - 1; }
-    var sctx = alloc(24);
+    var sctx = alloc_via(load64(rt + 32), 24);      # rt's allocator (arena-reclaimable)
     store64(sctx, 0);
     store64(sctx + 8, tfd);
     store64(sctx + 16, rt);
@@ -576,18 +640,19 @@ fn async_with_timeout(rt, handle, ms): i64 {
 # ctx = { step, fp, arg, tfd, rt, tok }.
 fn _async_interval_task(ctx): i64 {
     var tfd = load64(ctx + 24);
-    if (load64(load64(ctx + 40)) != 0) {          # cancel-token cell signalled?
-        syscall(SYS_CLOSE, tfd);
-        return 0;
-    }
+    var tok = load64(ctx + 40);                   # cancel-token CELL (0 = never cancel)
+    if (tok != 0) { if (load64(tok) != 0) {       # cancel-token cell signalled?
+            syscall(SYS_CLOSE, tfd);
+            return 0;
+        } }
     if (load64(ctx) == 1) {
         var buf[8];
         syscall(SYS_READ, tfd, &buf, 8);          # drain the tick(s)
         fncall1(load64(ctx + 8), load64(ctx + 16));   # fp(arg)
-        if (load64(load64(ctx + 40)) != 0) {      # callback may have cancelled
-            syscall(SYS_CLOSE, tfd);
-            return 0;
-        }
+        if (tok != 0) { if (load64(tok) != 0) {   # callback may have cancelled
+                syscall(SYS_CLOSE, tfd);
+                return 0;
+            } }
     }
     store64(ctx, 1);
     async_wait_fd(load64(ctx + 32), tfd);         # park for the next tick
@@ -602,7 +667,7 @@ fn _async_interval_task(ctx): i64 {
 fn async_interval(rt, fp, arg, ms, tok): i64 {
     var tfd = _async_timerfd(ms, ms);
     if (tfd < 0) { return 0; }
-    var ctx = alloc(48);
+    var ctx = alloc_via(load64(rt + 32), 48);       # rt's allocator (arena-reclaimable)
     store64(ctx, 0);
     store64(ctx + 8, fp);
     store64(ctx + 16, arg);
@@ -629,9 +694,18 @@ fn _async_process_task(ctx): i64 {
             sys_exit(127);                                       # exec failed
         }
         store64(ctx + 32, pid);
-        store64(ctx + 40, sys_pidfd_open(pid, 0));
+        var pfd = sys_pidfd_open(pid, 0);
+        if (pfd < 0) {
+            # pidfd_open failed (kernel < 5.3, or the pid raced away). Parking on a
+            # negative fd would deadlock the reactor forever (epoll_wait(-1) on an empty
+            # epfd) and leave the child a zombie — reap it and complete with an error.
+            var rb[8];
+            sys_waitpid(pid, &rb, 0);
+            return 0 - 1;
+        }
+        store64(ctx + 40, pfd);
         store64(ctx, 1);
-        async_wait_fd(load64(ctx + 48), load64(ctx + 40));       # park on the pidfd
+        async_wait_fd(load64(ctx + 48), pfd);                    # park on the pidfd
         return 0;
     }
     # wake: the child has exited — reap it (returns at once) and close the pidfd
@@ -648,7 +722,7 @@ fn _async_process_task(ctx): i64 {
 # a task handle whose result — via task_join(rt, handle) — is the child's exit code.
 # v6.4.36 (P2 — tokio::process::Command spawn).
 fn async_spawn_process(rt, path, argv, envp): i64 {
-    var ctx = alloc(56);
+    var ctx = alloc_via(load64(rt + 32), 56);       # rt's allocator (arena-reclaimable)
     store64(ctx, 0);
     store64(ctx + 8, path);
     store64(ctx + 16, argv);
@@ -681,20 +755,13 @@ fn async_run_process(rt, path, argv, envp, ms): i64 {
     return 0 - 2;
 }
 
-# Timer: sleep for ms milliseconds using timerfd + epoll
+# Timer: sleep for ms milliseconds using timerfd + epoll. Shares the one-shot timerfd
+# construction with the reactor via _async_timerfd (interval 0) — v6.4.42 dedup.
 fn async_sleep_ms(ms): i64 {
-    var tfd = syscall(SYS_TIMERFD_CREATE, 1, 0);
+    var tfd = _async_timerfd(ms, 0);
     if (tfd < 0) { return 0 - 1; }
-    # itimerspec: { interval_sec, interval_nsec, value_sec, value_nsec }
-    var spec[32];
-    store64(&spec, 0);
-    store64(&spec + 8, 0);
-    store64(&spec + 16, ms / 1000);
-    store64(&spec + 24, (ms % 1000) * 1000000);
-    syscall(SYS_TIMERFD_SETTIME, tfd, 0, &spec, 0);
-    # Block until timer fires
     var buf[8];
-    syscall(SYS_READ, tfd, &buf, 8);
+    syscall(SYS_READ, tfd, &buf, 8);          # block until the timer fires
     syscall(SYS_CLOSE, tfd);
     return 0;
 }
@@ -716,7 +783,14 @@ fn async_await_readable(fd): i64 {
     # epoll_event: { events: u32, data: u64 } = 12 bytes (padded to 16)
     var ev[16];
     store32(&ev, 1);
+    # data @4 (x86 packed) / @8 (aarch64 unpacked) — see _async_wait_events. This helper
+    # never reads data back, but keep the offset consistent with the reactor. (v6.4.42)
+    #ifdef CYRIUS_ARCH_AARCH64
+    store64(&ev + 8, fd);
+    #endif
+    #ifndef CYRIUS_ARCH_AARCH64
     store64(&ev + 4, fd);
+    #endif
     syscall(SYS_EPOLL_CTL, epfd, 1, fd, &ev);
     var revents[16];
     sys_epoll_wait(epfd, &revents, 1, 0 - 1);
@@ -744,7 +818,12 @@ fn async_timeout(fp, arg, ms): i64 {
     var epfd = syscall(SYS_EPOLL_CREATE1, 0);
     var ev[16];
     store32(&ev, 1);
+    #ifdef CYRIUS_ARCH_AARCH64
+    store64(&ev + 8, rfd);        # epoll_data @8 on aarch64 (unpacked); @4 on x86 (v6.4.42)
+    #endif
+    #ifndef CYRIUS_ARCH_AARCH64
     store64(&ev + 4, rfd);
+    #endif
     syscall(SYS_EPOLL_CTL, epfd, 1, rfd, &ev);
     var revents[16];
     var nr = sys_epoll_wait(epfd, &revents, 1, ms);
@@ -764,6 +843,7 @@ fn async_timeout(fp, arg, ms): i64 {
     return 0 - 1;
 }
 
+#endif
 #endif
 
 # ================================================================
@@ -813,6 +893,59 @@ fn cancel_token_signal(tok): i64 {
 fn cancel_token_check(tok): i64 {
     if (tok == 0) { return 0; }
     return atomic_load(tok);
+}
+
+# ================================================================
+# Async RwLock (v6.4.41) — SHARED across all targets (plain state ops, no epoll). A
+# cooperative reader/writer lock for state a single-threaded reactor holds across an
+# await. Tasks are atomic between yields, so a lock is only needed ACROSS a yield — the
+# TRY-acquire family is what the cooperative model needs. A blocking await-until-free
+# acquire needs mid-body suspend (the execution-model follow-on) and is not provided
+# here. Layout: { writer_held (0/1), reader_count } = 16 bytes. For cross-THREAD sharing
+# use lib/thread.cyr's preemptive mutex; this is the reactor-cooperative lock.
+# ================================================================
+
+# Create a fresh async RwLock (unlocked). Returns a lock handle, or 0 on OOM.
+fn async_rwlock_new(): i64 {
+    var lk = alloc(16);
+    if (lk == 0) { return 0; }
+    store64(lk, 0);          # writer_held
+    store64(lk + 8, 0);      # reader_count
+    return lk;
+}
+
+# Try to take a shared (read) lock: returns 1 and bumps the reader count if no writer
+# holds it, else 0 (no wait). Pair with async_read_unlock.
+fn async_try_read_lock(lk): i64 {
+    if (lk == 0) { return 0; }
+    if (load64(lk) != 0) { return 0; }          # a writer holds it
+    store64(lk + 8, load64(lk + 8) + 1);
+    return 1;
+}
+
+# Release a shared (read) lock.
+fn async_read_unlock(lk): i64 {
+    if (lk == 0) { return 0; }
+    var rc = load64(lk + 8);
+    if (rc > 0) { store64(lk + 8, rc - 1); }
+    return 0;
+}
+
+# Try to take an exclusive (write) lock: returns 1 and marks it held if no writer AND no
+# readers hold it, else 0 (no wait). Pair with async_write_unlock.
+fn async_try_write_lock(lk): i64 {
+    if (lk == 0) { return 0; }
+    if (load64(lk) != 0) { return 0; }          # a writer holds it
+    if (load64(lk + 8) != 0) { return 0; }      # readers hold it
+    store64(lk, 1);
+    return 1;
+}
+
+# Release an exclusive (write) lock.
+fn async_write_unlock(lk): i64 {
+    if (lk == 0) { return 0; }
+    store64(lk, 0);
+    return 0;
 }
 
 # ================================================================

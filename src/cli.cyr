@@ -12,7 +12,7 @@
 # command refuses to run, mirroring the CLAUDE.md "no silent destructive
 # operations" rule.
 
-var AGNOVA_VERSION = "0.5.0";
+var AGNOVA_VERSION = "0.6.0";
 var DEFAULT_TARGET_ROOT = "/mnt";
 
 # Indices for our flag set — populated by _build_flags(), used by the
@@ -193,7 +193,7 @@ fn _print_version() {
     println(AGNOVA_VERSION);
     # Toolchain this binary was built against — keep in sync with the
     # `cyrius = "..."` pin in cyrius.cyml (update on every toolchain migration).
-    println("cyrius 6.4.39");
+    println("cyrius 6.4.43");
     return 0;
 }
 

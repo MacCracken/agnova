@@ -92,6 +92,7 @@ enum SysNrAgnos {
     SYS_BLK_WRITE  = 78;          # blk_write(h, lba, buf, nsec) → nsec / -1 — GATED (arm via blk_open magic)
     SYS_BLK_INFO   = 79;          # blk_info(h, out) → 0 / -1
     SYS_BLK_CLOSE  = 80;          # blk_close(h) → 0 / -1
+    SYS_READDIR    = 81;          # readdir(path, buf, max) → count / <0 (agnos #81; fchdir on Linux)
 }
 
 # ================================================================
@@ -528,6 +529,15 @@ fn sys_blk_write(h, lba, buf, nsec): i64 { return syscall(SYS_BLK_WRITE, h, lba,
 fn sys_blk_info(h, out): i64             { return syscall(SYS_BLK_INFO, h, out); }
 # blk_close(h) — release the handle → 0 / -1.
 fn sys_blk_close(h): i64                 { return syscall(SYS_BLK_CLOSE, h); }
+
+# ---- agnos ring-3 directory listing (#81, agnos 1.53.13; kernel `ext2_readdir_sys`). Gives
+# crab / a future `ls` / agnsh a named entry point instead of the raw number. agnos-kernel-only —
+# on Linux x86_64 #81 is `fchdir`, so this band lives only in the agnos syscall stdlib (included
+# under #ifdef CYRIUS_TARGET_AGNOS). (issue 2026-07-10-agnos-sys-readdir-wrapper.)
+# readdir(path, buf, max) — list `path` into `buf` as `max` fixed 64-byte records (name NUL-term
+# at +0, type at +63: 1=dir/0=file; `.`/`..` omitted) → entry count (>=0), or <0 (-1 bad ptr/not
+# ext2, -2 not found, -4 not a dir).
+fn sys_readdir(path, buf, max): i64      { return syscall(SYS_READDIR, path, buf, max); }
 
 # ---- agnos HDA audio band (#64-69) — the ring-3 half of the agnos 1.52.x Gate-2
 # freeze (kernel handlers land in parallel). Single frozen format: 48000 Hz / S16 /

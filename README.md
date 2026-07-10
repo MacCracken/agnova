@@ -8,8 +8,8 @@ The installer is **plan-first**: every action is materialized as a `SystemOp` de
 
 - **Type**: Binary (Cyrius)
 - **License**: GPL-3.0-only
-- **Toolchain**: Cyrius 6.4.39
-- **Version**: 0.5.0
+- **Toolchain**: Cyrius 6.4.43
+- **Version**: 0.6.0
 
 ## Build
 
