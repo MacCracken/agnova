@@ -651,3 +651,191 @@ fn df_format_ext2(part_abs, part_sectors) {
     df_ext2_free_inodes = free_inodes;
     return 0;
 }
+
+# Persist the running free-block / free-inode counters to the SB (block 0) + BGDT (block 1).
+fn df_ext2_persist_counts() {
+    df_ext2_rd_block(0, &df_ext2_blk);
+    store32(&df_ext2_blk + 1024 + 0x0C, df_ext2_free_blocks);   # s_free_blocks_count
+    store32(&df_ext2_blk + 1024 + 0x10, df_ext2_free_inodes);   # s_free_inodes_count
+    if (df_ext2_wr_block(0, &df_ext2_blk) != 8) { return 0 - 1; }
+    df_ext2_rd_block(1, &df_ext2_blk);
+    store16(&df_ext2_blk + 0x0C, df_ext2_free_blocks & 0xFFFF); # bg_free_blocks_count
+    store16(&df_ext2_blk + 0x0E, df_ext2_free_inodes & 0xFFFF); # bg_free_inodes_count
+    if (df_ext2_wr_block(1, &df_ext2_blk) != 8) { return 0 - 1; }
+    return 0;
+}
+
+# Link a dirent {child_ino, name, ftype} into directory `parent_ino` by the slack-split rule:
+# shrink the last entry to its minimal rec_len, append the new entry spanning to the block end.
+# Uses df_ext2_ind as dir-block scratch (free during the direct-file path). Returns 0 / -1.
+fn df_ext2_link_dirent(parent_ino, child_ino, name_ptr, name_len, ftype) {
+    var pblk = df_ext2_itable + (parent_ino - 1) / 32;
+    var poff = ((parent_ino - 1) - ((parent_ino - 1) / 32) * 32) * 128;
+    df_ext2_rd_block(pblk, &df_ext2_blk);
+    var dir_block = load32(&df_ext2_blk + poff + 0x28);   # parent i_block[0]
+
+    df_ext2_rd_block(dir_block, &df_ext2_ind);
+    # walk to the last entry (its rec_len runs to the block end).
+    var off = 0;
+    var done = 0;
+    while (done == 0) {
+        var rl = load16(&df_ext2_ind + off + 4);
+        if ((off + rl) >= 4096) { done = 1; }
+        else { off = off + rl; }
+    }
+    var last_nl = load8(&df_ext2_ind + off + 6) & 0xFF;
+    var min_rl = ((8 + last_nl + 3) / 4) * 4;              # round up to 4
+    var new_off = off + min_rl;
+    var new_rl = 4096 - new_off;
+    if (new_rl < (8 + name_len)) { return 0 - 1; }         # no room (dir-grow not in this cut)
+    store16(&df_ext2_ind + off + 4, min_rl);
+    store32(&df_ext2_ind + new_off + 0, child_ino);
+    store16(&df_ext2_ind + new_off + 4, new_rl);
+    store8(&df_ext2_ind + new_off + 6, name_len);
+    store8(&df_ext2_ind + new_off + 7, ftype);
+    var ni = 0;
+    while (ni < name_len) {
+        store8(&df_ext2_ind + new_off + 8 + ni, load8(name_ptr + ni) & 0xFF);
+        ni = ni + 1;
+    }
+    if (df_ext2_wr_block(dir_block, &df_ext2_ind) != 8) { return 0 - 1; }
+    return 0;
+}
+
+# Write a regular file `name` (name_len bytes) from the open src_fd into directory `parent_ino`.
+# Direct blocks (<=12) + SINGLE indirect (up to ~4 MiB); double/triple indirect not in this cut.
+# Returns 0 / -1.
+fn df_ext2_add_file(parent_ino, name_ptr, name_len, src_fd) {
+    var size = syscall(SYS_LSEEK, src_fd, 0, 2);           # SEEK_END -> size
+    syscall(SYS_LSEEK, src_fd, 0, 0);                      # rewind
+    var nblocks = (size + 4095) / 4096;
+    var need_ind = 0;
+    if (nblocks > 12) { need_ind = 1; }
+    if (nblocks > (12 + 1024)) { return 0 - 1; }           # single-indirect cap (~4 MiB)
+    var totblocks = nblocks + need_ind;                     # +1 for the indirect block
+
+    var ino = df_ext2_next_ino;
+    df_ext2_next_ino = ino + 1;
+    var first_block = df_ext2_next_block;
+    df_ext2_next_block = first_block + totblocks;
+    var ind_block = first_block + nblocks;                  # indirect block sits after the data
+
+    # mark the inode bit + every allocated block bit (data + indirect).
+    df_ext2_rd_block(3, &df_ext2_blk);
+    df_bit_set(&df_ext2_blk, ino - 1);
+    if (df_ext2_wr_block(3, &df_ext2_blk) != 8) { return 0 - 1; }
+    df_ext2_rd_block(2, &df_ext2_blk);
+    var bi = 0;
+    while (bi < totblocks) { df_bit_set(&df_ext2_blk, first_block + bi); bi = bi + 1; }
+    if (df_ext2_wr_block(2, &df_ext2_blk) != 8) { return 0 - 1; }
+    df_ext2_free_inodes = df_ext2_free_inodes - 1;
+    df_ext2_free_blocks = df_ext2_free_blocks - totblocks;
+
+    # stream the body into the (contiguous) data blocks, 4 blocks (16 KiB) per write.
+    var wi = 0;
+    var total = 0;
+    while (wi < nblocks) {
+        var chunk = nblocks - wi;
+        if (chunk > 4) { chunk = 4; }
+        df_zero(&df_batch, 16384);
+        total = total + df_read_fill(src_fd, &df_batch, chunk * 4096);
+        if (df_write(df_ext2_abs + (first_block + wi) * 8, &df_batch, chunk * 8) != (chunk * 8)) { return 0 - 1; }
+        wi = wi + chunk;
+    }
+    if (total != size) { return 0 - 1; }
+
+    # single-indirect block: u32 LE pointers for logical blocks 12..nblocks-1.
+    if (need_ind == 1) {
+        df_zero(&df_ext2_ind, 4096);
+        var li = 12;
+        while (li < nblocks) {
+            store32(&df_ext2_ind + (li - 12) * 4, first_block + li);
+            li = li + 1;
+        }
+        if (df_ext2_wr_block(ind_block, &df_ext2_ind) != 8) { return 0 - 1; }
+    }
+
+    # write the file inode (RMW its inode-table block; zero the 128-B slot first).
+    var itblk = df_ext2_itable + (ino - 1) / 32;
+    var ioff = ((ino - 1) - ((ino - 1) / 32) * 32) * 128;
+    df_ext2_rd_block(itblk, &df_ext2_blk);
+    var fi = &df_ext2_blk + ioff;
+    df_zero(fi, 128);
+    store16(fi + 0x00, 0x81A4);                           # regular file, 0644
+    store32(fi + 0x04, size);                             # i_size
+    store32(fi + 0x08, DF_EXT2_EPOCH);
+    store32(fi + 0x0C, DF_EXT2_EPOCH);
+    store32(fi + 0x10, DF_EXT2_EPOCH);
+    store16(fi + 0x1A, 1);                                # i_links_count
+    store32(fi + 0x1C, totblocks * 8);                    # i_blocks (512-B units incl. indirect)
+    var ndirect = nblocks;
+    if (ndirect > 12) { ndirect = 12; }
+    var di = 0;
+    while (di < ndirect) { store32(fi + 0x28 + di * 4, first_block + di); di = di + 1; }
+    if (need_ind == 1) { store32(fi + 0x28 + 12 * 4, ind_block); }   # i_block[12] = indirect
+    if (df_ext2_wr_block(itblk, &df_ext2_blk) != 8) { return 0 - 1; }
+
+    if (df_ext2_link_dirent(parent_ino, ino, name_ptr, name_len, 1) != 0) { return 0 - 1; }
+    return df_ext2_persist_counts();
+}
+
+# Create a subdirectory `name` under directory `parent_ino`. Returns the new inode number, or -1.
+fn df_ext2_mkdir(parent_ino, name_ptr, name_len) {
+    var ino = df_ext2_next_ino;
+    df_ext2_next_ino = ino + 1;
+    var dblock = df_ext2_next_block;
+    df_ext2_next_block = dblock + 1;
+
+    df_ext2_rd_block(3, &df_ext2_blk);
+    df_bit_set(&df_ext2_blk, ino - 1);
+    if (df_ext2_wr_block(3, &df_ext2_blk) != 8) { return 0 - 1; }
+    df_ext2_rd_block(2, &df_ext2_blk);
+    df_bit_set(&df_ext2_blk, dblock);
+    if (df_ext2_wr_block(2, &df_ext2_blk) != 8) { return 0 - 1; }
+    df_ext2_free_inodes = df_ext2_free_inodes - 1;
+    df_ext2_free_blocks = df_ext2_free_blocks - 1;
+
+    # the new dir's data block: '.' -> self, '..' -> parent.
+    df_zero(&df_ext2_blk, 4096);
+    store32(&df_ext2_blk + 0, ino); store16(&df_ext2_blk + 4, 12);
+    store8(&df_ext2_blk + 6, 1); store8(&df_ext2_blk + 7, 2); store8(&df_ext2_blk + 8, 0x2E);
+    store32(&df_ext2_blk + 12, parent_ino); store16(&df_ext2_blk + 16, 4084);
+    store8(&df_ext2_blk + 18, 2); store8(&df_ext2_blk + 19, 2);
+    store8(&df_ext2_blk + 20, 0x2E); store8(&df_ext2_blk + 21, 0x2E);
+    if (df_ext2_wr_block(dblock, &df_ext2_blk) != 8) { return 0 - 1; }
+
+    # the new dir inode (mode 0755 dir, links_count 2 for '.' and its own '..').
+    var itblk = df_ext2_itable + (ino - 1) / 32;
+    var ioff = ((ino - 1) - ((ino - 1) / 32) * 32) * 128;
+    df_ext2_rd_block(itblk, &df_ext2_blk);
+    var fi = &df_ext2_blk + ioff;
+    df_zero(fi, 128);
+    store16(fi + 0x00, 0x41ED);
+    store32(fi + 0x04, 4096);
+    store32(fi + 0x08, DF_EXT2_EPOCH);
+    store32(fi + 0x0C, DF_EXT2_EPOCH);
+    store32(fi + 0x10, DF_EXT2_EPOCH);
+    store16(fi + 0x1A, 2);
+    store32(fi + 0x1C, 8);
+    store32(fi + 0x28, dblock);
+    if (df_ext2_wr_block(itblk, &df_ext2_blk) != 8) { return 0 - 1; }
+
+    if (df_ext2_link_dirent(parent_ino, ino, name_ptr, name_len, 2) != 0) { return 0 - 1; }
+
+    # parent links_count +1 (the new dir's '..' points back at the parent).
+    var pblk = df_ext2_itable + (parent_ino - 1) / 32;
+    var poff = ((parent_ino - 1) - ((parent_ino - 1) / 32) * 32) * 128;
+    df_ext2_rd_block(pblk, &df_ext2_blk);
+    var plinks = load16(&df_ext2_blk + poff + 0x1A) & 0xFFFF;
+    store16(&df_ext2_blk + poff + 0x1A, plinks + 1);
+    if (df_ext2_wr_block(pblk, &df_ext2_blk) != 8) { return 0 - 1; }
+
+    # bg_used_dirs_count +1.
+    df_ext2_rd_block(1, &df_ext2_blk);
+    var ud = load16(&df_ext2_blk + 0x10) & 0xFFFF;
+    store16(&df_ext2_blk + 0x10, ud + 1);
+    if (df_ext2_wr_block(1, &df_ext2_blk) != 8) { return 0 - 1; }
+
+    if (df_ext2_persist_counts() != 0) { return 0 - 1; }
+    return ino;
+}

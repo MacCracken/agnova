@@ -1,8 +1,9 @@
 # ext2fmt_proof.cyr — standalone Linux (NATIVE_FILE) driver that writes a sovereign ext2 into
-# a raw image via diskfmt's df_format_ext2, so e2fsck / dumpe2fs / debugfs can validate it.
+# a raw image via diskfmt (df_format_ext2 + df_ext2_add_file), so e2fsck / dumpe2fs / debugfs
+# can validate it.
 #
 # Build: cyrius build tests/ext2fmt_proof.cyr build/ext2fmt_proof
-# Run:   ./build/ext2fmt_proof            (formats /tmp/agnova-ext2-proof.img, 137216 sectors = 67 MiB)
+# Run:   ./build/ext2fmt_proof   (formats /tmp/agnova-ext2-proof.img 67 MiB + adds /hello.txt)
 #
 # SPDX-License-Identifier: GPL-3.0-only
 
@@ -11,10 +12,30 @@ include "src/diskfmt.cyr"
 fn main() {
     var path = "/tmp/agnova-ext2-proof.img";
     if (df_open_target(path) != 0) { return 1; }
-    df_set_geometry(0, 0);                 # scratch_base=0; part size is passed to df_format_ext2
-    var rc = df_format_ext2(0, 137216);    # part_abs=0 (image IS the fs), 67 MiB
+    df_set_geometry(0, 0);                              # scratch_base=0; image IS the fs
+    if (df_format_ext2(0, 137216) != 0) { df_close_target(); return 2; }
+
+    # populate: /hello.txt in the root
+    var sfd = df_open_src("/tmp/agnova-ext2-hello.txt");
+    if (sfd < 0) { df_close_target(); return 3; }
+    if (df_ext2_add_file(2, "hello.txt", 9, sfd) != 0) { df_close_src(sfd); df_close_target(); return 4; }
+    df_close_src(sfd);
+
+    # mkdir /bin, then a file inside it (nested dirent)
+    var binino = df_ext2_mkdir(2, "bin", 3);
+    if (binino < 0) { df_close_target(); return 5; }
+    var s2 = df_open_src("/tmp/agnova-ext2-hello.txt");
+    if (s2 < 0) { df_close_target(); return 6; }
+    if (df_ext2_add_file(binino, "greet", 5, s2) != 0) { df_close_src(s2); df_close_target(); return 7; }
+    df_close_src(s2);
+
+    # a >48 KiB file into /bin -> exercises the single-indirect block
+    var s3 = df_open_src("/tmp/agnova-ext2-big.bin");
+    if (s3 < 0) { df_close_target(); return 8; }
+    if (df_ext2_add_file(binino, "bigfile", 7, s3) != 0) { df_close_src(s3); df_close_target(); return 9; }
+    df_close_src(s3);
+
     df_close_target();
-    if (rc != 0) { return 2; }
     return 0;
 }
 
