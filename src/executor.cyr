@@ -229,14 +229,14 @@ fn _exec_unmount(p) {
 fn execute_op(op) {
     var t = tag(op);
     var p = payload(op);
-#ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_AGNOS
     if (t == OP_COMMAND) { return _exec_command(p); }
     if (t == OP_WRITE_FILE) { return _exec_write_file(p); }
     if (t == OP_MAKE_DIR) { return _exec_make_dir(p); }
     if (t == OP_SYMLINK) { return _exec_symlink(p); }
     if (t == OP_MOUNT) { return _exec_mount(p); }
     if (t == OP_UNMOUNT) { return _exec_unmount(p); }
-#endif
+    #endif
     # Structured disk ops route to the native backend (Phase-5).
     if (t == OP_PARTITION_DISK) { return native_partition(op); }
     if (t == OP_FORMAT_FS) { return native_format(op); }

@@ -29,8 +29,8 @@ var DISK_BACKEND_NATIVE_BLOCK = 2;
 # Process-global selected backend (set by --disk-backend; default = shell).
 var disk_backend = 0;
 
-# Sentinel returned by the native handlers until they are implemented. Non-zero so
-# execute_phase treats it as a (fatal) op failure — a clean, no-crash "not yet native".
+# Sentinel returned by native_format for a filesystem the native path can't build — ext4/xfs/
+# btrfs go through the shell backend. Non-zero so execute_phase treats it as a clean op failure.
 var E_NOT_IMPL = 0 - 38;
 
 fn set_disk_backend(b) {
@@ -57,14 +57,14 @@ fn set_native_sources(gnoboot_cstr, kernel_cstr) {
 }
 
 # 8.3 short names for the two staged files, written into diskfmt's df_nm scratch.
-fn df_name_bootx64() {
-    store8(&df_nm + 0, 0x42); store8(&df_nm + 1, 0x4F); store8(&df_nm + 2, 0x4F); store8(&df_nm + 3, 0x54);  # "BOOTX64 EFI"
+fn df_name_bootx64() {                                       # "BOOTX64 EFI"
+    store8(&df_nm + 0, 0x42); store8(&df_nm + 1, 0x4F); store8(&df_nm + 2, 0x4F); store8(&df_nm + 3, 0x54);
     store8(&df_nm + 4, 0x58); store8(&df_nm + 5, 0x36); store8(&df_nm + 6, 0x34); store8(&df_nm + 7, 0x20);
     store8(&df_nm + 8, 0x45); store8(&df_nm + 9, 0x46); store8(&df_nm + 10, 0x49);
     return 0;
 }
-fn df_name_agnos() {
-    store8(&df_nm + 0, 0x41); store8(&df_nm + 1, 0x47); store8(&df_nm + 2, 0x4E); store8(&df_nm + 3, 0x4F);  # "AGNOS      "
+fn df_name_agnos() {                                         # "AGNOS      "
+    store8(&df_nm + 0, 0x41); store8(&df_nm + 1, 0x47); store8(&df_nm + 2, 0x4E); store8(&df_nm + 3, 0x4F);
     store8(&df_nm + 4, 0x53); store8(&df_nm + 5, 0x20); store8(&df_nm + 6, 0x20); store8(&df_nm + 7, 0x20);
     store8(&df_nm + 8, 0x20); store8(&df_nm + 9, 0x20); store8(&df_nm + 10, 0x20);
     return 0;
@@ -86,7 +86,7 @@ fn plan_native_disk_ops(cfg, target_root) {
     vec_push(pops, op_partition_disk(disk));
     vec_push(plans, phase_ops_new(PHASE_PARTITION_DISK, str_from("Partition disk (native GPT)"), pops));
 
-    # PHASE_FORMAT_FILESYSTEMS — FAT32 the ESP (partition 0) only; ext4 root is deferred.
+    # PHASE_FORMAT_FILESYSTEMS — FAT32 the ESP (partition 0) only; ext4 root uses the shell backend.
     var fops = vec_new();
     vec_push(fops, op_format_fs(0, vec_get(parts, 0), dev));
     vec_push(plans, phase_ops_new(PHASE_FORMAT_FILESYSTEMS, str_from("Format ESP (native FAT32)"), fops));
@@ -118,7 +118,8 @@ fn native_partition(op) {
     # Disk size for the layout: --disk-sectors override, else the real device capacity.
     var n = df_effective_sectors();
     if (n < 4096) { df_close_target(); return 0 - 1; }
-    if ((df_scratch_base + n) > df_target_sectors()) { df_close_target(); return 0 - 1; }  # scratch image must fit the disk
+    # the scratch image must fit within the real disk
+    if ((df_scratch_base + n) > df_target_sectors()) { df_close_target(); return 0 - 1; }
 
     # Geometry: ESP at 1 MiB, sized from partition 0; root fills to the last usable LBA.
     var esp_spec = vec_get(parts, 0);
@@ -130,9 +131,11 @@ fn native_partition(op) {
 
     df_gpt_zero_entries();
     var esp_name = str_from("ESP");
-    df_gpt_set_entry(0, esp_s, esp_e, DF_TYPE_ESP_LO, DF_TYPE_ESP_HI, 0x4553501D2A7328C1, 0x00A0C93EC93BBA4B, str_cstr(esp_name), 3);
+    df_gpt_set_entry(0, esp_s, esp_e, DF_TYPE_ESP_LO, DF_TYPE_ESP_HI,
+    0x4553501D2A7328C1, 0x00A0C93EC93BBA4B, str_cstr(esp_name), 3);
     var root_name = str_from("agnos-root");
-    df_gpt_set_entry(1, rf_s, rf_e, DF_TYPE_LINUX_FS_LO, DF_TYPE_LINUX_FS_HI, 0x524F4F540FC63DAF, 0x3D69D8477DE48E79, str_cstr(root_name), 10);
+    df_gpt_set_entry(1, rf_s, rf_e, DF_TYPE_LINUX_FS_LO, DF_TYPE_LINUX_FS_HI,
+    0x524F4F540FC63DAF, 0x3D69D8477DE48E79, str_cstr(root_name), 10);
     df_build_mbr(n);
     df_build_gpt(n);
     var rc = df_write_gpt(n);
@@ -140,7 +143,7 @@ fn native_partition(op) {
     return rc;
 }
 
-# OP_FORMAT_FS: format partition `part_index` as FAT32 (ESP only; ext4/xfs/btrfs deferred).
+# OP_FORMAT_FS: format partition `part_index` as FAT32 (ESP only; ext4/xfs/btrfs via the shell path).
 # Locates the partition's LBA range by reading the just-written GPT entry array (stateless).
 fn native_format(op) {
     var pi = SystemOp_FormatFs_part_index(payload(op));

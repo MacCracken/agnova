@@ -38,9 +38,16 @@ jobs:
       - name: Lint
         run: |
           set -e
+          rc=0
           for f in src/*.cyr; do
-            cyrius lint "$f"
+            out=$(cyrius lint "$f")
+            printf '%s\n' "$out"
+            if printf '%s\n' "$out" | grep -qE '^[[:space:]]*(warn|deferral) line '; then
+              echo "::error file=$f::cyrlint reported warnings or untracked deferrals"
+              rc=1
+            fi
           done
+          exit $rc
 
       - name: Format check
         run: |

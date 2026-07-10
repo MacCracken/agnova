@@ -70,8 +70,6 @@ fn df_read(lba, buf, nsec) {
     if (sys_read(df_fd, buf, nsec * 512) == (nsec * 512)) { return nsec; }
     return 0 - 1;
 }
-# Source file (the payload being staged) — Linux sys_open(path, flags, mode); O_RDONLY = 0.
-fn df_open_src(path_cstr) { return sys_open(path_cstr, 0, 0); }
 #endif
 
 #ifdef CYRIUS_TARGET_AGNOS
@@ -91,10 +89,11 @@ fn df_close_target() { sys_blk_close(df_h); return 0; }
 fn df_target_sectors() { sys_blk_info(df_h, &df_binfo); return load64(&df_binfo); }   # capacity_lbas
 fn df_write(lba, buf, nsec) { return sys_blk_write(df_h, lba + df_scratch_base, buf, nsec); }
 fn df_read(lba, buf, nsec)  { return sys_blk_read(df_h, lba + df_scratch_base, buf, nsec); }
-# Source file — agnos sys_open(name, namelen, flags); flags 0 = read.
-fn df_open_src(path_cstr) { return sys_open(path_cstr, strlen(path_cstr), 0); }
 #endif
 
+# Source file (the staged payload), read-only. io.cyr's xopen is target-portable — it handles
+# the agnos length-carrying sys_open ABI internally; flags 0 = O_RDONLY.
+fn df_open_src(path_cstr) { return xopen(path_cstr, 0); }
 fn df_close_src(fd) { return sys_close(fd); }
 
 # Disk size (sectors) used for the layout: the --disk-sectors override, else the real capacity.

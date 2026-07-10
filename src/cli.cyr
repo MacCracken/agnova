@@ -53,11 +53,11 @@ fn _build_flags() {
     FLAG_IMEANIT    = flags_add_bool(h,   0, "i-mean-it",   0,        "required to actually execute (DESTRUCTIVE)");
     FLAG_UNTIL      = flags_add_str(h,    0, "until",       0,        "execute: stop after this phase (e.g. mount)");
     FLAG_HELP       = flags_add_bool(h,   0, "help",        0,        "print this help");
-    FLAG_DISK_BACKEND = flags_add_str(h,  0, "disk-backend", "shell", "shell|native-file|native-block (native = sovereign sector I/O, no shell-out)");
-    FLAG_GNOBOOT_SRC  = flags_add_str(h,  0, "gnoboot-src",  0,       "native: source path for BOOTX64.EFI staged into the ESP");
-    FLAG_KERNEL_SRC   = flags_add_str(h,  0, "kernel-src",   0,       "native: source path for the kernel staged into the ESP");
-    FLAG_SCRATCH_BASE = flags_add_str(h,  0, "scratch-base", "0",     "native: LBA offset to write the image at (imaging/QEMU proof; 0 = whole disk)");
-    FLAG_DISK_SECTORS = flags_add_str(h,  0, "disk-sectors", "0",     "native: override disk size in 512-B sectors for the layout (0 = real capacity)");
+    FLAG_DISK_BACKEND = flags_add_str(h,  0, "disk-backend", "shell", "shell|native-file|native-block");
+    FLAG_GNOBOOT_SRC  = flags_add_str(h,  0, "gnoboot-src",  0,       "native: BOOTX64.EFI source path");
+    FLAG_KERNEL_SRC   = flags_add_str(h,  0, "kernel-src",   0,       "native: kernel source path");
+    FLAG_SCRATCH_BASE = flags_add_str(h,  0, "scratch-base", "0",     "native: image LBA offset (0=whole disk)");
+    FLAG_DISK_SECTORS = flags_add_str(h,  0, "disk-sectors", "0",     "native: disk-size override, sectors (0=real)");
     return h;
 }
 
