@@ -4,7 +4,7 @@
 #
 # Replaces the 60+ ad-hoc `streq("--foo", argv(i))` loops that
 # every toolchain binary (cyrius, ark, cyrld, cyrfmt, cyrlint,
-# cyrdoc, cyrc) and every consumer project ships today on top
+# cyrdoc, cybs) and every consumer project ships today on top
 # of `lib/args.cyr`'s bare argc/argv surface.
 #
 # Typical use:
@@ -155,12 +155,12 @@ fn flags_get_bool(h, idx): i64 { return load64(_flags_entry(h, idx) + 24); }
 # Read the int flag at `idx`. Returns the parsed value or the
 # registered default. Caller must have registered idx via
 # flags_add_int.
-fn flags_get_int(h, idx)  { return load64(_flags_entry(h, idx) + 24); }
+fn flags_get_int(h, idx): i64 { return load64(_flags_entry(h, idx) + 24); }
 
 # Read the str flag at `idx`. Returns a cstr ptr — either the
 # parsed argv token or the registered default. Caller must have
 # registered idx via flags_add_str.
-fn flags_get_str(h, idx)  { return load64(_flags_entry(h, idx) + 24); }
+fn flags_get_str(h, idx): i64 { return load64(_flags_entry(h, idx) + 24); }
 
 # Number of positional (non-flag) args captured during parse.
 # Includes everything after a `--` terminator.

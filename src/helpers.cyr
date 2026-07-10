@@ -169,6 +169,8 @@ fn default_kernel_params(security) {
 # no kernel flag — e.g. "rw"/"defaults"/"suid"/"dev"/"exec", or a
 # filesystem-specific data option). Only options with a defined MS_*
 # constant in the vendored syscall table are recognised.
+# Linux-only: the MS_* flags don't exist on agnos (no sys_mount) — compiled out there.
+#ifndef CYRIUS_TARGET_AGNOS
 fn _mount_flag_for_token(tok) {
     if (str_eq_cstr(tok, "ro") == 1) { return MS_RDONLY; }
     if (str_eq_cstr(tok, "nosuid") == 1) { return MS_NOSUID; }
@@ -220,3 +222,4 @@ fn mount_flags_from_options(options) {
     }
     return flags;
 }
+#endif

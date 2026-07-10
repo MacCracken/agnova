@@ -7,6 +7,14 @@
 # their invocation behind --i-mean-it. Tests should NEVER call
 # execute_op() — they validate plan output via the planner only.
 
+# The shell-out execution primitives below are Linux-hosted-only: they use fork/execve/dup2/
+# pipe/waitpid, the O_*/MS_* flag enums, and sys_mount/umount2/mkdir/chmod/access — none of
+# which exist on the agnos syscall arm. On a CYRIUS_TARGET_AGNOS build they are compiled OUT
+# entirely (execute_op then routes only the structured native disk ops). The Linux build is
+# unchanged. Undefined *variables* (O_*/MS_*) fault compile even when unreachable, so the whole
+# block must be gated, not just the execute_op branches.
+#ifndef CYRIUS_TARGET_AGNOS
+
 # ---- Helper: convert vec<Str> args into a null-terminated argv of cstrs ----
 
 fn _build_argv(args) {
@@ -214,18 +222,22 @@ fn _exec_unmount(p) {
     return sys_umount2(str_cstr(SystemOp_Unmount_mount_point(p)), 0);
 }
 
-# Top-level dispatch on op tag.
+#endif
+
+# Top-level dispatch on op tag. The shell/file/mount ops exist only on the Linux build; on
+# agnos only the structured native disk ops are dispatched (the rest are compiled out above).
 fn execute_op(op) {
     var t = tag(op);
     var p = payload(op);
+#ifndef CYRIUS_TARGET_AGNOS
     if (t == OP_COMMAND) { return _exec_command(p); }
     if (t == OP_WRITE_FILE) { return _exec_write_file(p); }
     if (t == OP_MAKE_DIR) { return _exec_make_dir(p); }
     if (t == OP_SYMLINK) { return _exec_symlink(p); }
     if (t == OP_MOUNT) { return _exec_mount(p); }
     if (t == OP_UNMOUNT) { return _exec_unmount(p); }
-    # Structured disk ops route to the native backend (Phase-5). The shell path
-    # never emits these, so on a default (shell) run these branches are inert.
+#endif
+    # Structured disk ops route to the native backend (Phase-5).
     if (t == OP_PARTITION_DISK) { return native_partition(op); }
     if (t == OP_FORMAT_FS) { return native_format(op); }
     if (t == OP_STAGE_FILE) { return native_stage(op); }

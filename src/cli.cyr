@@ -34,6 +34,8 @@ var FLAG_HELP = 0;
 var FLAG_DISK_BACKEND = 0;
 var FLAG_GNOBOOT_SRC = 0;
 var FLAG_KERNEL_SRC = 0;
+var FLAG_SCRATCH_BASE = 0;
+var FLAG_DISK_SECTORS = 0;
 
 fn _build_flags() {
     var h = flags_new();
@@ -54,6 +56,8 @@ fn _build_flags() {
     FLAG_DISK_BACKEND = flags_add_str(h,  0, "disk-backend", "shell", "shell|native-file|native-block (native = sovereign sector I/O, no shell-out)");
     FLAG_GNOBOOT_SRC  = flags_add_str(h,  0, "gnoboot-src",  0,       "native: source path for BOOTX64.EFI staged into the ESP");
     FLAG_KERNEL_SRC   = flags_add_str(h,  0, "kernel-src",   0,       "native: source path for the kernel staged into the ESP");
+    FLAG_SCRATCH_BASE = flags_add_str(h,  0, "scratch-base", "0",     "native: LBA offset to write the image at (imaging/QEMU proof; 0 = whole disk)");
+    FLAG_DISK_SECTORS = flags_add_str(h,  0, "disk-sectors", "0",     "native: override disk size in 512-B sectors for the layout (0 = real capacity)");
     return h;
 }
 
@@ -547,6 +551,7 @@ fn cli_main() {
     # Select the disk backend for this run (default shell = unchanged behavior).
     set_disk_backend(_parse_disk_backend(flags_get_str(h, FLAG_DISK_BACKEND)));
     set_native_sources(flags_get_str(h, FLAG_GNOBOOT_SRC), flags_get_str(h, FLAG_KERNEL_SRC));
+    df_set_geometry(atoi(flags_get_str(h, FLAG_SCRATCH_BASE)), atoi(flags_get_str(h, FLAG_DISK_SECTORS)));
 
     var pcount = flags_positional_count(h);
     if (pcount == 0) {

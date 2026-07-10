@@ -22,5 +22,13 @@ fn main() {
     return cli_main();
 }
 
-var r = main();
-syscall(SYS_EXIT, r);
+# Bare top-level _entry() call (NOT `var r = main()`): on agnos a module-scope `var r = main()`
+# runs during gvar-init, BEFORE cycc captures the init-rsp, so argc()/argv() read 0/null. A bare
+# statement runs in PARSE_PROG after the capture. SYS_EXIT (not literal 60) is 0 on agnos / 60 on
+# Linux. Correct on both targets.
+fn _entry() {
+    var r = main();
+    syscall(SYS_EXIT, r);
+    return 0;
+}
+_entry();
