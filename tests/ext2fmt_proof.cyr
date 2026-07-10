@@ -1,9 +1,10 @@
 # ext2fmt_proof.cyr — standalone Linux (NATIVE_FILE) driver that writes a sovereign ext2 into
-# a raw image via diskfmt (df_format_ext2 + df_ext2_add_file), so e2fsck / dumpe2fs / debugfs
-# can validate it.
+# a raw image via diskfmt, so e2fsck / dumpe2fs / debugfs can validate it. Exercises the full
+# feature set: MULTI-BLOCK-GROUP geometry, lost+found, direct / single-indirect / double-indirect
+# files, and cross-group path staging. Driven by scripts/ext2-format-smoke.sh.
 #
 # Build: cyrius build tests/ext2fmt_proof.cyr build/ext2fmt_proof
-# Run:   ./build/ext2fmt_proof   (formats /tmp/agnova-ext2-proof.img 67 MiB + adds /hello.txt)
+# Run:   ./build/ext2fmt_proof   (formats a 512 MiB /tmp image = 4 block groups + populates it)
 #
 # SPDX-License-Identifier: GPL-3.0-only
 
@@ -13,9 +14,10 @@ fn main() {
     var path = "/tmp/agnova-ext2-proof.img";
     if (df_open_target(path) != 0) { return 1; }
     df_set_geometry(0, 0);                              # scratch_base=0; image IS the fs
-    if (df_format_ext2(0, 137216) != 0) { df_close_target(); return 2; }
+    # 512 MiB partition -> 4 block groups of 128 MiB each (exercises multi-group).
+    if (df_format_ext2(0, 1048576) != 0) { df_close_target(); return 2; }
 
-    # populate: /hello.txt in the root
+    # /hello.txt in the root (direct blocks)
     var sfd = df_open_src("/tmp/agnova-ext2-hello.txt");
     if (sfd < 0) { df_close_target(); return 3; }
     if (df_ext2_add_file(2, "hello.txt", 9, sfd) != 0) { df_close_src(sfd); df_close_target(); return 4; }
@@ -29,11 +31,23 @@ fn main() {
     if (df_ext2_add_file(binino, "greet", 5, s2) != 0) { df_close_src(s2); df_close_target(); return 7; }
     df_close_src(s2);
 
-    # a >48 KiB file into /bin -> exercises the single-indirect block
+    # ~1 MiB file into /bin -> single-indirect (i_block[12])
     var s3 = df_open_src("/tmp/agnova-ext2-big.bin");
     if (s3 < 0) { df_close_target(); return 8; }
     if (df_ext2_add_file(binino, "bigfile", 7, s3) != 0) { df_close_src(s3); df_close_target(); return 9; }
     df_close_src(s3);
+
+    # ~9 MiB file into /bin -> double-indirect (i_block[13], multiple inner indirect blocks)
+    var s4 = df_open_src("/tmp/agnova-ext2-huge.bin");
+    if (s4 < 0) { df_close_target(); return 10; }
+    if (df_ext2_add_file(binino, "huge", 4, s4) != 0) { df_close_src(s4); df_close_target(); return 11; }
+    df_close_src(s4);
+
+    # deep nested path via the path walker (auto-mkdir /usr, /usr/lib)
+    var s5 = df_open_src("/tmp/agnova-ext2-hello.txt");
+    if (s5 < 0) { df_close_target(); return 12; }
+    if (df_ext2_stage("/usr/lib/greet", s5) != 0) { df_close_src(s5); df_close_target(); return 13; }
+    df_close_src(s5);
 
     df_close_target();
     return 0;

@@ -508,29 +508,86 @@ fn df_stage_file(dir_buf, dir_rel_sec, dir_slot, name_ptr, src_fd) {
 }
 
 # ======================================================================================
-# Sovereign ext2 mkfs (the root-filesystem writer). Classic ext2, 4 KiB blocks, SINGLE block
-# group (first cut), 128-byte inodes, rev_level=1, FILETYPE-only feature. Byte layout derived
-# from + verified against the agnos kernel reader (kernel/core/ext2.cyr). All builders write
-# via df_write partition-relative (part_abs threaded like esp_abs; df_scratch_base is added
-# INSIDE df_write, never here). e2fsck-provable on Linux; flips to agnos NATIVE_BLOCK for free.
+# Sovereign ext2 mkfs (the root-filesystem writer). Classic ext2, 4 KiB blocks, 128-byte inodes,
+# rev_level=1, FILETYPE-only feature. MULTI-BLOCK-GROUP (roots of any size), files via direct +
+# single + double indirect (up to ~4.29 GiB — past the kernel reader's 2 GiB i_size cap, so
+# triple-indirect is a kernel-side item, not ours; see kernel/core/ext2.cyr:220), and a proper
+# lost+found. NO sparse_super, so a full superblock + GDT backup lives in EVERY group (e2fsck
+# verifies each). Byte layout derived from + verified against the agnos kernel reader
+# (kernel/core/ext2.cyr) and e2fsck/dumpe2fs. All builders write via df_write partition-relative
+# (df_ext2_abs); df_scratch_base is added INSIDE df_write. e2fsck-provable; agnos NATIVE_BLOCK free.
 # ======================================================================================
-var df_ext2_blk[512];   # 4096 B — general ext2 block builder (RE-ZERO before every build)
-var df_ext2_ind[512];   # 4096 B — single-indirect block (used once a file exceeds 12 blocks)
+var df_ext2_blk[512];    # 4096 B — inode-table / dir / SB / GDT builder
+var df_ext2_ind[512];    # 4096 B — single-indirect pointer block (also dir-scratch in lookup)
+var df_ext2_ind2[512];   # 4096 B — double-indirect pointer block
+var df_ext2_bmp[512];    # 4096 B — bitmap / GDT read-modify-write scratch (never aliases blk)
+var df_ext2_dat[512];    # 4096 B — per-data-block streaming buffer
+var df_ext2_direct[16];  # scratch: the file's 12 direct block numbers (u64 each)
 
-# ext2 staging state (separate from df_esp_* so the root arm survives the ESP path's reopen).
+# geometry (set by df_format_ext2)
 var df_ext2_abs = 0;         # partition first LBA (absolute)
-var df_ext2_bs = 4096;
 var df_ext2_bpg = 32768;     # blocks per group
-var df_ext2_ipg = 0;         # inodes per group (= inodes_count for a single group)
-var df_ext2_isize = 128;
-var df_ext2_itable = 4;      # first inode-table block
-var df_ext2_bbmp = 2;        # block-bitmap block
-var df_ext2_ibmp = 3;        # inode-bitmap block
-var df_ext2_next_ino = 11;
-var df_ext2_next_block = 0;  # next free data block cursor
+var df_ext2_ipg = 8192;      # inodes per group
+var df_ext2_B = 0;           # s_blocks_count
+var df_ext2_G = 0;           # group count
+var df_ext2_gd = 1;          # GDT blocks
+var df_ext2_itpg = 256;      # inode-table blocks per group (ipg/32)
+var df_ext2_metapg = 0;      # metadata blocks at the head of every group (SB+GDT+bbmp+ibmp+itable)
+var DF_EXT2_EPOCH = 1751500000;   # fixed mkfs timestamp
+
+# running allocation state
+var df_ext2_next_ino = 12;   # 1..10 reserved, 11 = lost+found, 12 = first user inode
+var df_ext2_next_block = 0;  # next candidate block (data-only; alloc skips metadata)
 var df_ext2_free_blocks = 0;
 var df_ext2_free_inodes = 0;
-var DF_EXT2_EPOCH = 1751500000;   # fixed mkfs timestamp
+
+# per-group counters persisted into the GDT. Bound: 512 groups = 64 GiB root (widen these to grow).
+var df_ext2_gfb[512];    # per-group free blocks
+var df_ext2_gfi[512];    # per-group free inodes
+var df_ext2_gud[512];    # per-group used dirs
+
+# inode-location outputs (set by df_ext2_iloc)
+var df_ext2_iloc_blk = 0;
+var df_ext2_iloc_off = 0;
+
+# path-resolve state (df_ext2_resolve outputs: parent inode + last-component name/len)
+var df_ext2_rp_parent = 0;
+var df_ext2_rp_base = 0;
+var df_ext2_rp_blen = 0;
+
+# input source for the file/tar writers: an fd (mode 0) OR an in-memory buffer (mode 1, for
+# extracting a decompressed .tar.gz without a temp file). df_ext2_src_read pulls from whichever.
+var df_ext2_src_mode = 0;
+var df_ext2_src_fd = 0;
+var df_ext2_src_buf = 0;
+var df_ext2_src_pos = 0;
+var df_ext2_src_len = 0;
+
+fn df_ext2_src_set_fd(fd) { df_ext2_src_mode = 0; df_ext2_src_fd = fd; return 0; }
+fn df_ext2_src_set_mem(buf, len) {
+    df_ext2_src_mode = 1; df_ext2_src_buf = buf; df_ext2_src_pos = 0; df_ext2_src_len = len;
+    return 0;
+}
+
+# Copy n bytes buf->dst (8-byte strides + byte tail).
+fn df_bcopy(dst, buf, n) {
+    var i = 0;
+    while (i + 8 <= n) { store64(dst + i, load64(buf + i)); i = i + 8; }
+    while (i < n) { store8(dst + i, load8(buf + i) & 0xFF); i = i + 1; }
+    return 0;
+}
+
+# Read up to `want` bytes from the current source into dst. Returns bytes read (0 at end).
+fn df_ext2_src_read(dst, want) {
+    if (df_ext2_src_mode == 0) { return df_read_fill(df_ext2_src_fd, dst, want); }
+    var avail = df_ext2_src_len - df_ext2_src_pos;
+    var n = want;
+    if (n > avail) { n = avail; }
+    if (n <= 0) { return 0; }
+    df_bcopy(dst, df_ext2_src_buf + df_ext2_src_pos, n);
+    df_ext2_src_pos = df_ext2_src_pos + n;
+    return n;
+}
 
 # One ext2 4 KiB block <-> 8 sectors, partition-relative (mirrors the kernel's block_to_lba).
 fn df_ext2_wr_block(bn, buf) { return df_write(df_ext2_abs + bn * 8, buf, 8); }
@@ -544,135 +601,296 @@ fn df_bit_set(buf, bit) {
     return 0;
 }
 
-# Format an empty single-group ext2 into partition [part_abs, +part_sectors). Geometry is
-# derived at runtime and CAPPED to one block group, so a fill-to-disk root is safe (a fs
-# smaller than its partition is legal ext2). Returns 0 / -1.
+# u64-slot array accessors (per-group counters live in module arrays, not arr[i] syntax).
+fn df_ext2_arr_get(base, g) { return load64(base + g * 8); }
+fn df_ext2_arr_set(base, g, v) { store64(base + g * 8, v); return 0; }
+fn df_ext2_arr_add(base, g, d) { store64(base + g * 8, load64(base + g * 8) + d); return 0; }
+
+# inode `ino` (1-based) -> its inode-table block + byte offset (group-aware).
+fn df_ext2_iloc(ino) {
+    var g = (ino - 1) / df_ext2_ipg;
+    var idx = (ino - 1) - g * df_ext2_ipg;
+    var itable = g * df_ext2_bpg + 3 + df_ext2_gd;
+    df_ext2_iloc_blk = itable + idx / 32;
+    df_ext2_iloc_off = (idx - (idx / 32) * 32) * 128;
+    return 0;
+}
+
+# Mark block `bn` used in its group's block bitmap (RMW via df_ext2_bmp). Returns 8 / <8.
+fn df_ext2_mark_block(bn) {
+    var g = bn / df_ext2_bpg;
+    var goff = bn - g * df_ext2_bpg;
+    var bbmp = g * df_ext2_bpg + 1 + df_ext2_gd;
+    df_ext2_rd_block(bbmp, &df_ext2_bmp);
+    df_bit_set(&df_ext2_bmp, goff);
+    return df_ext2_wr_block(bbmp, &df_ext2_bmp);
+}
+
+# Mark inode `ino` used in its group's inode bitmap. Returns 8 / <8.
+fn df_ext2_mark_inode(ino) {
+    var g = (ino - 1) / df_ext2_ipg;
+    var idx = (ino - 1) - g * df_ext2_ipg;
+    var ibmp = g * df_ext2_bpg + 2 + df_ext2_gd;
+    df_ext2_rd_block(ibmp, &df_ext2_bmp);
+    df_bit_set(&df_ext2_bmp, idx);
+    return df_ext2_wr_block(ibmp, &df_ext2_bmp);
+}
+
+# Allocate the next free DATA block (skips per-group metadata + group boundaries). Marks the
+# bitmap bit + decrements the group's / global free-block counts. Returns the block number, -1 full.
+fn df_ext2_alloc_block() {
+    while (df_ext2_next_block < df_ext2_B) {
+        var bn = df_ext2_next_block;
+        df_ext2_next_block = bn + 1;
+        var g = bn / df_ext2_bpg;
+        var goff = bn - g * df_ext2_bpg;
+        if (goff >= df_ext2_metapg) {
+            if (df_ext2_mark_block(bn) != 8) { return 0 - 1; }
+            df_ext2_arr_add(&df_ext2_gfb, g, 0 - 1);
+            df_ext2_free_blocks = df_ext2_free_blocks - 1;
+            return bn;
+        }
+    }
+    return 0 - 1;
+}
+
+# Allocate the next free inode. Marks the bitmap bit + decrements counts. Returns ino / -1.
+fn df_ext2_alloc_inode() {
+    var ino = df_ext2_next_ino;
+    df_ext2_next_ino = ino + 1;
+    if (df_ext2_mark_inode(ino) != 8) { return 0 - 1; }
+    df_ext2_arr_add(&df_ext2_gfi, (ino - 1) / df_ext2_ipg, 0 - 1);
+    df_ext2_free_inodes = df_ext2_free_inodes - 1;
+    return ino;
+}
+
+# Read exactly `want` (<=4096) bytes of the current source into a fresh block buffer and write it
+# as block `dblk` (rest zero-padded). `want` is bounded by the remaining file size so a tar member
+# never over-reads into the following padding/header. Returns 0 / -1.
+fn df_ext2_wr_data(dblk, want) {
+    df_zero(&df_ext2_dat, 4096);
+    if (want > 0) { df_ext2_src_read(&df_ext2_dat, want); }
+    if (df_write(df_ext2_abs + dblk * 8, &df_ext2_dat, 8) != 8) { return 0 - 1; }
+    return 0;
+}
+
+# Populate a 1024-byte superblock at `dst` for group-number `grp_nr` (0 = primary).
+fn df_ext2_write_sb(dst, grp_nr) {
+    store32(dst + 0x00, df_ext2_ipg * df_ext2_G);   # s_inodes_count
+    store32(dst + 0x04, df_ext2_B);                 # s_blocks_count
+    store32(dst + 0x0C, df_ext2_free_blocks);       # s_free_blocks_count
+    store32(dst + 0x10, df_ext2_free_inodes);       # s_free_inodes_count
+    store32(dst + 0x14, 0);                         # s_first_data_block
+    store32(dst + 0x18, 2);                         # s_log_block_size (4096)
+    store32(dst + 0x1C, 2);                         # s_log_cluster_size
+    store32(dst + 0x20, df_ext2_bpg);               # s_blocks_per_group
+    store32(dst + 0x24, df_ext2_bpg);               # s_clusters_per_group
+    store32(dst + 0x28, df_ext2_ipg);               # s_inodes_per_group
+    store32(dst + 0x30, DF_EXT2_EPOCH);             # s_wtime
+    store16(dst + 0x36, 0xFFFF);                    # s_max_mnt_count (-1)
+    store16(dst + 0x38, 0xEF53);                    # s_magic
+    store16(dst + 0x3A, 1);                         # s_state VALID_FS
+    store16(dst + 0x3C, 1);                         # s_errors: continue
+    store32(dst + 0x4C, 1);                         # s_rev_level DYNAMIC
+    store32(dst + 0x54, 11);                        # s_first_ino
+    store16(dst + 0x58, 128);                       # s_inode_size
+    store16(dst + 0x5A, grp_nr);                    # s_block_group_nr (this copy's group)
+    store32(dst + 0x60, 0x0002);                    # s_feature_incompat: FILETYPE
+    store64(dst + 0x68, 0x41474E4F53524F4F);        # s_uuid (16 nonzero bytes)
+    store64(dst + 0x70, 0x54AA55CC33DDEE11);
+    store8(dst + 0x78, 0x41); store8(dst + 0x79, 0x47); store8(dst + 0x7A, 0x4E);  # "AGNOS-ROOT"
+    store8(dst + 0x7B, 0x4F); store8(dst + 0x7C, 0x53); store8(dst + 0x7D, 0x2D);
+    store8(dst + 0x7E, 0x52); store8(dst + 0x7F, 0x4F); store8(dst + 0x80, 0x4F);
+    store8(dst + 0x81, 0x54);
+    return 0;
+}
+
+# Rebuild the GDT from the in-memory per-group counters and write the superblock + GDT to EVERY
+# group (primary in group 0 + a backup in each other group — no sparse_super). Called at the end
+# of format AND after every populate op, so primary and all backups stay consistent for e2fsck.
+fn df_ext2_flush_meta() {
+    df_zero(&df_batch, 16384);
+    var g = 0;
+    while (g < df_ext2_G) {
+        var d = &df_batch + g * 32;
+        store32(d + 0x00, g * df_ext2_bpg + 1 + df_ext2_gd);   # bg_block_bitmap
+        store32(d + 0x04, g * df_ext2_bpg + 2 + df_ext2_gd);   # bg_inode_bitmap
+        store32(d + 0x08, g * df_ext2_bpg + 3 + df_ext2_gd);   # bg_inode_table
+        store16(d + 0x0C, df_ext2_arr_get(&df_ext2_gfb, g) & 0xFFFF);   # bg_free_blocks_count
+        store16(d + 0x0E, df_ext2_arr_get(&df_ext2_gfi, g) & 0xFFFF);   # bg_free_inodes_count
+        store16(d + 0x10, df_ext2_arr_get(&df_ext2_gud, g) & 0xFFFF);   # bg_used_dirs_count
+        g = g + 1;
+    }
+    g = 0;
+    while (g < df_ext2_G) {
+        df_zero(&df_ext2_blk, 4096);
+        var sboff = 0;
+        if (g == 0) { sboff = 1024; }                          # group 0: SB after the boot pad
+        df_ext2_write_sb(&df_ext2_blk + sboff, g);
+        if (df_ext2_wr_block(g * df_ext2_bpg, &df_ext2_blk) != 8) { return 0 - 1; }
+        var t = 0;
+        while (t < df_ext2_gd) {
+            if (df_ext2_wr_block(g * df_ext2_bpg + 1 + t, &df_batch + t * 4096) != 8) { return 0 - 1; }
+            t = t + 1;
+        }
+        g = g + 1;
+    }
+    return 0;
+}
+
+# Format a MULTI-BLOCK-GROUP ext2 into partition [part_abs, +part_sectors). Groups of 32768
+# blocks each; a full SB+GDT backup per group (no sparse_super); inode-table zeroed everywhere
+# (no uninit_bg — the kernel reader lacks it); root (inode 2) + lost+found (inode 11) prebuilt.
+# Returns 0 / -1.
 fn df_format_ext2(part_abs, part_sectors) {
     df_ext2_abs = part_abs;
+    var BPG = 32768;
+    var IPG = 8192;
+    var itpg = IPG / 32;                          # 256 inode-table blocks per group
     var B = part_sectors / 8;                     # blocks_count
-    if (B > 32768) { B = 32768; }                 # cap to one group
-    var I = B / 4;                                # inodes_count (bytes-per-inode 16384)
-    I = ((I + 7) / 8) * 8;                        # round up to a multiple of 8
-    var IT = (I + 31) / 32;                        # inode-table blocks = ceil(I*128/4096)
-    var used = 4 + IT + 1;                         # SB,BGDT,bbmp,ibmp + itable + root-dir
-    var root_dir_block = 4 + IT;
-    var free_blocks = B - used;
-    var free_inodes = I - 10;
+    if (B < (itpg + 16)) { return 0 - 1; }        # too small for even one group
 
-    # Block 2: block bitmap — bits 0..used-1 used, bits B..32767 padding, else free.
-    df_zero(&df_ext2_blk, 4096);
-    var bit = 0;
-    while (bit < used) { df_bit_set(&df_ext2_blk, bit); bit = bit + 1; }
-    bit = B;
-    while (bit < 32768) { df_bit_set(&df_ext2_blk, bit); bit = bit + 1; }
-    if (df_ext2_wr_block(2, &df_ext2_blk) != 8) { return 0 - 1; }
+    # group count, then drop an unusably-small tail group.
+    var G = (B + BPG - 1) / BPG;
+    var gd = (G * 32 + 4095) / 4096;
+    var metapg = gd + itpg + 3;                   # SB + GDT + bbmp + ibmp + itable
+    var last = B - (G - 1) * BPG;
+    if (last < (metapg + 8)) {
+        B = (G - 1) * BPG;
+        G = G - 1;
+        gd = (G * 32 + 4095) / 4096;
+        metapg = gd + itpg + 3;
+    }
+    if (G < 1) { return 0 - 1; }
+    if (G > 512) { return 0 - 1; }                # >64 GiB root — widen the per-group arrays
+    var I = IPG * G;
 
-    # Block 3: inode bitmap — inodes 1..10 used, bits I..32767 padding, else free.
-    df_zero(&df_ext2_blk, 4096);
-    bit = 0;
-    while (bit < 10) { df_bit_set(&df_ext2_blk, bit); bit = bit + 1; }
-    bit = I;
-    while (bit < 32768) { df_bit_set(&df_ext2_blk, bit); bit = bit + 1; }
-    if (df_ext2_wr_block(3, &df_ext2_blk) != 8) { return 0 - 1; }
+    df_ext2_bpg = BPG; df_ext2_ipg = IPG; df_ext2_itpg = itpg;
+    df_ext2_B = B; df_ext2_G = G; df_ext2_gd = gd; df_ext2_metapg = metapg;
 
-    # Inode table: block 4 carries root inode 2 (offset 128); blocks 5..3+IT zeroed.
+    # ---- zero every inode-table block in every group (kernel has no lazy_itable_init) ----
     df_zero(&df_ext2_blk, 4096);
-    var ri = &df_ext2_blk + 128;
-    store16(ri + 0x00, 0x41ED);                   # i_mode: directory, 0755
-    store32(ri + 0x04, 4096);                     # i_size
-    store32(ri + 0x08, DF_EXT2_EPOCH);            # i_atime
-    store32(ri + 0x0C, DF_EXT2_EPOCH);            # i_ctime
-    store32(ri + 0x10, DF_EXT2_EPOCH);            # i_mtime
-    store16(ri + 0x1A, 2);                        # i_links_count (. and ..)
-    store32(ri + 0x1C, 8);                        # i_blocks (512-B units: one 4K block)
-    store32(ri + 0x28, root_dir_block);           # i_block[0]
-    if (df_ext2_wr_block(4, &df_ext2_blk) != 8) { return 0 - 1; }
-    df_zero(&df_ext2_blk, 4096);
-    var bn = 5;
-    while (bn <= 3 + IT) {
-        if (df_ext2_wr_block(bn, &df_ext2_blk) != 8) { return 0 - 1; }
-        bn = bn + 1;
+    var g = 0;
+    while (g < G) {
+        var it0 = g * BPG + 3 + gd;
+        var t = 0;
+        while (t < itpg) {
+            if (df_ext2_wr_block(it0 + t, &df_ext2_blk) != 8) { return 0 - 1; }
+            t = t + 1;
+        }
+        g = g + 1;
     }
 
-    # Root-dir data block: '.' and '..' (both -> inode 2; root's parent is itself).
+    # ---- per-group free counters. group 0 spends 2 data blocks (root + lost+found) and 11 inodes.
+    var root_db = metapg;                         # group 0's first two data blocks
+    var lf_db = metapg + 1;
+    g = 0;
+    while (g < G) {
+        var gblocks = BPG;
+        if (g == (G - 1)) { gblocks = B - g * BPG; }
+        var gib = gblocks - metapg;
+        var gii = IPG;
+        if (g == 0) { gib = gib - 2; gii = IPG - 11; }
+        df_ext2_arr_set(&df_ext2_gfb, g, gib);
+        df_ext2_arr_set(&df_ext2_gfi, g, gii);
+        df_ext2_arr_set(&df_ext2_gud, g, 0);
+        g = g + 1;
+    }
+    df_ext2_arr_set(&df_ext2_gud, 0, 2);          # root + lost+found are dirs in group 0
+
+    df_ext2_next_ino = 12;                        # 1..10 reserved, 11 = lost+found
+    df_ext2_next_block = metapg + 2;              # after root + lost+found
+    df_ext2_free_blocks = B - G * metapg - 2;
+    df_ext2_free_inodes = I - 11;
+
+    # ---- root dir data block: '.', '..' (-> inode 2), and a 'lost+found' entry (-> inode 11) ----
     df_zero(&df_ext2_blk, 4096);
     store32(&df_ext2_blk + 0, 2); store16(&df_ext2_blk + 4, 12);
+    store8(&df_ext2_blk + 6, 1); store8(&df_ext2_blk + 7, 2); store8(&df_ext2_blk + 8, 0x2E);
+    store32(&df_ext2_blk + 12, 2); store16(&df_ext2_blk + 16, 12);
+    store8(&df_ext2_blk + 18, 2); store8(&df_ext2_blk + 19, 2);
+    store8(&df_ext2_blk + 20, 0x2E); store8(&df_ext2_blk + 21, 0x2E);
+    store32(&df_ext2_blk + 24, 11); store16(&df_ext2_blk + 28, 4072);   # spans to block end
+    store8(&df_ext2_blk + 30, 10); store8(&df_ext2_blk + 31, 2);
+    store8(&df_ext2_blk + 32, 0x6C); store8(&df_ext2_blk + 33, 0x6F);   # "lost+found"
+    store8(&df_ext2_blk + 34, 0x73); store8(&df_ext2_blk + 35, 0x74);
+    store8(&df_ext2_blk + 36, 0x2B); store8(&df_ext2_blk + 37, 0x66);
+    store8(&df_ext2_blk + 38, 0x6F); store8(&df_ext2_blk + 39, 0x75);
+    store8(&df_ext2_blk + 40, 0x6E); store8(&df_ext2_blk + 41, 0x64);
+    if (df_ext2_wr_block(root_db, &df_ext2_blk) != 8) { return 0 - 1; }
+
+    # ---- lost+found dir data block: '.' -> 11, '..' -> 2 ----
+    df_zero(&df_ext2_blk, 4096);
+    store32(&df_ext2_blk + 0, 11); store16(&df_ext2_blk + 4, 12);
     store8(&df_ext2_blk + 6, 1); store8(&df_ext2_blk + 7, 2); store8(&df_ext2_blk + 8, 0x2E);
     store32(&df_ext2_blk + 12, 2); store16(&df_ext2_blk + 16, 4084);
     store8(&df_ext2_blk + 18, 2); store8(&df_ext2_blk + 19, 2);
     store8(&df_ext2_blk + 20, 0x2E); store8(&df_ext2_blk + 21, 0x2E);
-    if (df_ext2_wr_block(root_dir_block, &df_ext2_blk) != 8) { return 0 - 1; }
+    if (df_ext2_wr_block(lf_db, &df_ext2_blk) != 8) { return 0 - 1; }
 
-    # Block 1: BGDT — one 32-byte descriptor (bg_inode_table_hi @0x28 stays 0).
-    df_zero(&df_ext2_blk, 4096);
-    store32(&df_ext2_blk + 0x00, 2);              # bg_block_bitmap
-    store32(&df_ext2_blk + 0x04, 3);              # bg_inode_bitmap
-    store32(&df_ext2_blk + 0x08, 4);              # bg_inode_table
-    store16(&df_ext2_blk + 0x0C, free_blocks & 0xFFFF);   # bg_free_blocks_count
-    store16(&df_ext2_blk + 0x0E, free_inodes & 0xFFFF);   # bg_free_inodes_count
-    store16(&df_ext2_blk + 0x10, 1);              # bg_used_dirs_count
-    if (df_ext2_wr_block(1, &df_ext2_blk) != 8) { return 0 - 1; }
+    # ---- root (inode 2) + lost+found (inode 11) inodes — both in group 0's first itable block ----
+    var it0 = 3 + gd;
+    df_ext2_rd_block(it0, &df_ext2_blk);
+    var ri = &df_ext2_blk + 1 * 128;              # inode 2 slot
+    df_zero(ri, 128);
+    store16(ri + 0x00, 0x41ED); store32(ri + 0x04, 4096);
+    store32(ri + 0x08, DF_EXT2_EPOCH); store32(ri + 0x0C, DF_EXT2_EPOCH);
+    store32(ri + 0x10, DF_EXT2_EPOCH);
+    store16(ri + 0x1A, 3);                        # links: . .. lost+found/..
+    store32(ri + 0x1C, 8); store32(ri + 0x28, root_db);
+    var li = &df_ext2_blk + 10 * 128;             # inode 11 slot
+    df_zero(li, 128);
+    store16(li + 0x00, 0x41ED); store32(li + 0x04, 4096);
+    store32(li + 0x08, DF_EXT2_EPOCH); store32(li + 0x0C, DF_EXT2_EPOCH);
+    store32(li + 0x10, DF_EXT2_EPOCH);
+    store16(li + 0x1A, 2); store32(li + 0x1C, 8); store32(li + 0x28, lf_db);
+    if (df_ext2_wr_block(it0, &df_ext2_blk) != 8) { return 0 - 1; }
 
-    # Block 0: boot pad + superblock @ byte 1024 (written LAST for crash-safety).
-    df_zero(&df_ext2_blk, 4096);
-    var sb = &df_ext2_blk + 1024;
-    store32(sb + 0x00, I);                        # s_inodes_count
-    store32(sb + 0x04, B);                        # s_blocks_count
-    store32(sb + 0x0C, free_blocks);              # s_free_blocks_count
-    store32(sb + 0x10, free_inodes);              # s_free_inodes_count
-    store32(sb + 0x14, 0);                        # s_first_data_block
-    store32(sb + 0x18, 2);                        # s_log_block_size (4096)
-    store32(sb + 0x1C, 2);                        # s_log_cluster_size (== block size)
-    store32(sb + 0x20, 32768);                    # s_blocks_per_group
-    store32(sb + 0x24, 32768);                    # s_clusters_per_group
-    store32(sb + 0x28, I);                        # s_inodes_per_group
-    store32(sb + 0x30, DF_EXT2_EPOCH);            # s_wtime
-    store16(sb + 0x36, 0xFFFF);                   # s_max_mnt_count (-1)
-    store16(sb + 0x38, 0xEF53);                   # s_magic
-    store16(sb + 0x3A, 1);                        # s_state VALID_FS
-    store16(sb + 0x3C, 1);                        # s_errors: continue
-    store32(sb + 0x4C, 1);                        # s_rev_level DYNAMIC
-    store32(sb + 0x54, 11);                       # s_first_ino
-    store16(sb + 0x58, 128);                      # s_inode_size
-    store32(sb + 0x60, 0x0002);                   # s_feature_incompat: FILETYPE
-    store64(sb + 0x68, 0x41474E4F53524F4F);       # s_uuid (16 nonzero bytes)
-    store64(sb + 0x70, 0x54AA55CC33DDEE11);
-    store8(sb + 0x78, 0x41); store8(sb + 0x79, 0x47); store8(sb + 0x7A, 0x4E);  # "AGNOS-ROOT"
-    store8(sb + 0x7B, 0x4F); store8(sb + 0x7C, 0x53); store8(sb + 0x7D, 0x2D);
-    store8(sb + 0x7E, 0x52); store8(sb + 0x7F, 0x4F); store8(sb + 0x80, 0x4F);
-    store8(sb + 0x81, 0x54);
-    if (df_ext2_wr_block(0, &df_ext2_blk) != 8) { return 0 - 1; }
+    # ---- block bitmaps: metadata head [0,metapg), group-0 root+lf, and partial-tail padding ----
+    g = 0;
+    while (g < G) {
+        var gblocks = BPG;
+        if (g == (G - 1)) { gblocks = B - g * BPG; }
+        df_zero(&df_ext2_bmp, 4096);
+        var bit = 0;
+        while (bit < metapg) { df_bit_set(&df_ext2_bmp, bit); bit = bit + 1; }
+        if (g == 0) { df_bit_set(&df_ext2_bmp, metapg); df_bit_set(&df_ext2_bmp, metapg + 1); }
+        bit = gblocks;
+        while (bit < BPG) { df_bit_set(&df_ext2_bmp, bit); bit = bit + 1; }
+        if (df_ext2_wr_block(g * BPG + 1 + gd, &df_ext2_bmp) != 8) { return 0 - 1; }
+        g = g + 1;
+    }
 
-    # staging cursors (mirror SB + BGDT for the populate bites)
-    df_ext2_ipg = I;
-    df_ext2_next_ino = 11;
-    df_ext2_next_block = 5 + IT;
-    df_ext2_free_blocks = free_blocks;
-    df_ext2_free_inodes = free_inodes;
-    return 0;
+    # ---- inode bitmaps: group 0 marks inodes 1..11; every group pads bits [IPG,32768) ----
+    g = 0;
+    while (g < G) {
+        df_zero(&df_ext2_bmp, 4096);
+        if (g == 0) {
+            var b0 = 0;
+            while (b0 < 11) { df_bit_set(&df_ext2_bmp, b0); b0 = b0 + 1; }
+        }
+        var pb = IPG / 8;                          # 1024: bits >= IPG are byte-aligned padding
+        while (pb < 4096) { store8(&df_ext2_bmp + pb, 0xFF); pb = pb + 1; }
+        if (df_ext2_wr_block(g * BPG + 2 + gd, &df_ext2_bmp) != 8) { return 0 - 1; }
+        g = g + 1;
+    }
+
+    # ---- superblock + GDT to every group (primary + all backups) ----
+    return df_ext2_flush_meta();
 }
 
 # Persist the running free-block / free-inode counters to the SB (block 0) + BGDT (block 1).
 fn df_ext2_persist_counts() {
-    df_ext2_rd_block(0, &df_ext2_blk);
-    store32(&df_ext2_blk + 1024 + 0x0C, df_ext2_free_blocks);   # s_free_blocks_count
-    store32(&df_ext2_blk + 1024 + 0x10, df_ext2_free_inodes);   # s_free_inodes_count
-    if (df_ext2_wr_block(0, &df_ext2_blk) != 8) { return 0 - 1; }
-    df_ext2_rd_block(1, &df_ext2_blk);
-    store16(&df_ext2_blk + 0x0C, df_ext2_free_blocks & 0xFFFF); # bg_free_blocks_count
-    store16(&df_ext2_blk + 0x0E, df_ext2_free_inodes & 0xFFFF); # bg_free_inodes_count
-    if (df_ext2_wr_block(1, &df_ext2_blk) != 8) { return 0 - 1; }
-    return 0;
+    return df_ext2_flush_meta();   # re-emit SB + full GDT (all groups) from the live counters
 }
 
 # Link a dirent {child_ino, name, ftype} into directory `parent_ino` by the slack-split rule:
 # shrink the last entry to its minimal rec_len, append the new entry spanning to the block end.
 # Uses df_ext2_ind as dir-block scratch (free during the direct-file path). Returns 0 / -1.
 fn df_ext2_link_dirent(parent_ino, child_ino, name_ptr, name_len, ftype) {
-    var pblk = df_ext2_itable + (parent_ino - 1) / 32;
-    var poff = ((parent_ino - 1) - ((parent_ino - 1) / 32) * 32) * 128;
-    df_ext2_rd_block(pblk, &df_ext2_blk);
-    var dir_block = load32(&df_ext2_blk + poff + 0x28);   # parent i_block[0]
+    df_ext2_iloc(parent_ino);
+    df_ext2_rd_block(df_ext2_iloc_blk, &df_ext2_blk);
+    var dir_block = load32(&df_ext2_blk + df_ext2_iloc_off + 0x28);   # parent i_block[0]
 
     df_ext2_rd_block(dir_block, &df_ext2_ind);
     # walk to the last entry (its rec_len runs to the block end).
@@ -702,64 +920,98 @@ fn df_ext2_link_dirent(parent_ino, child_ino, name_ptr, name_len, ftype) {
     return 0;
 }
 
-# Write a regular file `name` (name_len bytes) from the open src_fd into directory `parent_ino`.
-# Direct blocks (<=12) + SINGLE indirect (up to ~4 MiB); double/triple indirect not in this cut.
-# Returns 0 / -1.
+# Write a whole open file (probes its length by seeking) into directory `parent_ino`.
 fn df_ext2_add_file(parent_ino, name_ptr, name_len, src_fd) {
     var size = syscall(SYS_LSEEK, src_fd, 0, 2);           # SEEK_END -> size
     syscall(SYS_LSEEK, src_fd, 0, 0);                      # rewind
+    df_ext2_src_set_fd(src_fd);
+    return df_ext2_add_file_sz(parent_ino, name_ptr, name_len, size);
+}
+
+# Write `size` bytes read from the CURRENT source (fd or memory) as a regular file `name` into
+# directory `parent_ino` (the tar-member form — never seeks, so it stops exactly at `size` and
+# does not over-read into a following tar padding/header). Data blocks are allocated one at a time
+# via the group-aware allocator (so a file spans block groups, skipping their metadata) and routed
+# into direct[0..11], a single-indirect block (i_block[12]), and a double-indirect tree
+# (i_block[13]) — up to ~4.29 GiB. Beyond that needs triple-indirect + large_file, which the
+# kernel's 2 GiB i_size cap makes moot. Returns 0 / -1.
+fn df_ext2_add_file_sz(parent_ino, name_ptr, name_len, size) {
     var nblocks = (size + 4095) / 4096;
-    var need_ind = 0;
-    if (nblocks > 12) { need_ind = 1; }
-    if (nblocks > (12 + 1024)) { return 0 - 1; }           # single-indirect cap (~4 MiB)
-    var totblocks = nblocks + need_ind;                     # +1 for the indirect block
+    if (nblocks > (12 + 1024 + 1024 * 1024)) { return 0 - 1; }   # > double-indirect (see above)
 
-    var ino = df_ext2_next_ino;
-    df_ext2_next_ino = ino + 1;
-    var first_block = df_ext2_next_block;
-    df_ext2_next_block = first_block + totblocks;
-    var ind_block = first_block + nblocks;                  # indirect block sits after the data
+    var ino = df_ext2_alloc_inode();
+    if (ino < 0) { return 0 - 1; }
+    var ib12 = 0; var ib13 = 0; var meta = 0;              # indirect roots + metadata-block count
+    var rem = size;                                        # bytes still to read (bounds each block)
+    df_zero(&df_ext2_direct, 128);
 
-    # mark the inode bit + every allocated block bit (data + indirect).
-    df_ext2_rd_block(3, &df_ext2_blk);
-    df_bit_set(&df_ext2_blk, ino - 1);
-    if (df_ext2_wr_block(3, &df_ext2_blk) != 8) { return 0 - 1; }
-    df_ext2_rd_block(2, &df_ext2_blk);
-    var bi = 0;
-    while (bi < totblocks) { df_bit_set(&df_ext2_blk, first_block + bi); bi = bi + 1; }
-    if (df_ext2_wr_block(2, &df_ext2_blk) != 8) { return 0 - 1; }
-    df_ext2_free_inodes = df_ext2_free_inodes - 1;
-    df_ext2_free_blocks = df_ext2_free_blocks - totblocks;
-
-    # stream the body into the (contiguous) data blocks, 4 blocks (16 KiB) per write.
-    var wi = 0;
-    var total = 0;
-    while (wi < nblocks) {
-        var chunk = nblocks - wi;
-        if (chunk > 4) { chunk = 4; }
-        df_zero(&df_batch, 16384);
-        total = total + df_read_fill(src_fd, &df_batch, chunk * 4096);
-        if (df_write(df_ext2_abs + (first_block + wi) * 8, &df_batch, chunk * 8) != (chunk * 8)) { return 0 - 1; }
-        wi = wi + chunk;
+    # ---- direct blocks 0..11 ----
+    var L = 0;
+    var nd = nblocks;
+    if (nd > 12) { nd = 12; }
+    while (L < nd) {
+        var dblk = df_ext2_alloc_block();
+        if (dblk < 0) { return 0 - 1; }
+        var w0 = rem; if (w0 > 4096) { w0 = 4096; }
+        if (df_ext2_wr_data(dblk, w0) != 0) { return 0 - 1; }
+        rem = rem - w0;
+        store64(&df_ext2_direct + L * 8, dblk);
+        L = L + 1;
     }
-    if (total != size) { return 0 - 1; }
 
-    # single-indirect block: u32 LE pointers for logical blocks 12..nblocks-1.
-    if (need_ind == 1) {
+    # ---- single-indirect block (i_block[12]): logical blocks 12..1035 ----
+    if (nblocks > 12) {
         df_zero(&df_ext2_ind, 4096);
-        var li = 12;
-        while (li < nblocks) {
-            store32(&df_ext2_ind + (li - 12) * 4, first_block + li);
-            li = li + 1;
+        var lim = nblocks;
+        if (lim > 1036) { lim = 1036; }
+        var c = 0;
+        while (L < lim) {
+            var d1 = df_ext2_alloc_block();
+            if (d1 < 0) { return 0 - 1; }
+            var w1 = rem; if (w1 > 4096) { w1 = 4096; }
+            if (df_ext2_wr_data(d1, w1) != 0) { return 0 - 1; }
+            rem = rem - w1;
+            store32(&df_ext2_ind + c * 4, d1);
+            c = c + 1; L = L + 1;
         }
-        if (df_ext2_wr_block(ind_block, &df_ext2_ind) != 8) { return 0 - 1; }
+        ib12 = df_ext2_alloc_block();
+        if (ib12 < 0) { return 0 - 1; }
+        if (df_ext2_wr_block(ib12, &df_ext2_ind) != 8) { return 0 - 1; }
+        meta = meta + 1;
     }
 
-    # write the file inode (RMW its inode-table block; zero the 128-B slot first).
-    var itblk = df_ext2_itable + (ino - 1) / 32;
-    var ioff = ((ino - 1) - ((ino - 1) / 32) * 32) * 128;
-    df_ext2_rd_block(itblk, &df_ext2_blk);
-    var fi = &df_ext2_blk + ioff;
+    # ---- double-indirect tree (i_block[13]): logical blocks 1036.. ----
+    if (nblocks > 1036) {
+        df_zero(&df_ext2_ind2, 4096);
+        var dc = 0;
+        while (L < nblocks) {
+            df_zero(&df_ext2_ind, 4096);            # one inner single-indirect block
+            var ic = 0;
+            while (ic < 1024 && L < nblocks) {
+                var d2 = df_ext2_alloc_block();
+                if (d2 < 0) { return 0 - 1; }
+                var w2 = rem; if (w2 > 4096) { w2 = 4096; }
+                if (df_ext2_wr_data(d2, w2) != 0) { return 0 - 1; }
+                rem = rem - w2;
+                store32(&df_ext2_ind + ic * 4, d2);
+                ic = ic + 1; L = L + 1;
+            }
+            var indblk = df_ext2_alloc_block();
+            if (indblk < 0) { return 0 - 1; }
+            if (df_ext2_wr_block(indblk, &df_ext2_ind) != 8) { return 0 - 1; }
+            meta = meta + 1;
+            store32(&df_ext2_ind2 + dc * 4, indblk); dc = dc + 1;
+        }
+        ib13 = df_ext2_alloc_block();
+        if (ib13 < 0) { return 0 - 1; }
+        if (df_ext2_wr_block(ib13, &df_ext2_ind2) != 8) { return 0 - 1; }
+        meta = meta + 1;
+    }
+
+    # ---- file inode ----
+    df_ext2_iloc(ino);
+    df_ext2_rd_block(df_ext2_iloc_blk, &df_ext2_blk);
+    var fi = &df_ext2_blk + df_ext2_iloc_off;
     df_zero(fi, 128);
     store16(fi + 0x00, 0x81A4);                           # regular file, 0644
     store32(fi + 0x04, size);                             # i_size
@@ -767,33 +1019,49 @@ fn df_ext2_add_file(parent_ino, name_ptr, name_len, src_fd) {
     store32(fi + 0x0C, DF_EXT2_EPOCH);
     store32(fi + 0x10, DF_EXT2_EPOCH);
     store16(fi + 0x1A, 1);                                # i_links_count
-    store32(fi + 0x1C, totblocks * 8);                    # i_blocks (512-B units incl. indirect)
-    var ndirect = nblocks;
-    if (ndirect > 12) { ndirect = 12; }
+    store32(fi + 0x1C, (nblocks + meta) * 8);             # i_blocks (512-B units incl. indirect)
+    var ndir = nblocks;
+    if (ndir > 12) { ndir = 12; }
     var di = 0;
-    while (di < ndirect) { store32(fi + 0x28 + di * 4, first_block + di); di = di + 1; }
-    if (need_ind == 1) { store32(fi + 0x28 + 12 * 4, ind_block); }   # i_block[12] = indirect
-    if (df_ext2_wr_block(itblk, &df_ext2_blk) != 8) { return 0 - 1; }
+    while (di < ndir) { store32(fi + 0x28 + di * 4, load64(&df_ext2_direct + di * 8)); di = di + 1; }
+    if (ib12 != 0) { store32(fi + 0x28 + 12 * 4, ib12); }   # i_block[12] = single indirect
+    if (ib13 != 0) { store32(fi + 0x28 + 13 * 4, ib13); }   # i_block[13] = double indirect
+    if (df_ext2_wr_block(df_ext2_iloc_blk, &df_ext2_blk) != 8) { return 0 - 1; }
 
     if (df_ext2_link_dirent(parent_ino, ino, name_ptr, name_len, 1) != 0) { return 0 - 1; }
     return df_ext2_persist_counts();
 }
 
+# Create a fast symlink `name` -> `target` (target < 60 bytes, stored inline in the i_block area,
+# i_blocks=0) under directory `parent_ino`. Returns 0 / -1.
+fn df_ext2_add_symlink(parent_ino, name_ptr, name_len, target_ptr, target_len) {
+    if (target_len >= 60) { return 0 - 1; }               # slow (data-block) symlink unsupported
+    var ino = df_ext2_alloc_inode();
+    if (ino < 0) { return 0 - 1; }
+    df_ext2_iloc(ino);
+    df_ext2_rd_block(df_ext2_iloc_blk, &df_ext2_blk);
+    var fi = &df_ext2_blk + df_ext2_iloc_off;
+    df_zero(fi, 128);
+    store16(fi + 0x00, 0xA1FF);                           # S_IFLNK | 0777
+    store32(fi + 0x04, target_len);                       # i_size = target length
+    store32(fi + 0x08, DF_EXT2_EPOCH);
+    store32(fi + 0x0C, DF_EXT2_EPOCH);
+    store32(fi + 0x10, DF_EXT2_EPOCH);
+    store16(fi + 0x1A, 1);                                # i_links_count
+    store32(fi + 0x1C, 0);                                # i_blocks 0 (fast symlink)
+    var k = 0;
+    while (k < target_len) { store8(fi + 0x28 + k, load8(target_ptr + k) & 0xFF); k = k + 1; }
+    if (df_ext2_wr_block(df_ext2_iloc_blk, &df_ext2_blk) != 8) { return 0 - 1; }
+    if (df_ext2_link_dirent(parent_ino, ino, name_ptr, name_len, 7) != 0) { return 0 - 1; }
+    return df_ext2_persist_counts();
+}
+
 # Create a subdirectory `name` under directory `parent_ino`. Returns the new inode number, or -1.
 fn df_ext2_mkdir(parent_ino, name_ptr, name_len) {
-    var ino = df_ext2_next_ino;
-    df_ext2_next_ino = ino + 1;
-    var dblock = df_ext2_next_block;
-    df_ext2_next_block = dblock + 1;
-
-    df_ext2_rd_block(3, &df_ext2_blk);
-    df_bit_set(&df_ext2_blk, ino - 1);
-    if (df_ext2_wr_block(3, &df_ext2_blk) != 8) { return 0 - 1; }
-    df_ext2_rd_block(2, &df_ext2_blk);
-    df_bit_set(&df_ext2_blk, dblock);
-    if (df_ext2_wr_block(2, &df_ext2_blk) != 8) { return 0 - 1; }
-    df_ext2_free_inodes = df_ext2_free_inodes - 1;
-    df_ext2_free_blocks = df_ext2_free_blocks - 1;
+    var ino = df_ext2_alloc_inode();
+    if (ino < 0) { return 0 - 1; }
+    var dblock = df_ext2_alloc_block();
+    if (dblock < 0) { return 0 - 1; }
 
     # the new dir's data block: '.' -> self, '..' -> parent.
     df_zero(&df_ext2_blk, 4096);
@@ -805,10 +1073,9 @@ fn df_ext2_mkdir(parent_ino, name_ptr, name_len) {
     if (df_ext2_wr_block(dblock, &df_ext2_blk) != 8) { return 0 - 1; }
 
     # the new dir inode (mode 0755 dir, links_count 2 for '.' and its own '..').
-    var itblk = df_ext2_itable + (ino - 1) / 32;
-    var ioff = ((ino - 1) - ((ino - 1) / 32) * 32) * 128;
-    df_ext2_rd_block(itblk, &df_ext2_blk);
-    var fi = &df_ext2_blk + ioff;
+    df_ext2_iloc(ino);
+    df_ext2_rd_block(df_ext2_iloc_blk, &df_ext2_blk);
+    var fi = &df_ext2_blk + df_ext2_iloc_off;
     df_zero(fi, 128);
     store16(fi + 0x00, 0x41ED);
     store32(fi + 0x04, 4096);
@@ -818,23 +1085,19 @@ fn df_ext2_mkdir(parent_ino, name_ptr, name_len) {
     store16(fi + 0x1A, 2);
     store32(fi + 0x1C, 8);
     store32(fi + 0x28, dblock);
-    if (df_ext2_wr_block(itblk, &df_ext2_blk) != 8) { return 0 - 1; }
+    if (df_ext2_wr_block(df_ext2_iloc_blk, &df_ext2_blk) != 8) { return 0 - 1; }
 
     if (df_ext2_link_dirent(parent_ino, ino, name_ptr, name_len, 2) != 0) { return 0 - 1; }
 
     # parent links_count +1 (the new dir's '..' points back at the parent).
-    var pblk = df_ext2_itable + (parent_ino - 1) / 32;
-    var poff = ((parent_ino - 1) - ((parent_ino - 1) / 32) * 32) * 128;
-    df_ext2_rd_block(pblk, &df_ext2_blk);
-    var plinks = load16(&df_ext2_blk + poff + 0x1A) & 0xFFFF;
-    store16(&df_ext2_blk + poff + 0x1A, plinks + 1);
-    if (df_ext2_wr_block(pblk, &df_ext2_blk) != 8) { return 0 - 1; }
+    df_ext2_iloc(parent_ino);
+    df_ext2_rd_block(df_ext2_iloc_blk, &df_ext2_blk);
+    var plinks = load16(&df_ext2_blk + df_ext2_iloc_off + 0x1A) & 0xFFFF;
+    store16(&df_ext2_blk + df_ext2_iloc_off + 0x1A, plinks + 1);
+    if (df_ext2_wr_block(df_ext2_iloc_blk, &df_ext2_blk) != 8) { return 0 - 1; }
 
-    # bg_used_dirs_count +1.
-    df_ext2_rd_block(1, &df_ext2_blk);
-    var ud = load16(&df_ext2_blk + 0x10) & 0xFFFF;
-    store16(&df_ext2_blk + 0x10, ud + 1);
-    if (df_ext2_wr_block(1, &df_ext2_blk) != 8) { return 0 - 1; }
+    # bg_used_dirs_count +1 for the group holding the NEW directory's inode.
+    df_ext2_arr_add(&df_ext2_gud, (ino - 1) / df_ext2_ipg, 1);
 
     if (df_ext2_persist_counts() != 0) { return 0 - 1; }
     return ino;
@@ -843,10 +1106,9 @@ fn df_ext2_mkdir(parent_ino, name_ptr, name_len) {
 # Look up `name` in directory `dir_ino` (single data block). Returns the child inode, or 0 if
 # not found. Uses df_ext2_ind as dir-block scratch.
 fn df_ext2_lookup(dir_ino, name_ptr, name_len) {
-    var pblk = df_ext2_itable + (dir_ino - 1) / 32;
-    var poff = ((dir_ino - 1) - ((dir_ino - 1) / 32) * 32) * 128;
-    df_ext2_rd_block(pblk, &df_ext2_blk);
-    var dir_block = load32(&df_ext2_blk + poff + 0x28);
+    df_ext2_iloc(dir_ino);
+    df_ext2_rd_block(df_ext2_iloc_blk, &df_ext2_blk);
+    var dir_block = load32(&df_ext2_blk + df_ext2_iloc_off + 0x28);
     df_ext2_rd_block(dir_block, &df_ext2_ind);
     var off = 0;
     while (off < 4096) {
@@ -870,31 +1132,115 @@ fn df_ext2_lookup(dir_ino, name_ptr, name_len) {
     return 0;
 }
 
-# Stage a file from src_fd into the ext2 root at absolute path dst_cstr (e.g. "/bin/agnsh"),
-# creating intermediate directories (single-block dirs). Returns 0 / -1.
-fn df_ext2_stage(dst_cstr, src_fd) {
+# Resolve `path` (absolute or relative; leading "./" / "/" and a trailing "/" are stripped),
+# mkdir_p'ing every parent directory, and set df_ext2_rp_parent / _base / _blen to the last
+# component (single-block dirs). Returns 0 / -1.
+fn df_ext2_resolve(path) {
     var cur = 2;                                # root inode
-    var i = 0;
-    if ((load8(dst_cstr) & 0xFF) == 0x2F) { i = 1; }
-    var start = i;
-    while (i < 4096) {
-        var c = load8(dst_cstr + i) & 0xFF;
-        if (c == 0x2F) {
+    var s = 0;
+    while ((load8(path + s) & 0xFF) == 0x2E && (load8(path + s + 1) & 0xFF) == 0x2F) { s = s + 2; }
+    while ((load8(path + s) & 0xFF) == 0x2F) { s = s + 1; }
+    var e = s;
+    while ((load8(path + e) & 0xFF) != 0) { e = e + 1; }        # strlen
+    while (e > s && (load8(path + e - 1) & 0xFF) == 0x2F) { e = e - 1; }   # strip trailing '/'
+    if (e <= s) {                                              # empty path == the root itself
+        df_ext2_rp_parent = 2; df_ext2_rp_base = path; df_ext2_rp_blen = 0;
+        return 0;
+    }
+    var start = s;
+    var i = s;
+    while (i < e) {
+        if ((load8(path + i) & 0xFF) == 0x2F) {
             var clen = i - start;
             if (clen > 0) {
-                var child = df_ext2_lookup(cur, dst_cstr + start, clen);
-                if (child == 0) { child = df_ext2_mkdir(cur, dst_cstr + start, clen); }
-                if (child < 0) { return 0 - 1; }
-                cur = child;
+                var ch = df_ext2_lookup(cur, path + start, clen);
+                if (ch == 0) { ch = df_ext2_mkdir(cur, path + start, clen); }
+                if (ch < 0) { return 0 - 1; }
+                cur = ch;
             }
             start = i + 1;
         }
-        if (c == 0) {
-            var flen = i - start;
-            if (flen == 0) { return 0 - 1; }
-            return df_ext2_add_file(cur, dst_cstr + start, flen, src_fd);
-        }
         i = i + 1;
     }
-    return 0 - 1;
+    df_ext2_rp_parent = cur;
+    df_ext2_rp_base = path + start;
+    df_ext2_rp_blen = e - start;
+    return 0;
 }
+
+# Stage a file from src_fd into the ext2 root at absolute path dst_cstr (e.g. "/bin/agnsh"),
+# creating intermediate directories. Returns 0 / -1.
+fn df_ext2_stage(dst_cstr, src_fd) {
+    if (df_ext2_resolve(dst_cstr) != 0) { return 0 - 1; }
+    if (df_ext2_rp_blen == 0) { return 0 - 1; }
+    return df_ext2_add_file(df_ext2_rp_parent, df_ext2_rp_base, df_ext2_rp_blen, src_fd);
+}
+
+# --- tar extraction into the ext2 root (via the shared sankoch tar cursor) ------------------
+# The ustar/v7 parser, PAX + GNU long names, checksum validation, envelope sniff + RAM decompress
+# (gzip/xz/bzip2/zstd), and path/symlink traversal safety all live in sankoch's tar.cyr (2.5.x).
+# agnova supplies only the EXT2 sink: resolve the path (auto-mkdir parents) then mkdir / add-file /
+# add-symlink. Unlike a source-tree extractor, a ROOTFS writer KEEPS absolute symlink targets
+# (/bin/sh -> /bin/agnsh — they resolve inside the installed root), so no absolute-symlink veto.
+
+# Bounded C-string length (for the tar symlink target).
+fn df_cstr_len_max(ptr, max) {
+    var i = 0;
+    while (i < max) {
+        if ((load8(ptr + i) & 0xFF) == 0) { return i; }
+        i = i + 1;
+    }
+    return max;
+}
+
+# Extract an in-memory archive (plain OR gzip/xz/bzip2/zstd — tar_open_auto sniffs + inflates)
+# into the ext2 root. Returns the entry count, or -1.
+fn df_ext2_untar_mem(buf, len) {
+    var cur = tar_open_auto(buf, len);
+    if (cur == 0) { return 0 - 1; }
+    var count = 0;
+    var r = tar_next(cur);
+    while (r == 1) {
+        var kind = tar_kind(cur);
+        if (df_ext2_resolve(tar_path(cur)) != 0) { return 0 - 1; }
+        if (kind == TAR_DIR) {
+            if (df_ext2_rp_blen > 0) {
+                var ch = df_ext2_lookup(df_ext2_rp_parent, df_ext2_rp_base, df_ext2_rp_blen);
+                if (ch == 0) {
+                    if (df_ext2_mkdir(df_ext2_rp_parent, df_ext2_rp_base, df_ext2_rp_blen) < 0) { return 0 - 1; }
+                }
+            }
+        } elif (kind == TAR_SYMLINK) {
+            if (df_ext2_rp_blen > 0) {
+                var link = tar_link(cur);
+                var tl = df_cstr_len_max(link, 4096);
+                var sl = df_ext2_add_symlink(df_ext2_rp_parent, df_ext2_rp_base, df_ext2_rp_blen, link, tl);
+                if (sl != 0) { return 0 - 1; }
+            }
+        } else {
+            if (df_ext2_rp_blen == 0) { return 0 - 1; }
+            df_ext2_src_set_mem(tar_data(cur), tar_size(cur));
+            var af = df_ext2_add_file_sz(df_ext2_rp_parent, df_ext2_rp_base, df_ext2_rp_blen, tar_size(cur));
+            if (af != 0) { return 0 - 1; }
+        }
+        count = count + 1;
+        r = tar_next(cur);
+    }
+    if (r < 0) { return 0 - 1; }
+    return count;
+}
+
+# Extract an archive from an open fd: read it whole into RAM, then hand to the cursor (which sniffs
+# the envelope). Returns entry count / -1.
+fn df_ext2_untar(tar_fd) {
+    var sz = syscall(SYS_LSEEK, tar_fd, 0, 2);
+    syscall(SYS_LSEEK, tar_fd, 0, 0);
+    if (sz <= 0) { return 0 - 1; }
+    var buf = alloc(sz);
+    if (df_read_fill(tar_fd, buf, sz) != sz) { return 0 - 1; }
+    return df_ext2_untar_mem(buf, sz);
+}
+
+# .tar.gz / .tar.xz / .tar.bz2 / .tar.zst all route through the same path now — tar_open_auto sniffs
+# + inflates. Named alias kept for the compressed-archive call sites.
+fn df_ext2_untar_gz(gz_fd) { return df_ext2_untar(gz_fd); }

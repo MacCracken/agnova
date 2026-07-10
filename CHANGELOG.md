@@ -6,6 +6,57 @@ This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Changed
+- **ext2 tar extraction now uses sankoch's shared tar cursor.** `df_ext2_untar` /
+  `df_ext2_untar_mem` dropped agnova's own ustar parser (~60 lines: `df_parse_octal`,
+  `df_tar_pad`, `df_src_skip`, `df_ext2_untar_core`, the header buffer) in favour of sankoch 2.5.x's
+  `tar_open_auto` + `tar_next` cursor — one implementation shared with takumi. agnova supplies only
+  the ext2 sink (`df_ext2_resolve` → `df_ext2_mkdir` / `df_ext2_add_file_sz` / `df_ext2_add_symlink`)
+  and, as a rootfs writer, keeps absolute symlink targets (they resolve inside the installed root).
+  **Bonus: `.tar.xz` / `.tar.bz2` / `.tar.zst` now extract into ext2** (the cursor sniffs + inflates
+  every envelope) — so the sovereign base-system install can consume `base-system.tar.zst`.
+  `scripts/untar-gz-smoke.sh` now proves all four compressed envelopes → ext2, e2fsck-clean +
+  byte-identical + symlinks preserved.
+
+### Added
+- **Multi-block-group ext2** — `df_format_ext2` now writes a fs of any size (groups of 32768
+  blocks, a full SB + GDT backup in every group — no sparse_super, so e2fsck verifies each).
+  Group-aware inode locator + block/inode allocators that skip per-group metadata; per-group
+  free-block / free-inode / used-dirs counters persisted into the GDT and re-synced to all backups
+  after every op. A 512 MiB root is 4 groups; a 1.5 GiB install root is 12 groups — both e2fsck-clean.
+- **Double-indirect files** — the file writer allocates data blocks one at a time (group-aware,
+  non-contiguous) and routes them through direct[0..11], a single-indirect block, and a
+  double-indirect tree (`i_block[13]`), so files up to ~4.29 GiB are supported (past the kernel
+  reader's 2 GiB `i_size` cap). A 9 MiB double-indirect file round-trips byte-identical.
+- **lost+found** — inode 11 is created as a proper directory at mkfs, linked from `/`.
+- **Symlinks** — `df_ext2_add_symlink` writes fast symlinks (target < 60 B stored inline in the
+  i_block area, `i_blocks=0`).
+- **tar (ustar) extraction** — `df_ext2_untar` populates the root from a tarball (regular files
+  incl. indirect, nested directories, symlinks), replacing the "loose file tree" assumption. A
+  shared path resolver (`df_ext2_resolve`) `mkdir -p`'s parents; a size-bounded streaming reader
+  stops exactly at each member (no over-read into padding).
+- **gzip (.tar.gz) extraction** — `df_ext2_untar_gz` inflates the archive in RAM via sankoch and
+  untars from memory (`df_ext2_untar_mem`) — no `gunzip`, no temp file, works on the agnos target.
+  New deps: `sankoch`, `thread`.
+- **Validation harnesses**: `scripts/ext2-format-smoke.sh` (multi-group + lost+found +
+  direct/single/double-indirect + deep-path staging), `scripts/untar-smoke.sh` (ustar files/dirs/
+  symlinks), `scripts/untar-gz-smoke.sh` (.tar.gz) — all checked by `e2fsck -fn` / `dumpe2fs` /
+  `debugfs` with byte-identical extraction. The arc-closer boot smoke confirms the multi-group
+  root still boots to `/bin/agnsh` on the real kernel.
+
+### Notes
+- **Triple-indirect (>4.29 GiB files)** is bounded by the AGNOS kernel's ext2 reader, which caps
+  `i_size` at 2 GiB (`agnos/kernel/core/ext2.cyr:220`) — double-indirect already exceeds that, so
+  larger files are moot until the kernel grows 64-bit `i_size` + `large_file`. Filed as a kernel
+  item (`agnos/docs/development/issues/2026-07-10-ext2-large-file-64bit-isize.md`).
+- **zstd tarballs** are not extractable: sankoch implements LZ4 / DEFLATE / zlib / gzip / bzip2 but
+  parks Zstandard, so no sovereign zstd decompressor exists yet. `.tar` and `.tar.gz` cover the
+  base-system need.
+- **LUKS root encryption** is a sigil (crypto-boundary) concern, not a disk-format one. sigil's
+  `luks.cyr` today drives `cryptsetup` (the Linux-host path); a *sovereign* in-process LUKS
+  (argon2id keyslot + AES-XTS sector layer + LUKS2 header, then wired into diskfmt's `df_write` /
+  `df_read` seam) is a real cross-repo security feature to be scoped in sigil.
+
 ## [0.6.0] - 2026-07-10 — sovereign ext2 root: agnova installs AGNOS natively and boots what it wrote
 
 Closes the AGNOS native-install arc. agnova now writes the **whole boot medium** — GPT + FAT32 ESP

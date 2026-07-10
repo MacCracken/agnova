@@ -1,0 +1,32 @@
+# untargz_proof.cyr — format a sovereign ext2 image, then populate its root by extracting a
+# GZIP-compressed ustar tarball (df_ext2_untar_gz: sankoch inflate in RAM -> untar from memory,
+# no temp file). e2fsck / debugfs validate the extracted tree. Driven by scripts/untar-gz-smoke.sh.
+#
+# Build: cyrius build tests/untargz_proof.cyr build/untargz_proof
+#
+# SPDX-License-Identifier: GPL-3.0-only
+
+include "src/diskfmt.cyr"
+
+fn main() {
+    var path = "/tmp/agnova-untargz.img";
+    if (df_open_target(path) != 0) { return 1; }
+    df_set_geometry(0, 0);
+    if (df_format_ext2(0, 524288) != 0) { df_close_target(); return 2; }   # 256 MiB
+
+    var gfd = df_open_src("/tmp/agnova-rootfs.tar.gz");
+    if (gfd < 0) { df_close_target(); return 3; }
+    var n = df_ext2_untar_gz(gfd);
+    df_close_src(gfd);
+    if (n < 0) { df_close_target(); return 4; }
+
+    df_close_target();
+    return 0;
+}
+
+fn _entry() {
+    var r = main();
+    syscall(SYS_EXIT, r);
+    return 0;
+}
+_entry();
