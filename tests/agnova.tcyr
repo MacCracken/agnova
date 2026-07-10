@@ -8,6 +8,8 @@
 # NEVER call execute_op or anything that touches disk from here.
 
 include "src/types.cyr"
+include "src/diskfmt.cyr"
+include "src/disk_backend.cyr"
 include "src/helpers.cyr"
 include "src/validation.cyr"
 include "src/partitioning.cyr"
@@ -1714,6 +1716,73 @@ fn t_mount_flags_from_options() {
     return 0;
 }
 
+# --- Phase-5 structured disk ops (native-backend seam) ---
+# The three new SystemOp variants that the native disk backend fulfills. Pure
+# construct/accessor round-trip — no execute, no disk (matches the file's rule).
+fn t_disk_ops_structured() {
+    # Tags follow OP_UNMOUNT=5 without colliding.
+    assert_eq(OP_PARTITION_DISK, 6, "partition tag = 6");
+    assert_eq(OP_FORMAT_FS, 7, "format tag = 7");
+    assert_eq(OP_STAGE_FILE, 8, "stage tag = 8");
+
+    var pop = op_partition_disk(12345);
+    assert_eq(tag(pop), OP_PARTITION_DISK, "partition op tag");
+    assert_eq(SystemOp_PartitionDisk_layout(payload(pop)), 12345, "partition layout round-trips");
+
+    var fop = op_format_fs(1, 999, str_from("/dev/sda1"));
+    assert_eq(tag(fop), OP_FORMAT_FS, "format op tag");
+    assert_eq(SystemOp_FormatFs_part_index(payload(fop)), 1, "format part_index round-trips");
+    assert_eq(SystemOp_FormatFs_spec(payload(fop)), 999, "format spec round-trips");
+    assert_eq(str_eq_cstr(SystemOp_FormatFs_device(payload(fop)), "/dev/sda1"), 1, "format device round-trips");
+
+    var sop = op_stage_file(str_from("/usr/lib/gnoboot/BOOTX64.EFI"), str_from("/EFI/BOOT/BOOTX64.EFI"), 0);
+    assert_eq(tag(sop), OP_STAGE_FILE, "stage op tag");
+    assert_eq(str_eq_cstr(SystemOp_StageFile_src_path(payload(sop)), "/usr/lib/gnoboot/BOOTX64.EFI"), 1, "stage src round-trips");
+    assert_eq(str_eq_cstr(SystemOp_StageFile_dst_fat_path(payload(sop)), "/EFI/BOOT/BOOTX64.EFI"), 1, "stage dst round-trips");
+    assert_eq(SystemOp_StageFile_target_fs(payload(sop)), 0, "stage target_fs round-trips");
+
+    # system_op_display renders each (non-blank), unlike the pre-port fall-through.
+    assert_eq(str_len(system_op_display(pop)) > 0, 1, "partition display non-empty");
+    assert_eq(str_len(system_op_display(fop)) > 0, 1, "format display non-empty");
+    assert_eq(str_len(system_op_display(sop)) > 0, 1, "stage display non-empty");
+    return 0;
+}
+
+# --- Phase-5 diskfmt: parametric GPT builders (RAM self-verify, no disk I/O) ---
+# Builds a GPT for a realistic 16 GiB disk (exercises fill-to-last-usable-LBA math),
+# then re-decodes every field. This is the vendored, gptwr-proven format core.
+fn t_diskfmt_gpt_ram() {
+    var N = 33554432;                       # 16 GiB / 512 = 33554432 sectors
+    var ESP_S = 2048;                       # 1 MiB alignment
+    var ESP_E = 2048 + 1048576 - 1;         # 512 MiB ESP
+    var RF_S  = ESP_E + 1;
+    var RF_E  = N - 34;                      # root fills to last usable LBA
+
+    df_gpt_zero_entries();
+    var esp_name = str_from("ESP");
+    df_gpt_set_entry(0, ESP_S, ESP_E, DF_TYPE_ESP_LO, DF_TYPE_ESP_HI, 0x1111, 0x2222, str_cstr(esp_name), 3);
+    var root_name = str_from("agnos-root");
+    df_gpt_set_entry(1, RF_S, RF_E, DF_TYPE_LINUX_FS_LO, DF_TYPE_LINUX_FS_HI, 0x3333, 0x4444, str_cstr(root_name), 10);
+    df_build_mbr(N);
+    df_build_gpt(N);
+
+    assert_eq(df_self_verify(N), 0, "GPT self-verify passes");
+    assert_eq(load64(&df_pea + 0), DF_TYPE_ESP_LO, "ESP type-GUID lo");
+    assert_eq(load64(&df_pea + 8), DF_TYPE_ESP_HI, "ESP type-GUID hi");
+    assert_eq(load64(&df_pea + 128 + 0), DF_TYPE_LINUX_FS_LO, "root type-GUID lo");
+    assert_eq(load64(&df_pea + 128 + 8), DF_TYPE_LINUX_FS_HI, "root type-GUID hi");
+    assert_eq(load64(&df_pea + 32), ESP_S, "ESP first LBA");
+    assert_eq(load64(&df_pea + 40), ESP_E, "ESP last LBA");
+    assert_eq(load64(&df_pea + 128 + 32), RF_S, "root first LBA");
+    assert_eq(load64(&df_pea + 128 + 40), RF_E, "root last LBA (fills to N-34)");
+    assert_eq(load8(&df_pea + 56) & 0xFF, 0x45, "ESP UTF-16 name[0] = 'E'");
+    assert_eq(load8(&df_pea + 57) & 0xFF, 0, "ESP UTF-16 name high byte = 0");
+    assert_eq(load8(&df_mbr + 450) & 0xFF, 0xEE, "protective MBR type 0xEE");
+    assert_eq(load8(&df_mbr + 510) & 0xFF, 0x55, "MBR sig 0x55");
+    assert_eq(load8(&df_mbr + 511) & 0xFF, 0xAA, "MBR sig 0xAA");
+    return 0;
+}
+
 # ============================================================
 # main — calls every test, prints summary, returns failure count
 # ============================================================
@@ -1880,6 +1949,10 @@ fn main() {
     t_iso_build_command_uefi();
     t_iso_build_command_bios();
     t_system_op_descriptors();
+
+    # Phase-5 native-backend seam
+    t_disk_ops_structured();
+    t_diskfmt_gpt_ram();
 
     return assert_summary();
 }

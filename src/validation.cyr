@@ -178,12 +178,19 @@ fn validate_config(cfg) {
         return Err(str_from("target device is not set"));
     }
 
-    # 2. Must start with /dev/
-    if (str_starts_with(dev, str_from("/dev/")) == 0) {
-        return Err(str_from("target device must start with /dev/"));
+    # 2. Must start with /dev/ — enforced for real devices (shell / native-block).
+    #    The native-file backend writes to a loopback IMAGE FILE (dev-box proving),
+    #    so the /dev/ requirement + the after-/dev/ suffix check are skipped for it;
+    #    the ".." / shell-dangerous-char checks below still apply to any path.
+    var require_dev = 1;
+    if (get_disk_backend() == DISK_BACKEND_NATIVE_FILE) { require_dev = 0; }
+    if (require_dev == 1) {
+        if (str_starts_with(dev, str_from("/dev/")) == 0) {
+            return Err(str_from("target device must start with /dev/"));
+        }
     }
 
-    # 3. No "..", and no shell-dangerous chars
+    # 3. No "..", and no shell-dangerous chars (always enforced)
     if (str_contains_cstr(dev, "..") == 1) {
         return Err(str_from("target device path contains invalid characters"));
     }
@@ -191,13 +198,15 @@ fn validate_config(cfg) {
         return Err(str_from("target device path contains invalid characters"));
     }
 
-    # 4. Suffix after /dev/ must be alphanumeric, /, -, _
-    if (dev_len <= 5) {
-        return Err(str_from("target device path contains invalid characters after /dev/"));
-    }
-    var suffix = str_substr(dev, 5, dev_len);
-    if (_all_dev_path_chars(suffix) == 0) {
-        return Err(str_from("target device path contains invalid characters after /dev/"));
+    # 4. Suffix after /dev/ must be alphanumeric, /, -, _ (real devices only)
+    if (require_dev == 1) {
+        if (dev_len <= 5) {
+            return Err(str_from("target device path contains invalid characters after /dev/"));
+        }
+        var suffix = str_substr(dev, 5, dev_len);
+        if (_all_dev_path_chars(suffix) == 0) {
+            return Err(str_from("target device path contains invalid characters after /dev/"));
+        }
     }
 
     # 5. Must have at least one partition

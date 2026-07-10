@@ -224,6 +224,11 @@ fn execute_op(op) {
     if (t == OP_SYMLINK) { return _exec_symlink(p); }
     if (t == OP_MOUNT) { return _exec_mount(p); }
     if (t == OP_UNMOUNT) { return _exec_unmount(p); }
+    # Structured disk ops route to the native backend (Phase-5). The shell path
+    # never emits these, so on a default (shell) run these branches are inert.
+    if (t == OP_PARTITION_DISK) { return native_partition(op); }
+    if (t == OP_FORMAT_FS) { return native_format(op); }
+    if (t == OP_STAGE_FILE) { return native_stage(op); }
     return 0 - 1;
 }
 

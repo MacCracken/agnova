@@ -1,0 +1,111 @@
+# disk_backend.cyr — agnova native disk backend (sovereign disk-shaping, no shell-out).
+#
+# Copyright (C) 2026 the AGNOS authors.
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Phase-5 of the AGNOS native-install arc. agnova's default (Linux-hosted) path
+# shells out to parted/mkfs.vfat/cp via OP_COMMAND; this native backend instead
+# fulfills the structured disk ops (OP_PARTITION_DISK / OP_FORMAT_FS / OP_STAGE_FILE)
+# entirely in-process — building a GPT table + FAT32 ESP + staging the bootloader by
+# raw sector I/O (the gptwr-proven format logic), with NO fork/exec. It is selected
+# by `--disk-backend` and dispatched from execute_op (executor.cyr).
+#
+# Two sector primitives share this backend, differing ONLY in how a sector is read/
+# written:
+#   NATIVE_FILE  — file-offset sys_open/lseek/read/write into a loopback image (the
+#                  Linux-host proving target: exercises 100% of the GPT/FAT logic on
+#                  the dev box, validated by sgdisk/fsck.fat/mcopy; no agnos needed).
+#   NATIVE_BLOCK — sys_blk_* behind the aegis arm-gate (the agnos target).
+# The shell path (DISK_BACKEND_SHELL) stays byte-identical and is the proven reference.
+#
+# Bite 1 (this file's initial form): the seam only — backend selector + stubs that
+# return E_NOT_IMPL. The GPT/FAT/staging implementation lands in Bites 2-6 (the shared
+# format lib + the injected sector primitive).
+
+var DISK_BACKEND_SHELL = 0;
+var DISK_BACKEND_NATIVE_FILE = 1;
+var DISK_BACKEND_NATIVE_BLOCK = 2;
+
+# Process-global selected backend (set by --disk-backend; default = shell).
+var disk_backend = 0;
+
+# Sentinel returned by the native handlers until they are implemented. Non-zero so
+# execute_phase treats it as a (fatal) op failure — a clean, no-crash "not yet native".
+var E_NOT_IMPL = 0 - 38;
+
+fn set_disk_backend(b) {
+    disk_backend = b;
+    return 0;
+}
+
+fn get_disk_backend() {
+    return disk_backend;
+}
+
+# --- Native plan --------------------------------------------------------------------
+# On a native backend the shell planners (parted/mkfs/cp OP_COMMANDs) are NOT used;
+# instead we emit the structured disk ops and SUPPRESS the phases that cannot run
+# natively (mount / base-tarball / packages / grub — no fork/exec on agnos), so the
+# plan runs to the disk-shaping phases without aborting. ESP-only slice (Phase-5 scope).
+fn plan_native_disk_ops(cfg, target_root) {
+    var plans = vec_new();
+    var disk = InstallConfig_disk(cfg);
+
+    # PHASE_PARTITION_DISK — one structured op carrying the whole DiskLayout.
+    var pops = vec_new();
+    vec_push(pops, op_partition_disk(disk));
+    vec_push(plans, phase_ops_new(PHASE_PARTITION_DISK, str_from("Partition disk (native GPT)"), pops));
+
+    # Bites 4-5 append: PHASE_FORMAT_DISK (OP_FORMAT_FS for the ESP) and
+    # PHASE_INSTALL_BOOTLOADER (OP_STAGE_FILE for BOOTX64.EFI + the kernel).
+    return plans;
+}
+
+# --- Native op handlers ---------------------------------------------------------------
+# Each receives the full SystemOp. The GPT/FAT/staging is built by the vendored diskfmt
+# (df_*) against the df sector primitive (file-offset today; sys_blk_* on agnos later).
+
+# OP_PARTITION_DISK: write a GPT (protective MBR + primary/backup header + entry array)
+# for the DiskLayout onto target_device. Default 2-partition layout: a sized ESP
+# (partition 0) + a root that fills to the last usable LBA (partition 1).
+fn native_partition(op) {
+    var layout = SystemOp_PartitionDisk_layout(payload(op));
+    var dev = DiskLayout_target_device(layout);
+    var parts = DiskLayout_partitions(layout);
+    if (vec_len(parts) < 2) { return 0 - 1; }
+
+    var fd = sys_open(str_cstr(dev), O_RDWR, 0);
+    if (fd < 0) { return 0 - 1; }
+    df_set_fd(fd);
+
+    # Disk size in sectors via SEEK_END (works on both an image file and a block device).
+    var n = syscall(SYS_LSEEK, fd, 0, 2) / 512;
+    if (n < 4096) { sys_close(fd); return 0 - 1; }
+
+    # Geometry: ESP at 1 MiB, sized from partition 0; root fills to the last usable LBA.
+    var esp_spec = vec_get(parts, 0);
+    var esp_s = 2048;
+    var esp_e = esp_s + PartitionSpec_size_mb(esp_spec) * 2048 - 1;   # MiB -> 512B sectors
+    var rf_s = esp_e + 1;
+    var rf_e = n - 34;
+    if (rf_e <= rf_s) { sys_close(fd); return 0 - 1; }               # ESP too big for this disk
+
+    df_gpt_zero_entries();
+    var esp_name = str_from("ESP");
+    df_gpt_set_entry(0, esp_s, esp_e, DF_TYPE_ESP_LO, DF_TYPE_ESP_HI, 0x4553501D2A7328C1, 0x00A0C93EC93BBA4B, str_cstr(esp_name), 3);
+    var root_name = str_from("agnos-root");
+    df_gpt_set_entry(1, rf_s, rf_e, DF_TYPE_LINUX_FS_LO, DF_TYPE_LINUX_FS_HI, 0x524F4F540FC63DAF, 0x3D69D8477DE48E79, str_cstr(root_name), 10);
+    df_build_mbr(n);
+    df_build_gpt(n);
+    var rc = df_write_gpt(n);
+    sys_close(fd);
+    return rc;
+}
+
+fn native_format(op) {
+    return E_NOT_IMPL;
+}
+
+fn native_stage(op) {
+    return E_NOT_IMPL;
+}

@@ -1,0 +1,201 @@
+# diskfmt.cyr — sovereign GPT + FAT32 on-disk format builders (agnova-vendored).
+#
+# Copyright (C) 2026 the AGNOS authors.
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# VENDORED (Phase-5 stopgap) from the gptwr proof tool (agnos/blk-test/gptwr.cyr),
+# which proved this exact byte layout end-to-end: GPT accepted by sgdisk, FAT32 by
+# fsck.fat, files byte-identical via mcopy, and a tool-built disk booted to a shell.
+# This copy is PARAMETRIC where gptwr hardcoded proof-tool constants (the FAT volume
+# label, the partition entry set, the disk geometry). It is expected to graduate into
+# its own Cyrius system-lib once the native backend is proven with real runs.
+#
+# Byte offsets/CRCs are derived from the agnos kernel's OWN readers (gpt.cyr / fatfs.cyr)
+# — the type-GUIDs are written as the kernel's LO/HI u64 constants via store64, which
+# reproduces the mixed-endian on-disk bytes for free and stays bit-consistent with the
+# reader. DO NOT "simplify" the split FstClusHI@20 / FstClusLO@26 into one store32 (it
+# clobbers WrtTime@22); DO NOT drop the CountOfClusters>=65525 FAT32 guard.
+#
+# Sector I/O is a thin primitive (df_write/df_read) that later gains a #ifdef agnos arm
+# (sys_blk_*); today it is file-offset I/O into an open image fd (df_fd) — the Linux
+# proving path, exercising 100% of the format logic on the dev box.
+
+# --- GPT partition-type GUIDs (LE u64 views of the on-disk 16 bytes; == kernel gpt.cyr) ---
+var DF_TYPE_ESP_LO      = 0x11D2F81FC12A7328;   # ESP:      C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+var DF_TYPE_ESP_HI      = 0x3BC93EC9A0004BBA;
+var DF_TYPE_LINUX_FS_LO = 0x477284830FC63DAF;   # Linux FS: 0FC63DAF-8483-4772-8E79-3D69D8477DE4
+var DF_TYPE_LINUX_FS_HI = 0xE47D47D8693D798E;
+
+# Fixed deterministic disk/unique GUIDs (nonzero + distinct; values arbitrary).
+var DF_DISK_GUID_LO = 0x4E5347414E4F1D2A;
+var DF_DISK_GUID_HI = 0x11E6A5D0C7B3F8A0;
+
+# --- In-RAM structure buffers (module-global var X[N] = N*8 bytes) ---
+var df_mbr[64];    #   512 B — protective MBR (LBA 0)
+var df_hdr[64];    #   512 B — primary GPT header (LBA 1)
+var df_pea[2048];  # 16384 B — partition entry array (128 x 128 B)
+var df_bhdr[64];   #   512 B — backup GPT header (LBA N-1)
+
+# --- Sector I/O primitive (Linux file-offset today; agnos sys_blk_* in the native-block bite) ---
+var df_fd = 0;     # the open image fd for NATIVE_FILE
+
+fn df_set_fd(fd) { df_fd = fd; return 0; }
+
+# Write `nsec` sectors from buf at LBA. Returns nsec on success, -1 otherwise.
+# (No sys_lseek wrapper in the x86_64 Linux lib — call SYS_LSEEK directly, whence 0 = SEEK_SET.)
+fn df_write(lba, buf, nsec) {
+    syscall(SYS_LSEEK, df_fd, lba * 512, 0);
+    var w = sys_write(df_fd, buf, nsec * 512);
+    if (w == (nsec * 512)) { return nsec; }
+    return 0 - 1;
+}
+
+# Read `nsec` sectors into buf at LBA. Returns nsec on success, -1 otherwise.
+fn df_read(lba, buf, nsec) {
+    syscall(SYS_LSEEK, df_fd, lba * 512, 0);
+    var r = sys_read(df_fd, buf, nsec * 512);
+    if (r == (nsec * 512)) { return nsec; }
+    return 0 - 1;
+}
+
+# --- CRC-32/ISO-HDLC (poly 0xEDB88320) — gates every GPT CRC ---
+fn df_crc32(buf, len) {
+    var crc = 0xFFFFFFFF;
+    var i = 0;
+    while (i < len) {
+        crc = crc ^ (load8(buf + i) & 0xFF);
+        var k = 0;
+        while (k < 8) {
+            if ((crc & 1) == 1) { crc = (crc >> 1) ^ 0xEDB88320; }
+            else               { crc = crc >> 1; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+}
+
+# Zero `nbytes` (multiple of 8) of a buffer.
+fn df_zero(buf, nbytes) {
+    var i = 0;
+    while (i < nbytes) { store64(buf + i, 0); i = i + 8; }
+    return 0;
+}
+
+# --- Protective MBR (UEFI 5.2.3) ---
+fn df_build_mbr(n) {
+    df_zero(&df_mbr, 512);
+    store8(&df_mbr + 446, 0x00);
+    store8(&df_mbr + 447, 0x00); store8(&df_mbr + 448, 0x02); store8(&df_mbr + 449, 0x00);
+    store8(&df_mbr + 450, 0xEE);                     # GPT protective type
+    store8(&df_mbr + 451, 0xFF); store8(&df_mbr + 452, 0xFF); store8(&df_mbr + 453, 0xFF);
+    store32(&df_mbr + 454, 1);                       # first LBA
+    var sz = n - 1;
+    if (sz > 0xFFFFFFFF) { sz = 0xFFFFFFFF; }
+    store32(&df_mbr + 458, sz);
+    store8(&df_mbr + 510, 0x55); store8(&df_mbr + 511, 0xAA);
+    return 0;
+}
+
+# --- Partition entry array ---
+# Zero the whole 128-entry array (call before setting entries).
+fn df_gpt_zero_entries() {
+    df_zero(&df_pea, 16384);
+    return 0;
+}
+
+# Set partition entry `idx`: type GUID (lo/hi), unique GUID (lo/hi), first/last LBA, and an
+# ASCII name written as UTF-16LE at offset 56 (for parted-print parity). Attributes = 0.
+fn df_gpt_set_entry(idx, first, last, type_lo, type_hi, uniq_lo, uniq_hi, name_ptr, name_len) {
+    var e = &df_pea + idx * 128;
+    store64(e + 0, type_lo);
+    store64(e + 8, type_hi);
+    store64(e + 16, uniq_lo);
+    store64(e + 24, uniq_hi);
+    store64(e + 32, first);
+    store64(e + 40, last);
+    store64(e + 48, 0);                              # attributes
+    var i = 0;
+    while (i < name_len) {                           # ASCII -> UTF-16LE
+        store8(e + 56 + i * 2, load8(name_ptr + i) & 0xFF);
+        store8(e + 56 + i * 2 + 1, 0);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# --- Primary + backup GPT header (entries must already be in df_pea) ---
+fn df_build_gpt(n) {
+    df_zero(&df_hdr, 512);
+    store32(&df_hdr + 0,  0x20494645);               # "EFI "
+    store32(&df_hdr + 4,  0x54524150);               # "PART"
+    store32(&df_hdr + 8,  0x00010000);               # revision 1.0
+    store32(&df_hdr + 12, 92);                       # header size
+    store32(&df_hdr + 16, 0);                        # header CRC (computed below)
+    store32(&df_hdr + 20, 0);                        # reserved
+    store64(&df_hdr + 24, 1);                        # MyLBA
+    store64(&df_hdr + 32, n - 1);                    # AlternateLBA
+    store64(&df_hdr + 40, 34);                       # first usable LBA
+    store64(&df_hdr + 48, n - 34);                   # last usable LBA
+    store64(&df_hdr + 56, DF_DISK_GUID_LO);
+    store64(&df_hdr + 64, DF_DISK_GUID_HI);
+    store64(&df_hdr + 72, 2);                        # partition entry array LBA
+    store32(&df_hdr + 80, 128);                      # num entries
+    store32(&df_hdr + 84, 128);                      # entry size
+    var arr_crc = df_crc32(&df_pea, 16384);
+    store32(&df_hdr + 88, arr_crc);
+    var hc = df_crc32(&df_hdr, 92);
+    store32(&df_hdr + 16, hc);
+
+    # Backup header: swap My/Alternate LBAs, move the entry-array LBA to the tail, recompute CRC.
+    var i = 0;
+    while (i < 512) { store64(&df_bhdr + i, load64(&df_hdr + i)); i = i + 8; }
+    store64(&df_bhdr + 24, n - 1);
+    store64(&df_bhdr + 32, 1);
+    store64(&df_bhdr + 72, n - 33);
+    store32(&df_bhdr + 16, 0);
+    var bc = df_crc32(&df_bhdr, 92);
+    store32(&df_bhdr + 16, bc);
+    return 0;
+}
+
+# Write the built GPT (protective MBR + primary header + array + backup array + backup header)
+# to the disk at absolute LBAs. Returns 0 / -1.
+fn df_write_gpt(n) {
+    if (df_write(0, &df_mbr, 1) != 1)          { return 0 - 1; }
+    if (df_write(1, &df_hdr, 1) != 1)          { return 0 - 1; }
+    if (df_write(2, &df_pea, 32) != 32)        { return 0 - 1; }
+    if (df_write(n - 33, &df_pea, 32) != 32)   { return 0 - 1; }
+    if (df_write(n - 1, &df_bhdr, 1) != 1)     { return 0 - 1; }
+    return 0;
+}
+
+# Geometry-generic self-verify of the in-RAM GPT (re-decode + recompute CRCs). Returns 0 on
+# pass, a small nonzero diag code otherwise. Does NOT assume a specific partition set.
+fn df_self_verify(n) {
+    if (load32(&df_hdr + 0) != 0x20494645) { return 90; }
+    if (load32(&df_hdr + 4) != 0x54524150) { return 90; }
+    if (load32(&df_hdr + 12) != 92)        { return 89; }
+    if (load64(&df_hdr + 24) != 1)         { return 89; }
+    if (load64(&df_hdr + 32) != (n - 1))   { return 89; }
+    if (load64(&df_hdr + 40) != 34)        { return 89; }
+    if (load64(&df_hdr + 48) != (n - 34))  { return 89; }
+    if (load64(&df_hdr + 72) != 2)         { return 89; }
+    if (load32(&df_hdr + 80) != 128)       { return 89; }
+    if (load32(&df_hdr + 84) != 128)       { return 89; }
+    var saved = load32(&df_hdr + 16);
+    store32(&df_hdr + 16, 0);
+    var hc = df_crc32(&df_hdr, 92);
+    store32(&df_hdr + 16, saved);
+    if (hc != saved) { return 88; }
+    if (df_crc32(&df_pea, 16384) != load32(&df_hdr + 88)) { return 87; }
+    if (load64(&df_bhdr + 24) != (n - 1)) { return 86; }
+    if (load64(&df_bhdr + 32) != 1)       { return 86; }
+    if (load64(&df_bhdr + 72) != (n - 33)) { return 86; }
+    var bsaved = load32(&df_bhdr + 16);
+    store32(&df_bhdr + 16, 0);
+    var bc = df_crc32(&df_bhdr, 92);
+    store32(&df_bhdr + 16, bsaved);
+    if (bc != bsaved) { return 86; }
+    return 0;
+}

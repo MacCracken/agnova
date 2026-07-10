@@ -7,6 +7,8 @@
 # both, orchestrator on those, executor on orchestrator, cli on all.
 
 include "src/types.cyr"
+include "src/diskfmt.cyr"
+include "src/disk_backend.cyr"
 include "src/helpers.cyr"
 include "src/validation.cyr"
 include "src/partitioning.cyr"

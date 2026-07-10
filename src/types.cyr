@@ -176,6 +176,12 @@ enum SystemOpTag {
     OP_SYMLINK = 3;
     OP_MOUNT = 4;
     OP_UNMOUNT = 5;
+    # Structured disk-shaping ops (Phase-5 native-backend port). The shell
+    # backend never emits these (it emits OP_COMMAND parted/mkfs.*/cp); the
+    # native disk backend (disk_backend.cyr) fulfills them via sector I/O.
+    OP_PARTITION_DISK = 6;
+    OP_FORMAT_FS = 7;
+    OP_STAGE_FILE = 8;
 }
 
 # --- Variant: Command --- args: vec<Str>; stdin empty Str == None
@@ -276,6 +282,51 @@ fn op_unmount(mount_point) {
     return tagged_new(OP_UNMOUNT, p);
 }
 
+# --- Variant: PartitionDisk --- carries the DiskLayout to write (GPT + MBR).
+#derive(accessors)
+struct SystemOp_PartitionDisk {
+    layout;
+}
+
+fn op_partition_disk(layout) {
+    var p = alloc(sizeof(SystemOp_PartitionDisk));
+    store64(p, layout);
+    return tagged_new(OP_PARTITION_DISK, p);
+}
+
+# --- Variant: FormatFs --- format partition `part_index` per `spec` on `device`.
+#derive(accessors)
+struct SystemOp_FormatFs {
+    part_index;
+    spec;
+    device: Str;
+}
+
+fn op_format_fs(part_index, spec, device) {
+    var p = alloc(sizeof(SystemOp_FormatFs));
+    store64(p, part_index);
+    store64(p + 8, spec);
+    store64(p + 16, device);
+    return tagged_new(OP_FORMAT_FS, p);
+}
+
+# --- Variant: StageFile --- copy a source file into the FAT at dst_fat_path.
+# target_fs selects the partition/filesystem to stage into (the ESP).
+#derive(accessors)
+struct SystemOp_StageFile {
+    src_path: Str;
+    dst_fat_path: Str;
+    target_fs;
+}
+
+fn op_stage_file(src_path, dst_fat_path, target_fs) {
+    var p = alloc(sizeof(SystemOp_StageFile));
+    store64(p, src_path);
+    store64(p + 8, dst_fat_path);
+    store64(p + 16, target_fs);
+    return tagged_new(OP_STAGE_FILE, p);
+}
+
 # Human-facing one-line summary of a SystemOp.
 # Mirrors the rust-old `impl fmt::Display for SystemOp` (types.rs:524-544)
 # byte-for-byte. The CLI's --verbose dump uses its own multi-line format
@@ -328,6 +379,22 @@ fn system_op_display(op) {
     if (t == OP_UNMOUNT) {
         str_builder_add_cstr(sb, "umount ");
         str_builder_add(sb, SystemOp_Unmount_mount_point(p));
+        return str_builder_build(sb);
+    }
+    if (t == OP_PARTITION_DISK) {
+        str_builder_add_cstr(sb, "partition disk (GPT)");
+        return str_builder_build(sb);
+    }
+    if (t == OP_FORMAT_FS) {
+        str_builder_add_cstr(sb, "format ");
+        str_builder_add(sb, SystemOp_FormatFs_device(p));
+        return str_builder_build(sb);
+    }
+    if (t == OP_STAGE_FILE) {
+        str_builder_add_cstr(sb, "stage ");
+        str_builder_add(sb, SystemOp_StageFile_src_path(p));
+        str_builder_add_cstr(sb, " -> ");
+        str_builder_add(sb, SystemOp_StageFile_dst_fat_path(p));
         return str_builder_build(sb);
     }
     return str_builder_build(sb);

@@ -31,6 +31,7 @@ var FLAG_VERBOSE = 0;
 var FLAG_IMEANIT = 0;
 var FLAG_UNTIL = 0;
 var FLAG_HELP = 0;
+var FLAG_DISK_BACKEND = 0;
 
 fn _build_flags() {
     var h = flags_new();
@@ -48,7 +49,17 @@ fn _build_flags() {
     FLAG_IMEANIT    = flags_add_bool(h,   0, "i-mean-it",   0,        "required to actually execute (DESTRUCTIVE)");
     FLAG_UNTIL      = flags_add_str(h,    0, "until",       0,        "execute: stop after this phase (e.g. mount)");
     FLAG_HELP       = flags_add_bool(h,   0, "help",        0,        "print this help");
+    FLAG_DISK_BACKEND = flags_add_str(h,  0, "disk-backend", "shell", "shell|native-file|native-block (native = sovereign sector I/O, no shell-out)");
     return h;
+}
+
+# Parse --disk-backend string → DISK_BACKEND_* constant. Default shell on unknown.
+fn _parse_disk_backend(cstr_be) {
+    if (cstr_be == 0) { return DISK_BACKEND_SHELL; }
+    var be = str_from(cstr_be);
+    if (str_eq_cstr(be, "native-file") == 1)  { return DISK_BACKEND_NATIVE_FILE; }
+    if (str_eq_cstr(be, "native-block") == 1) { return DISK_BACKEND_NATIVE_BLOCK; }
+    return DISK_BACKEND_SHELL;
 }
 
 # Parse mode string → InstallMode enum. Default desktop on unknown.
@@ -162,6 +173,7 @@ fn _print_help() {
     println("    -v, --verbose            Print every op, not just per-phase counts");
     println("        --i-mean-it          Required to actually execute (DESTRUCTIVE)");
     println("        --until PHASE        execute: stop after PHASE (partition|format|mount|base|...)");
+    println("        --disk-backend B     shell|native-file|native-block (native = sovereign sector I/O)");
     println("        --help               Print this help");
     return 0;
 }
@@ -183,6 +195,9 @@ fn _op_kind_str(op) {
     if (t == OP_SYMLINK) { return "Symlink"; }
     if (t == OP_MOUNT) { return "Mount"; }
     if (t == OP_UNMOUNT) { return "Umount"; }
+    if (t == OP_PARTITION_DISK) { return "Partition"; }
+    if (t == OP_FORMAT_FS) { return "Format"; }
+    if (t == OP_STAGE_FILE) { return "Stage"; }
     return "?";
 }
 
@@ -241,6 +256,20 @@ fn _print_op(idx, total, op) {
     }
     if (t == OP_UNMOUNT) {
         str_println(SystemOp_Unmount_mount_point(p));
+    }
+    if (t == OP_PARTITION_DISK) {
+        println("(GPT + FAT ESP)");
+    }
+    if (t == OP_FORMAT_FS) {
+        str_print(SystemOp_FormatFs_device(p));
+        print(" part ", 6);
+        fmt_int(SystemOp_FormatFs_part_index(p));
+        println("");
+    }
+    if (t == OP_STAGE_FILE) {
+        str_print(SystemOp_StageFile_src_path(p));
+        print(" -> ", 4);
+        str_println(SystemOp_StageFile_dst_fat_path(p));
     }
     return 0;
 }
@@ -423,7 +452,14 @@ fn _cmd_execute(h) {
     if (target_cstr != 0) { target_str = str_from(target_cstr); }
 
     var inst = agnova_installer_new(cfg, passphrase);
-    var plans = full_execution_plan(cfg, target_str, passphrase);
+    # Native backends run the structured disk-op plan (partition/format/stage); the
+    # shell backend runs the full parted/mkfs/cp OP_COMMAND plan (byte-identical to before).
+    var plans = 0;
+    if (get_disk_backend() == DISK_BACKEND_SHELL) {
+        plans = full_execution_plan(cfg, target_str, passphrase);
+    } else {
+        plans = plan_native_disk_ops(cfg, target_str);
+    }
 
     var until_phase = _parse_until_phase(flags_get_str(h, FLAG_UNTIL));
 
@@ -503,6 +539,9 @@ fn cli_main() {
         _print_help();
         return 0;
     }
+
+    # Select the disk backend for this run (default shell = unchanged behavior).
+    set_disk_backend(_parse_disk_backend(flags_get_str(h, FLAG_DISK_BACKEND)));
 
     var pcount = flags_positional_count(h);
     if (pcount == 0) {
