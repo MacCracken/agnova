@@ -36,27 +36,57 @@ var df_hdr[64];    #   512 B — primary GPT header (LBA 1)
 var df_pea[2048];  # 16384 B — partition entry array (128 x 128 B)
 var df_bhdr[64];   #   512 B — backup GPT header (LBA N-1)
 
-# --- Sector I/O primitive (Linux file-offset today; agnos sys_blk_* in the native-block bite) ---
-var df_fd = 0;     # the open image fd for NATIVE_FILE
+# --- Target-disk I/O — the ONE target-gated seam ---------------------------------------
+# Linux (NATIVE_FILE): a file / loop-device fd + file-offset lseek/read/write (dev-box proving).
+# agnos (NATIVE_BLOCK): the arm-gated block layer (sys_blk_*), device selected by enumerated tag.
+# Everything else in diskfmt/disk_backend calls df_open_target/df_target_sectors/df_write/
+# df_read/df_close_target/df_open_src and is fully target-agnostic.
 
-fn df_set_fd(fd) { df_fd = fd; return 0; }
-
-# Write `nsec` sectors from buf at LBA. Returns nsec on success, -1 otherwise.
-# (No sys_lseek wrapper in the x86_64 Linux lib — call SYS_LSEEK directly, whence 0 = SEEK_SET.)
+#ifndef CYRIUS_TARGET_AGNOS
+var df_fd = 0;     # open target fd (image file or loop device)
+fn df_open_target(dev_cstr) {
+    df_fd = sys_open(dev_cstr, O_RDWR, 0);     # Linux sys_open(path, flags, mode)
+    if (df_fd < 0) { return 0 - 1; }
+    return 0;
+}
+fn df_close_target() { sys_close(df_fd); return 0; }
+fn df_target_sectors() { return syscall(SYS_LSEEK, df_fd, 0, 2) / 512; }   # SEEK_END size / 512
 fn df_write(lba, buf, nsec) {
     syscall(SYS_LSEEK, df_fd, lba * 512, 0);
-    var w = sys_write(df_fd, buf, nsec * 512);
-    if (w == (nsec * 512)) { return nsec; }
+    if (sys_write(df_fd, buf, nsec * 512) == (nsec * 512)) { return nsec; }
     return 0 - 1;
 }
-
-# Read `nsec` sectors into buf at LBA. Returns nsec on success, -1 otherwise.
 fn df_read(lba, buf, nsec) {
     syscall(SYS_LSEEK, df_fd, lba * 512, 0);
-    var r = sys_read(df_fd, buf, nsec * 512);
-    if (r == (nsec * 512)) { return nsec; }
+    if (sys_read(df_fd, buf, nsec * 512) == (nsec * 512)) { return nsec; }
     return 0 - 1;
 }
+# Source file (the payload being staged) — Linux sys_open(path, flags, mode); O_RDONLY = 0.
+fn df_open_src(path_cstr) { return sys_open(path_cstr, 0, 0); }
+#endif
+
+#ifdef CYRIUS_TARGET_AGNOS
+var df_h = 0;         # armed RW block handle
+var df_benum[24];     # enum entries scratch (192 B = 8*24; module-global var[N]=8N)
+var df_binfo[2];      # {capacity_lbas, lba_bytes}
+var DF_BLK_RW_ARM_MAGIC = 0x424C4B5F5257;
+fn df_open_target(dev_cstr) {
+    if (sys_blk_enum(&df_benum, 192) < 1) { return 0 - 1; }   # single active disk
+    var tag = load64(&df_benum);
+    sys_blk_open(0, DF_BLK_RW_ARM_MAGIC);                     # arm the capability gate
+    df_h = sys_blk_open(tag, 1);                              # RW handle
+    if (df_h < 0) { return 0 - 1; }
+    return 0;
+}
+fn df_close_target() { sys_blk_close(df_h); return 0; }
+fn df_target_sectors() { sys_blk_info(df_h, &df_binfo); return load64(&df_binfo); }   # capacity_lbas
+fn df_write(lba, buf, nsec) { return sys_blk_write(df_h, lba, buf, nsec); }
+fn df_read(lba, buf, nsec)  { return sys_blk_read(df_h, lba, buf, nsec); }
+# Source file — agnos sys_open(name, namelen, flags); flags 0 = read.
+fn df_open_src(path_cstr) { return sys_open(path_cstr, strlen(path_cstr), 0); }
+#endif
+
+fn df_close_src(fd) { return sys_close(fd); }
 
 # --- CRC-32/ISO-HDLC (poly 0xEDB88320) — gates every GPT CRC ---
 fn df_crc32(buf, len) {
