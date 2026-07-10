@@ -6,6 +6,28 @@ This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Added
+- **Sovereign ext2 root writer** (`src/diskfmt.cyr`) — a journal-less ext2 mkfs + populate engine,
+  so agnova now writes the **root filesystem** natively, not just the ESP. Classic ext2 (4096-byte
+  blocks, single block-group, 128-byte dynamic-rev inodes, `FILETYPE` feature only, no journal/csum):
+  `df_format_ext2` (empty fs), `df_ext2_add_file` (direct + single-indirect, ~4 MiB cap),
+  `df_ext2_mkdir` (nested dirs, parent-link + `used_dirs` accounting), `df_ext2_lookup` +
+  `df_ext2_stage` (absolute-path staging, intermediate dirs auto-created). Every field validated by
+  the reference `e2fsck -fn` / `dumpe2fs` / `debugfs`, and staged files proven byte-identical.
+- **`native_format` ext2 dispatch** — `FS_EXT4` (the root) now formats a sovereign journal-less
+  ext2 (the kernel reads it either way) instead of returning `E_NOT_IMPL`; `FS_VFAT` still → FAT32,
+  `xfs`/`btrfs` still fall to the shell path. **`native_stage` root arm** (`target_fs=1`) streams a
+  file into the ext2 root via `df_ext2_stage`. The native plan now emits a root-format op +
+  a `PHASE_INSTALL_BASE` op staging `/bin/agnsh` (source `--agnsh-src`).
+- **`--agnsh-src`** flag (base-system payload staged into the ext2 root).
+- **Full-native install proof** (`scripts/native-disk-smoke.sh`, extended): one `agnova execute`
+  writes GPT + FAT32 ESP + ext2 root + all staging with **no** `parted`/`mkfs.fat`/`mkfs.ext2`/`mcopy`
+  — validated by `sgdisk`, `fsck.fat` + `mcopy`, and `e2fsck` + `debugfs` (root clean, `/bin/agnsh`
+  byte-identical).
+- **Arc-closer boot proof** (`agnos/scripts/agnova-boot-smoke.sh`): a production kernel boots the
+  agnova-written medium and kybernet execs `/bin/agnsh` from the agnova-written ext2 root — AGNOS
+  installs AGNOS natively and boots what it wrote.
+
 ## [0.5.0] - 2026-07-10 — dual-target native disk backend: agnova shapes a disk with no shell-out
 
 Phase 5 of the AGNOS native-install arc. agnova now partitions, formats, and stages an ESP

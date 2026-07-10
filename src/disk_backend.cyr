@@ -47,12 +47,15 @@ fn get_disk_backend() {
 # source paths are an open decision — the smoke passes real dev-box files).
 var df_native_gnoboot = "/usr/lib/gnoboot/BOOTX64.EFI";
 var df_native_kernel  = "/boot/agnos";
+# Base-system payload staged into the ext2 root (/bin/agnsh) — overridable via --agnsh-src.
+var df_native_agnsh   = "/usr/lib/agnos/agnsh";
 # Target device path captured on the format op (OP_STAGE_FILE doesn't carry the device).
 var df_target_dev = 0;
 
-fn set_native_sources(gnoboot_cstr, kernel_cstr) {
+fn set_native_sources(gnoboot_cstr, kernel_cstr, agnsh_cstr) {
     if (gnoboot_cstr != 0) { df_native_gnoboot = gnoboot_cstr; }
     if (kernel_cstr != 0)  { df_native_kernel = kernel_cstr; }
+    if (agnsh_cstr != 0)   { df_native_agnsh = agnsh_cstr; }
     return 0;
 }
 
@@ -86,10 +89,16 @@ fn plan_native_disk_ops(cfg, target_root) {
     vec_push(pops, op_partition_disk(disk));
     vec_push(plans, phase_ops_new(PHASE_PARTITION_DISK, str_from("Partition disk (native GPT)"), pops));
 
-    # PHASE_FORMAT_FILESYSTEMS — FAT32 the ESP (partition 0) only; ext4 root uses the shell backend.
+    # PHASE_FORMAT_FILESYSTEMS — FAT32 the ESP (partition 0) + sovereign ext2 the root (partition 1).
     var fops = vec_new();
     vec_push(fops, op_format_fs(0, vec_get(parts, 0), dev));
-    vec_push(plans, phase_ops_new(PHASE_FORMAT_FILESYSTEMS, str_from("Format ESP (native FAT32)"), fops));
+    vec_push(fops, op_format_fs(1, vec_get(parts, 1), dev));
+    vec_push(plans, phase_ops_new(PHASE_FORMAT_FILESYSTEMS, str_from("Format ESP (FAT32) + root (ext2)"), fops));
+
+    # PHASE_INSTALL_BASE — stage the base system into the ext2 root (/bin/agnsh; dirs auto-created).
+    var bops = vec_new();
+    vec_push(bops, op_stage_file(str_from(df_native_agnsh), str_from("/bin/agnsh"), 1));
+    vec_push(plans, phase_ops_new(PHASE_INSTALL_BASE, str_from("Install base system (native ext2 root)"), bops));
 
     # PHASE_INSTALL_BOOTLOADER — stage gnoboot + kernel into the ESP (replaces the cp/mkdir ops).
     var sops = vec_new();
@@ -143,13 +152,17 @@ fn native_partition(op) {
     return rc;
 }
 
-# OP_FORMAT_FS: format partition `part_index` as FAT32 (ESP only; ext4/xfs/btrfs via the shell path).
-# Locates the partition's LBA range by reading the just-written GPT entry array (stateless).
+# OP_FORMAT_FS: format partition `part_index` — FAT32 for the ESP, journal-less ext2 for the
+# root (FS_EXT4; the kernel reads it as ext2). xfs/btrfs still fall to the shell path. The
+# partition's LBA range comes from re-reading the just-written GPT entry array (stateless).
 fn native_format(op) {
     var pi = SystemOp_FormatFs_part_index(payload(op));
     var spec = SystemOp_FormatFs_spec(payload(op));
     var dev = SystemOp_FormatFs_device(payload(op));
-    if (PartitionSpec_filesystem(spec) != FS_VFAT) { return E_NOT_IMPL; }   # rootfs-mkfs gap
+    var fs = PartitionSpec_filesystem(spec);
+    if (fs != FS_VFAT) {
+        if (fs != FS_EXT4) { return E_NOT_IMPL; }                           # xfs/btrfs via the shell
+    }
 
     df_target_dev = str_cstr(dev);
     if (df_open_target(df_target_dev) != 0) { return 0 - 1; }
@@ -157,17 +170,26 @@ fn native_format(op) {
     var e = &df_pea + pi * 128;
     var first = load64(e + 32);
     var last = load64(e + 40);
-    var label = PartitionSpec_label(spec);
-    var rc = df_format_esp(first, last - first + 1, str_cstr(label), str_len(label));
+    var psectors = last - first + 1;
+    var rc = 0;
+    if (fs == FS_VFAT) {
+        var label = PartitionSpec_label(spec);
+        rc = df_format_esp(first, psectors, str_cstr(label), str_len(label));
+    } else {
+        rc = df_format_ext2(first, psectors);                              # sovereign root mkfs
+    }
     df_close_target();
     return rc;
 }
 
-# OP_STAGE_FILE: stream a source file into the ESP's FAT at the dst path. Two known targets:
-# \EFI\BOOT\BOOTX64.EFI and \boot\agnos (the staging state was set by native_format).
+# OP_STAGE_FILE: stream a source file into a formatted partition. target_fs selects the writer:
+#   0 -> ESP FAT (two known dsts: \EFI\BOOT\BOOTX64.EFI and \boot\agnos)
+#   1 -> ext2 root (arbitrary absolute path, intermediate dirs auto-created)
+# The staging state (df_esp_* / df_ext2_*) was set by the matching native_format call.
 fn native_stage(op) {
     var src = SystemOp_StageFile_src_path(payload(op));
     var dst = SystemOp_StageFile_dst_fat_path(payload(op));
+    var target = SystemOp_StageFile_target_fs(payload(op));
     if (df_target_dev == 0) { return 0 - 1; }              # format must have run first
 
     if (df_open_target(df_target_dev) != 0) { return 0 - 1; }
@@ -175,12 +197,16 @@ fn native_stage(op) {
     if (sfd < 0) { df_close_target(); return 0 - 1; }
 
     var rc = 0;
-    if (str_contains_cstr(dst, "/EFI/BOOT/") == 1) {
-        df_name_bootx64();
-        rc = df_stage_file(&df_ebdir, df_esp_root_start + 2, 2, &df_nm, sfd);   # \EFI\BOOT (cluster 4)
+    if (target == 1) {
+        rc = df_ext2_stage(str_cstr(dst), sfd);                                # ext2 root
     } else {
-        df_name_agnos();
-        rc = df_stage_file(&df_btdir, df_esp_root_start + 3, 2, &df_nm, sfd);   # \boot (cluster 5)
+        if (str_contains_cstr(dst, "/EFI/BOOT/") == 1) {
+            df_name_bootx64();
+            rc = df_stage_file(&df_ebdir, df_esp_root_start + 2, 2, &df_nm, sfd);   # \EFI\BOOT
+        } else {
+            df_name_agnos();
+            rc = df_stage_file(&df_btdir, df_esp_root_start + 3, 2, &df_nm, sfd);   # \boot
+        }
     }
     df_close_src(sfd);
     df_close_target();

@@ -839,3 +839,62 @@ fn df_ext2_mkdir(parent_ino, name_ptr, name_len) {
     if (df_ext2_persist_counts() != 0) { return 0 - 1; }
     return ino;
 }
+
+# Look up `name` in directory `dir_ino` (single data block). Returns the child inode, or 0 if
+# not found. Uses df_ext2_ind as dir-block scratch.
+fn df_ext2_lookup(dir_ino, name_ptr, name_len) {
+    var pblk = df_ext2_itable + (dir_ino - 1) / 32;
+    var poff = ((dir_ino - 1) - ((dir_ino - 1) / 32) * 32) * 128;
+    df_ext2_rd_block(pblk, &df_ext2_blk);
+    var dir_block = load32(&df_ext2_blk + poff + 0x28);
+    df_ext2_rd_block(dir_block, &df_ext2_ind);
+    var off = 0;
+    while (off < 4096) {
+        var eino = load32(&df_ext2_ind + off);
+        var rl = load16(&df_ext2_ind + off + 4);
+        if (rl < 8) { return 0; }
+        if (eino != 0) {
+            if ((load8(&df_ext2_ind + off + 6) & 0xFF) == name_len) {
+                var same = 1;
+                var k = 0;
+                while (k < name_len) {
+                    if ((load8(&df_ext2_ind + off + 8 + k) & 0xFF) != (load8(name_ptr + k) & 0xFF)) {
+                        same = 0; k = name_len;
+                    } else { k = k + 1; }
+                }
+                if (same == 1) { return eino; }
+            }
+        }
+        off = off + rl;
+    }
+    return 0;
+}
+
+# Stage a file from src_fd into the ext2 root at absolute path dst_cstr (e.g. "/bin/agnsh"),
+# creating intermediate directories (single-block dirs). Returns 0 / -1.
+fn df_ext2_stage(dst_cstr, src_fd) {
+    var cur = 2;                                # root inode
+    var i = 0;
+    if ((load8(dst_cstr) & 0xFF) == 0x2F) { i = 1; }
+    var start = i;
+    while (i < 4096) {
+        var c = load8(dst_cstr + i) & 0xFF;
+        if (c == 0x2F) {
+            var clen = i - start;
+            if (clen > 0) {
+                var child = df_ext2_lookup(cur, dst_cstr + start, clen);
+                if (child == 0) { child = df_ext2_mkdir(cur, dst_cstr + start, clen); }
+                if (child < 0) { return 0 - 1; }
+                cur = child;
+            }
+            start = i + 1;
+        }
+        if (c == 0) {
+            var flen = i - start;
+            if (flen == 0) { return 0 - 1; }
+            return df_ext2_add_file(cur, dst_cstr + start, flen, src_fd);
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
