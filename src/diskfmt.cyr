@@ -506,3 +506,148 @@ fn df_stage_file(dir_buf, dir_rel_sec, dir_slot, name_ptr, src_fd) {
     if (df_write(esp_abs + 7, &df_fsinfo, 1) != 1) { return 0 - 1; }
     return 0;
 }
+
+# ======================================================================================
+# Sovereign ext2 mkfs (the root-filesystem writer). Classic ext2, 4 KiB blocks, SINGLE block
+# group (first cut), 128-byte inodes, rev_level=1, FILETYPE-only feature. Byte layout derived
+# from + verified against the agnos kernel reader (kernel/core/ext2.cyr). All builders write
+# via df_write partition-relative (part_abs threaded like esp_abs; df_scratch_base is added
+# INSIDE df_write, never here). e2fsck-provable on Linux; flips to agnos NATIVE_BLOCK for free.
+# ======================================================================================
+var df_ext2_blk[512];   # 4096 B — general ext2 block builder (RE-ZERO before every build)
+var df_ext2_ind[512];   # 4096 B — single-indirect block (used once a file exceeds 12 blocks)
+
+# ext2 staging state (separate from df_esp_* so the root arm survives the ESP path's reopen).
+var df_ext2_abs = 0;         # partition first LBA (absolute)
+var df_ext2_bs = 4096;
+var df_ext2_bpg = 32768;     # blocks per group
+var df_ext2_ipg = 0;         # inodes per group (= inodes_count for a single group)
+var df_ext2_isize = 128;
+var df_ext2_itable = 4;      # first inode-table block
+var df_ext2_bbmp = 2;        # block-bitmap block
+var df_ext2_ibmp = 3;        # inode-bitmap block
+var df_ext2_next_ino = 11;
+var df_ext2_next_block = 0;  # next free data block cursor
+var df_ext2_free_blocks = 0;
+var df_ext2_free_inodes = 0;
+var DF_EXT2_EPOCH = 1751500000;   # fixed mkfs timestamp
+
+# One ext2 4 KiB block <-> 8 sectors, partition-relative (mirrors the kernel's block_to_lba).
+fn df_ext2_wr_block(bn, buf) { return df_write(df_ext2_abs + bn * 8, buf, 8); }
+fn df_ext2_rd_block(bn, buf) { return df_read(df_ext2_abs + bn * 8, buf, 8); }
+
+# Set bit `bit` (LSB-first within each byte) in a bitmap buffer.
+fn df_bit_set(buf, bit) {
+    var byte = bit / 8;
+    var off = bit - byte * 8;
+    store8(buf + byte, (load8(buf + byte) & 0xFF) | (1 << off));
+    return 0;
+}
+
+# Format an empty single-group ext2 into partition [part_abs, +part_sectors). Geometry is
+# derived at runtime and CAPPED to one block group, so a fill-to-disk root is safe (a fs
+# smaller than its partition is legal ext2). Returns 0 / -1.
+fn df_format_ext2(part_abs, part_sectors) {
+    df_ext2_abs = part_abs;
+    var B = part_sectors / 8;                     # blocks_count
+    if (B > 32768) { B = 32768; }                 # cap to one group
+    var I = B / 4;                                # inodes_count (bytes-per-inode 16384)
+    I = ((I + 7) / 8) * 8;                        # round up to a multiple of 8
+    var IT = (I + 31) / 32;                        # inode-table blocks = ceil(I*128/4096)
+    var used = 4 + IT + 1;                         # SB,BGDT,bbmp,ibmp + itable + root-dir
+    var root_dir_block = 4 + IT;
+    var free_blocks = B - used;
+    var free_inodes = I - 10;
+
+    # Block 2: block bitmap — bits 0..used-1 used, bits B..32767 padding, else free.
+    df_zero(&df_ext2_blk, 4096);
+    var bit = 0;
+    while (bit < used) { df_bit_set(&df_ext2_blk, bit); bit = bit + 1; }
+    bit = B;
+    while (bit < 32768) { df_bit_set(&df_ext2_blk, bit); bit = bit + 1; }
+    if (df_ext2_wr_block(2, &df_ext2_blk) != 8) { return 0 - 1; }
+
+    # Block 3: inode bitmap — inodes 1..10 used, bits I..32767 padding, else free.
+    df_zero(&df_ext2_blk, 4096);
+    bit = 0;
+    while (bit < 10) { df_bit_set(&df_ext2_blk, bit); bit = bit + 1; }
+    bit = I;
+    while (bit < 32768) { df_bit_set(&df_ext2_blk, bit); bit = bit + 1; }
+    if (df_ext2_wr_block(3, &df_ext2_blk) != 8) { return 0 - 1; }
+
+    # Inode table: block 4 carries root inode 2 (offset 128); blocks 5..3+IT zeroed.
+    df_zero(&df_ext2_blk, 4096);
+    var ri = &df_ext2_blk + 128;
+    store16(ri + 0x00, 0x41ED);                   # i_mode: directory, 0755
+    store32(ri + 0x04, 4096);                     # i_size
+    store32(ri + 0x08, DF_EXT2_EPOCH);            # i_atime
+    store32(ri + 0x0C, DF_EXT2_EPOCH);            # i_ctime
+    store32(ri + 0x10, DF_EXT2_EPOCH);            # i_mtime
+    store16(ri + 0x1A, 2);                        # i_links_count (. and ..)
+    store32(ri + 0x1C, 8);                        # i_blocks (512-B units: one 4K block)
+    store32(ri + 0x28, root_dir_block);           # i_block[0]
+    if (df_ext2_wr_block(4, &df_ext2_blk) != 8) { return 0 - 1; }
+    df_zero(&df_ext2_blk, 4096);
+    var bn = 5;
+    while (bn <= 3 + IT) {
+        if (df_ext2_wr_block(bn, &df_ext2_blk) != 8) { return 0 - 1; }
+        bn = bn + 1;
+    }
+
+    # Root-dir data block: '.' and '..' (both -> inode 2; root's parent is itself).
+    df_zero(&df_ext2_blk, 4096);
+    store32(&df_ext2_blk + 0, 2); store16(&df_ext2_blk + 4, 12);
+    store8(&df_ext2_blk + 6, 1); store8(&df_ext2_blk + 7, 2); store8(&df_ext2_blk + 8, 0x2E);
+    store32(&df_ext2_blk + 12, 2); store16(&df_ext2_blk + 16, 4084);
+    store8(&df_ext2_blk + 18, 2); store8(&df_ext2_blk + 19, 2);
+    store8(&df_ext2_blk + 20, 0x2E); store8(&df_ext2_blk + 21, 0x2E);
+    if (df_ext2_wr_block(root_dir_block, &df_ext2_blk) != 8) { return 0 - 1; }
+
+    # Block 1: BGDT — one 32-byte descriptor (bg_inode_table_hi @0x28 stays 0).
+    df_zero(&df_ext2_blk, 4096);
+    store32(&df_ext2_blk + 0x00, 2);              # bg_block_bitmap
+    store32(&df_ext2_blk + 0x04, 3);              # bg_inode_bitmap
+    store32(&df_ext2_blk + 0x08, 4);              # bg_inode_table
+    store16(&df_ext2_blk + 0x0C, free_blocks & 0xFFFF);   # bg_free_blocks_count
+    store16(&df_ext2_blk + 0x0E, free_inodes & 0xFFFF);   # bg_free_inodes_count
+    store16(&df_ext2_blk + 0x10, 1);              # bg_used_dirs_count
+    if (df_ext2_wr_block(1, &df_ext2_blk) != 8) { return 0 - 1; }
+
+    # Block 0: boot pad + superblock @ byte 1024 (written LAST for crash-safety).
+    df_zero(&df_ext2_blk, 4096);
+    var sb = &df_ext2_blk + 1024;
+    store32(sb + 0x00, I);                        # s_inodes_count
+    store32(sb + 0x04, B);                        # s_blocks_count
+    store32(sb + 0x0C, free_blocks);              # s_free_blocks_count
+    store32(sb + 0x10, free_inodes);              # s_free_inodes_count
+    store32(sb + 0x14, 0);                        # s_first_data_block
+    store32(sb + 0x18, 2);                        # s_log_block_size (4096)
+    store32(sb + 0x1C, 2);                        # s_log_cluster_size (== block size)
+    store32(sb + 0x20, 32768);                    # s_blocks_per_group
+    store32(sb + 0x24, 32768);                    # s_clusters_per_group
+    store32(sb + 0x28, I);                        # s_inodes_per_group
+    store32(sb + 0x30, DF_EXT2_EPOCH);            # s_wtime
+    store16(sb + 0x36, 0xFFFF);                   # s_max_mnt_count (-1)
+    store16(sb + 0x38, 0xEF53);                   # s_magic
+    store16(sb + 0x3A, 1);                        # s_state VALID_FS
+    store16(sb + 0x3C, 1);                        # s_errors: continue
+    store32(sb + 0x4C, 1);                        # s_rev_level DYNAMIC
+    store32(sb + 0x54, 11);                       # s_first_ino
+    store16(sb + 0x58, 128);                      # s_inode_size
+    store32(sb + 0x60, 0x0002);                   # s_feature_incompat: FILETYPE
+    store64(sb + 0x68, 0x41474E4F53524F4F);       # s_uuid (16 nonzero bytes)
+    store64(sb + 0x70, 0x54AA55CC33DDEE11);
+    store8(sb + 0x78, 0x41); store8(sb + 0x79, 0x47); store8(sb + 0x7A, 0x4E);  # "AGNOS-ROOT"
+    store8(sb + 0x7B, 0x4F); store8(sb + 0x7C, 0x53); store8(sb + 0x7D, 0x2D);
+    store8(sb + 0x7E, 0x52); store8(sb + 0x7F, 0x4F); store8(sb + 0x80, 0x4F);
+    store8(sb + 0x81, 0x54);
+    if (df_ext2_wr_block(0, &df_ext2_blk) != 8) { return 0 - 1; }
+
+    # staging cursors (mirror SB + BGDT for the populate bites)
+    df_ext2_ipg = I;
+    df_ext2_next_ino = 11;
+    df_ext2_next_block = 5 + IT;
+    df_ext2_free_blocks = free_blocks;
+    df_ext2_free_inodes = free_inodes;
+    return 0;
+}

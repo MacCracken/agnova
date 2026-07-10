@@ -1,0 +1,26 @@
+# ext2fmt_proof.cyr — standalone Linux (NATIVE_FILE) driver that writes a sovereign ext2 into
+# a raw image via diskfmt's df_format_ext2, so e2fsck / dumpe2fs / debugfs can validate it.
+#
+# Build: cyrius build tests/ext2fmt_proof.cyr build/ext2fmt_proof
+# Run:   ./build/ext2fmt_proof            (formats /tmp/agnova-ext2-proof.img, 137216 sectors = 67 MiB)
+#
+# SPDX-License-Identifier: GPL-3.0-only
+
+include "src/diskfmt.cyr"
+
+fn main() {
+    var path = "/tmp/agnova-ext2-proof.img";
+    if (df_open_target(path) != 0) { return 1; }
+    df_set_geometry(0, 0);                 # scratch_base=0; part size is passed to df_format_ext2
+    var rc = df_format_ext2(0, 137216);    # part_abs=0 (image IS the fs), 67 MiB
+    df_close_target();
+    if (rc != 0) { return 2; }
+    return 0;
+}
+
+fn _entry() {
+    var r = main();
+    syscall(SYS_EXIT, r);
+    return 0;
+}
+_entry();
