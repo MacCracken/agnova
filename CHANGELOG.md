@@ -6,6 +6,12 @@ This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-07-10 — complete multi-group ext2 + shared sankoch tar (incl. .tar.zst)
+
+Rounds out the sovereign ext2 root writer (multi-block-group, double-indirect, lost+found,
+symlinks) and consolidates tar extraction onto sankoch's shared cursor, which unlocks
+`.tar.xz` / `.tar.bz2` / `.tar.zst` — so a native install can lay down `base-system.tar.zst`.
+
 ### Changed
 - **ext2 tar extraction now uses sankoch's shared tar cursor.** `df_ext2_untar` /
   `df_ext2_untar_mem` dropped agnova's own ustar parser (~60 lines: `df_parse_octal`,
