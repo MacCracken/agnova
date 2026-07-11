@@ -2,7 +2,7 @@
 
 ## Status
 
-**v0.3.0 (current)** — executor disk path validated on real (loopback) hardware: partition → format → mount run clean end-to-end. Three execution-only bugs found and fixed (PATH/exec, loop-device naming, phase attribution). Mount-option `MS_*` parsing, `execute --until <phase>` staging, a plan-generation benchmark harness, and CI gates (CHANGELOG-per-PR, `cyrfmt --check`) added. 307 tests, lint + fmt clean. Full multi-phase install pass (base tarball, packages, LUKS, bootloader) deferred to v0.7.0 — needs a VM with AGNOS artifacts.
+**v0.7.0 (current)** — the **sovereign native install arc** landed. `--disk-backend=native-file|native-block` now shapes a whole, configured, bootable base system entirely in-process: GPT + FAT32 ESP + a sovereign multi-group ext2 root + base-system tarball extraction (`.tar`/`.gz`/`.xz`/`.bz2`/`.zst`, via the shared sankoch cursor) + all config files written straight into the ext2 image — with **zero host tools** (no `parted`/`mkfs`/`tar`/`unzstd`/`chroot`/`grub` fork-exec). A production AGNOS kernel boots the agnova-written medium to `/bin/agnsh` (the 0.6.0 arc-closer). The default **shell** backend is unchanged and stays the proven reference. A full native run completes its 8 emitted phases with 0 errors (`scripts/native-base-smoke.sh`). Still shell-only: user accounts, `ark` package install, service enablement — and the shell-path full-matrix e2e (LUKS execution, bootloader-on-VM) remains the v1.0 bar.
 
 ## Completed (v0.1.0)
 
@@ -39,18 +39,23 @@
 - [x] `cyrfmt --check` in CI — whole tree reformatted to cyrfmt canonical + a `Format check` step in the `build` job. (The `cyrius fmt` wrapper mangles args; the `cyrfmt` binary is invoked directly.)
 - [x] ~~Fix the 5 `line exceeds 120 characters` lint warnings~~ — already clean; `cyrius lint` is 0 warnings across `src/` and `lib/`.
 
-## Deferred to v0.7.0 — full multi-phase install pass
+## Completed — sovereign native install arc (v0.5.0 → v0.7.0)
 
-The disk path (partition/format/mount) is proven. A *complete* `agnova execute` (no `--until`) reaching `PHASE_COMPLETE` with `errors: 0` is **blocked on AGNOS runtime artifacts that don't exist on a dev box** — so it's deferred to v0.7.0. **What is needed to close it:**
+The 0.3.0 status deferred a *complete* multi-phase install to v0.7.0, expecting a **shell** run to `PHASE_COMPLETE` that would need a VM with AGNOS artifacts (a base tarball staged on disk, `ark` on `PATH`, `cryptsetup`, `bootctl`/`grub-install`). The arc took the **sovereign** route instead — a native backend that lays the whole base system down **in-process, no host tools** — so the goal (a complete run that writes a configured, bootable base system) is met without any of those externals.
 
-- **A VM (or real machine) running AGNOS-built media**, since the install shells out to AGNOS tooling and expects AGNOS files in place. Specifically:
-  - **Base-system tarball** present at `/run/agnos/installer/base-system.tar.zst` — the `INSTALL_BASE` phase `tar`-extracts it (this is exactly where the dev-box run stops). Produced by the AGNOS image build (zugot recipes).
-  - **`ark` package manager** on `PATH` — `INSTALL_PACKAGES` runs `ark` (and `plan_install_base_ops` references `ark-install.sh`).
-- **LUKS/cryptsetup execution validated** — run `execute --encrypt --passphrase … --i-mean-it` against a loopback/VM and confirm the stdin-piped `cryptsetup luksFormat` + `open` work. The planner ops and the executor's stdin-pipe are implemented and unit-covered; only *real-cryptsetup execution* is unverified. (Closes the old "wire `--passphrase`" item — CLI side is done; this is the remaining execution check.)
-- **Bootloader install validated on a UEFI VM** — `bootctl install` (systemd-boot) and `grub-install` (GRUB) actually writing to the ESP.
-- **Full matrix** — `execute` to `PHASE_COMPLETE`, `errors: 0`, across UEFI+BIOS × encrypted+unencrypted × all 4 modes. Satisfying this also satisfies the v1.0 "one full install succeeds end-to-end" criterion.
+- [x] **Native disk backend** (v0.5.0) — `--disk-backend=shell|native-file|native-block`. Structured disk ops (`OP_PARTITION_DISK`/`OP_FORMAT_FS`/`OP_STAGE_FILE`) route to an in-process backend (`disk_backend.cyr`) that writes a GPT + FAT32 ESP by raw sector I/O (`diskfmt.cyr`, vendored + parameterized from the gptwr proof), no `parted`/`mkfs.vfat`/`mcopy`. The same binary runs on the Linux host (`native-file`, file-offset I/O into a loop image) and on agnos (`native-block`, `sys_blk_*` behind the arm-gate); one target-gated I/O seam. Proven by `sgdisk`/`fsck.fat`/`mcopy` + a ring-3 agnos GPT-write smoke.
+- [x] **Sovereign ext2 root** (v0.6.0 → v0.6.1) — a journal-less multi-group ext2 mkfs+populate engine (any size; per-group SB+GDT backups; direct/single/double-indirect files to ~4.29 GiB; `lost+found`; symlinks), so the **root filesystem** is written natively, not just the ESP. A production kernel boots the agnova-written medium and execs `/bin/agnsh` from the agnova-written root (the arc-closer boot proof). Every field validated by `e2fsck -fn`/`dumpe2fs`/`debugfs`.
+- [x] **Base-system extraction into the root** (v0.6.1 → v0.7.0) — this *is* the deferred `INSTALL_BASE` tar-extract, done sovereignly: `--base-tarball <archive>` untars a whole base system into the ext2 root through the shared **sankoch** tar cursor, which sniffs + inflates `.tar`/`.gz`/`.xz`/`.bz2`/`.zst` in RAM — replacing the shell path's `tar -xf base-system.tar.zst --zstd`, with no `tar`/`unzstd` and no temp file. With no tarball, a single `/bin/agnsh` is staged (minimal boot-to-shell payload).
+- [x] **Config files into the image** (v0.7.0) — `/etc/fstab`, `hostname`, `hosts`, `resolv.conf`, `machine-id`, `locale.conf`, the `/etc/localtime` symlink, `nftables.conf`, IMA policy, sysctl hardening, and the `/etc/agnos/first-boot` marker are written straight into the ext2 image (no mount, no host fs). The shared config planners (`plan_network_ops`/`plan_locale_ops`/`plan_security_ops`) are reused with an empty `target_root` so they emit root-relative paths; `execute_op` routes their `OP_WRITE_FILE`/`OP_MAKE_DIR`/`OP_SYMLINK` to the native ext2 sink (`df_ext2_write_mem`/`df_ext2_mkdir_p`/`df_ext2_symlink_p`).
+- [x] **Full native run proven** (v0.7.0) — `scripts/native-base-smoke.sh`: a `.tar.zst` base + all config land in an e2fsck-clean ext2 (byte-identical large file, preserved symlinks, fresh machine-id), no shell-out; the native run completes **8/8 emitted phases, 0 errors**.
 
-## Future (v0.4.0)
+## Still open — was the rest of the deferred pass
+
+- [ ] **Native user accounts / packages / services** — the native plan deliberately omits `useradd`/`usermod` (needs sovereign `/etc/passwd`,`/shadow`,`/group` gen), `ark` package install into the offline image, and `chroot argonaut enable` service enablement. These are the residual gap between a native disk-shaped base and a fully-configured install.
+- [ ] **Shell-path full-matrix e2e** — a *complete* `agnova execute` on the **shell** backend to `PHASE_COMPLETE`, `errors: 0`, across UEFI+BIOS × encrypted+unencrypted × all 4 modes, on a VM with AGNOS media. Still needs real-`cryptsetup` LUKS execution (the planner ops + executor stdin-pipe are implemented and unit-covered; only *execution* is unverified) and `bootctl`/`grub-install` writing to a UEFI ESP validated. Satisfying it also satisfies the v1.0 "one full install succeeds end-to-end" criterion.
+- [ ] **Sovereign LUKS** — an in-process LUKS (argon2id keyslot + AES-XTS sector layer + LUKS2 header, wired into `diskfmt`'s `df_write`/`df_read` seam) is a cross-repo crypto-boundary feature to be scoped in **sigil**, not a disk-format concern (see CHANGELOG 0.6.1 notes). It would give the native path encrypted-root parity with the shell path's `cryptsetup`.
+
+## Future (unscheduled)
 
 - [ ] **Resumable installs** — checkpoint `AgnovaInstaller` state to `/run/agnos/installer/state.json` after each phase advance; on restart, resume from last completed phase
 - [ ] **Hardware detection** — probe `/sys/block` for disks, `/proc/cpuinfo` for arch, `/sys/firmware/efi` for UEFI
