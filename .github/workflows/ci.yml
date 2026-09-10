@@ -82,7 +82,13 @@ jobs:
           cat /tmp/plan.txt
           echo "--- assertions ---"
           grep -q "validation: OK" /tmp/plan.txt
-          grep -q "13 phases, 60 operations" /tmp/plan.txt
+          # ⚠ The operation count tracks the PLAN, so it moves whenever the plan
+          # legitimately changes — that is the point of asserting it, but it means
+          # the number needs updating with the change that moved it.
+          # 60 -> 59 at 0.7.1: the `--user is now optional` doctrine change disarms
+          # the default compat account (no `wheel` group, enable_sudo=0), so Phase 8
+          # emits `useradd -G agents` only and no longer emits `usermod -aG wheel`.
+          grep -q "13 phases, 59 operations" /tmp/plan.txt
           grep -q "bootloader: gnoboot" /tmp/plan.txt
 
       - name: Smoke test (execute gate)
