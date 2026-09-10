@@ -44,13 +44,13 @@ fn plan_partition_ops(cfg) {
     if (DiskLayout_use_gpt(disk) == 1) {
         vec_push(pt_args, str_from("gpt"));
         vec_push(ops, op_command(
-        str_from("parted"), pt_args, str_from("Create GPT partition table"),
-        1, str_from("")));
+            str_from("parted"), pt_args, str_from("Create GPT partition table"),
+            1, str_from("")));
     } else {
         vec_push(pt_args, str_from("msdos"));
         vec_push(ops, op_command(
-        str_from("parted"), pt_args, str_from("Create MBR partition table"),
-        1, str_from("")));
+            str_from("parted"), pt_args, str_from("Create MBR partition table"),
+            1, str_from("")));
     }
 
     # Create each partition + set flags
@@ -127,8 +127,8 @@ fn plan_partition_ops(cfg) {
             str_builder_add_int(fdesc_sb, i + 1);
 
             vec_push(ops, op_command(
-            str_from("parted"), f_args, str_builder_build(fdesc_sb),
-            1, str_from("")));
+                str_from("parted"), f_args, str_builder_build(fdesc_sb),
+                1, str_from("")));
             fi = fi + 1;
         }
 
@@ -223,10 +223,10 @@ fn plan_encryption_ops(cfg, luks_passphrase) {
     var n = vec_len(partitions);
     if (n == 0) {
         return phase_ops_new(
-        PHASE_SETUP_ENCRYPTION,
-        str_from("Setup disk encryption (no partitions)"),
-        ops
-        );
+          PHASE_SETUP_ENCRYPTION,
+          str_from("Setup disk encryption (no partitions)"),
+          ops
+          );
     }
 
     # Find the root partition (mount_point == "/"); fall back to last.
@@ -261,8 +261,8 @@ fn plan_encryption_ops(cfg, luks_passphrase) {
     vec_push(fmt_args, str_from("--key-file=-"));
     vec_push(fmt_args, str_clone(part_dev));
     vec_push(ops, op_command(
-    str_from("cryptsetup"), fmt_args,
-    str_from("Format LUKS2 encrypted volume"), 1, luks_passphrase));
+        str_from("cryptsetup"), fmt_args,
+        str_from("Format LUKS2 encrypted volume"), 1, luks_passphrase));
 
     # cryptsetup open
     var open_args = vec_new();
@@ -271,8 +271,8 @@ fn plan_encryption_ops(cfg, luks_passphrase) {
     vec_push(open_args, str_clone(part_dev));
     vec_push(open_args, str_from("agnos-root"));
     vec_push(ops, op_command(
-    str_from("cryptsetup"), open_args,
-    str_from("Open LUKS volume as agnos-root"), 1, luks_passphrase));
+        str_from("cryptsetup"), open_args,
+        str_from("Open LUKS volume as agnos-root"), 1, luks_passphrase));
 
     return phase_ops_new(PHASE_SETUP_ENCRYPTION, str_from("Setup disk encryption"), ops);
 }

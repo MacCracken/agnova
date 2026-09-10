@@ -153,9 +153,9 @@ fn _config_from_flags(h) {
     if (tz_cstr != 0) { tz_str = str_from(tz_cstr); }
 
     return install_config_new(
-    mode, disk, bootloader, network, user, security, packages,
-    locale_str, tz_str
-    );
+      mode, disk, bootloader, network, user, security, packages,
+      locale_str, tz_str
+      );
 }
 
 fn _print_help() {
@@ -554,7 +554,7 @@ fn cli_main() {
     # Select the disk backend for this run (default shell = unchanged behavior).
     set_disk_backend(_parse_disk_backend(flags_get_str(h, FLAG_DISK_BACKEND)));
     set_native_sources(flags_get_str(h, FLAG_GNOBOOT_SRC), flags_get_str(h, FLAG_KERNEL_SRC),
-    flags_get_str(h, FLAG_AGNSH_SRC));
+      flags_get_str(h, FLAG_AGNSH_SRC));
     set_native_base(flags_get_str(h, FLAG_BASE_TARBALL));
     df_set_geometry(atoi(flags_get_str(h, FLAG_SCRATCH_BASE)), atoi(flags_get_str(h, FLAG_DISK_SECTORS)));
 

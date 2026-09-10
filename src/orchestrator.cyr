@@ -32,9 +32,9 @@ fn agnova_installer_new(config, luks_passphrase) {
     var p = alloc(sizeof(AgnovaInstaller));
     store64(p, config);
     store64(p + 8, install_progress_new(
-    PHASE_VALIDATE_CONFIG,
-    str_from("Preparing installation"),
-    clock_epoch_secs()));
+        PHASE_VALIDATE_CONFIG,
+        str_from("Preparing installation"),
+        clock_epoch_secs()));
     store64(p + 16, vec_new());
     store64(p + 24, vec_new());
     store64(p + 32, vec_new());
@@ -49,9 +49,9 @@ fn agnova_default_disk_layout(device, encrypt) {
     vec_push(esp_flags, PFLAG_BOOT);
     vec_push(esp_flags, PFLAG_ESP);
     vec_push(parts, partition_spec_new(
-    str_from("ESP"), str_from("/boot/efi"), FS_VFAT, 512, 1, esp_flags));
+        str_from("ESP"), str_from("/boot/efi"), FS_VFAT, 512, 1, esp_flags));
     vec_push(parts, partition_spec_new(
-    str_from("agnos-root"), str_from("/"), FS_EXT4, 0, 0, vec_new()));
+        str_from("agnos-root"), str_from("/"), FS_EXT4, 0, 0, vec_new()));
     return disk_layout_new(device, parts, 1, encrypt);
 }
 
@@ -146,13 +146,13 @@ fn agnova_result(inst) {
     var packages = InstallConfig_packages(cfg);
 
     return install_result_new(
-    success,
-    AgnovaInstaller_completed_phases(inst),
-    AgnovaInstaller_errors(inst),
-    elapsed,
-    package_selection_total_count(packages),
-    PackageSelection_total_size_mb(packages)
-    );
+      success,
+      AgnovaInstaller_completed_phases(inst),
+      AgnovaInstaller_errors(inst),
+      elapsed,
+      package_selection_total_count(packages),
+      PackageSelection_total_size_mb(packages)
+      );
 }
 
 fn agnova_log_message(inst, msg) {

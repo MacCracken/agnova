@@ -121,10 +121,10 @@ fn native_partition(op) {
     df_gpt_zero_entries();
     var esp_name = str_from("ESP");
     df_gpt_set_entry(0, esp_s, esp_e, DF_TYPE_ESP_LO, DF_TYPE_ESP_HI,
-    0x4553501D2A7328C1, 0x00A0C93EC93BBA4B, str_cstr(esp_name), 3);
+      0x4553501D2A7328C1, 0x00A0C93EC93BBA4B, str_cstr(esp_name), 3);
     var root_name = str_from("agnos-root");
     df_gpt_set_entry(1, rf_s, rf_e, DF_TYPE_LINUX_FS_LO, DF_TYPE_LINUX_FS_HI,
-    0x524F4F540FC63DAF, 0x3D69D8477DE48E79, str_cstr(root_name), 10);
+      0x524F4F540FC63DAF, 0x3D69D8477DE48E79, str_cstr(root_name), 10);
     df_build_mbr(n);
     df_build_gpt(n);
     var rc = df_write_gpt(n);

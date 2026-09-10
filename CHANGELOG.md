@@ -6,6 +6,8 @@ This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-10
+
 ### Changed — cyrius pin 6.4.43 → **6.6.2** (value-form migration)
 
 cyrius 6.6.0 flipped `Result`/`Option`/`Either` to a **value form** (a `(tag, payload)` register

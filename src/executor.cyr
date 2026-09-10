@@ -210,12 +210,12 @@ fn _exec_mount(p) {
     # flag/"defaults" options at mount time, so the data arg stays 0.
     var flags = mount_flags_from_options(SystemOp_Mount_options(p));
     return sys_mount(
-    str_cstr(device),
-    str_cstr(mount_point),
-    str_cstr(fs_type),
-    flags,
-    0
-    );
+      str_cstr(device),
+      str_cstr(mount_point),
+      str_cstr(fs_type),
+      flags,
+      0
+      );
 }
 
 fn _exec_unmount(p) {
