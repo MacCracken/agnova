@@ -6,6 +6,58 @@ This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Changed — cyrius pin 6.4.43 → **6.6.2** (value-form migration)
+
+cyrius 6.6.0 flipped `Result`/`Option`/`Either` to a **value form** (a `(tag, payload)` register
+pair, zero allocation) and deleted `payload()`. It also deleted `tagged_new()` — which agnova uses
+**10 times** for the `SystemOp` union — on a survey scoped to the twelve fold-table stdlibs but
+written down as "nothing in the ecosystem". agnova is a domain library and was never in scope.
+cyrius **6.6.2** restores the boxed primitives; this migrates to them.
+
+⭐ **All 10 `tagged_new` call sites are unchanged.** It returned under its own name because its
+meaning never changed — still a 16-byte box, tag at +0, payload at +8. Only the **reads** moved:
+`tag(op)` → `boxed_tag(op)`, `payload(op)` → `boxed_payload(op)`. 24 sites in `src/`, 68 in tests.
+
+⚠ **`src/executor.cyr` decides what to run on a disk from the tag** (`:230`, `:260`, `:281`), so a
+mis-read there is not a cosmetic bug. Under 6.6.0's `tag()` — which kept the NAME and was redefined
+to the identity — that dispatch would have received the **pointer** instead of the tag, silently.
+All six sites verified against their `tagged_new` producers in `src/types.cyr`.
+
+No public API change: every touched function keeps its arity. `cyrius build` OK (768,176 B),
+`cyrius test` **344 assertions, 0 failures**.
+
+### Known — vendored sibling bundles are stale (pre-existing, NOT from this migration)
+
+`cyrius build` now warns that `./lib/` shadows the pinned stdlib: **11 folded sibling bundles are
+behind**, some by years — bayan 1.1.0 (pinned 1.5.5), sigil 3.10.1 (3.12.16), sandhi 1.7.3
+(1.9.16), yukti 2.2.9 (2.3.10), patra 1.12.9 (1.14.1), vani 0.9.8 (1.2.4), mabda 4.0.2 (4.1.1),
+sakshi 2.4.5 (2.5.1), ganita 1.0.3 (1.2.4), niyama 1.0.5 (1.0.10), yantra 1.0.0 (1.0.4).
+
+⚠ **35 vendored files in total differ from the pinned snapshot, and 9 of them still call the
+retired `payload()`/`tag()`** (sandhi 25 sites, yukti 16, sigil 12, mabda 8, http 6, ws_server 5,
+vani 3, yantra 3, regression 1). They are **inert**: none is in `[deps].stdlib`, so `cyrius deps`
+never refreshes them and nothing reaches them. The one that looked dangerous — `lib/sigil.cyr`,
+which IS included — is pulled by `lib/tls_native.cyr`, itself undeclared. Orphan including orphan.
+
+⚠ Unlike most consumers, agnova **tracks `lib/` in git**, so these are committed dead weight
+dated 2026-07-10. Refreshing them is a separate piece of work with its own risk (11 bundles across
+many versions of API change) and is deliberately NOT bundled into this migration.
+
+### Changed
+- **`--user` is now optional — a user-less install is the doctrine-clean default.** AGNOS is
+  single-owner and does not do Unix login-by-default; identity is the owner's sigil keys, not an
+  `/etc/passwd` row (see the AGNOS auth doctrine). So POSIX account creation
+  (`useradd`/`usermod` → `/etc/passwd`,`/shadow`,`/group`) is **fenced behind an explicit
+  username**: no `--user` → no user phase at all (the sovereign native path already did this; the
+  shell path now matches). Providing `--user` opts into a POSIX compat account for Linux-host /
+  self-host installs.
+  - `validate` no longer rejects an empty username; `execute` no longer requires `--user`.
+  - The default compat account is **disarmed**: no `wheel` group and `enable_sudo=0` (privilege is
+    per-action via kavach/t-ron, not a session-wide sudo group). The AGNOS-semantic `agents` group
+    stays. `--user alice` now plans `useradd … -G agents alice` with no `usermod -aG wheel`.
+  - **Not** the removed-forever path: the compat account and its Unix machinery remain for the
+    shell/host-install use case — they are simply no longer the default and no longer armed.
+
 ## [0.7.0] - 2026-07-10 — sovereign native install: whole base system + config, zero host tools
 
 ### Added

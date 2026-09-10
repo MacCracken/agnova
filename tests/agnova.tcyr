@@ -60,8 +60,8 @@ fn _ops_has_command_binary(ops, binary_cstr) {
     var i = 0;
     while (i < n) {
         var op = vec_get(ops, i);
-        if (tag(op) == OP_COMMAND) {
-            if (str_eq_cstr(SystemOp_Command_binary(payload(op)), binary_cstr) == 1) {
+        if (boxed_tag(op) == OP_COMMAND) {
+            if (str_eq_cstr(SystemOp_Command_binary(boxed_payload(op)), binary_cstr) == 1) {
                 return 1;
             }
         }
@@ -76,8 +76,8 @@ fn _ops_has_command_arg(ops, needle_cstr) {
     var i = 0;
     while (i < n) {
         var op = vec_get(ops, i);
-        if (tag(op) == OP_COMMAND) {
-            if (_vec_str_any_eq(SystemOp_Command_args(payload(op)), needle_cstr) == 1) {
+        if (boxed_tag(op) == OP_COMMAND) {
+            if (_vec_str_any_eq(SystemOp_Command_args(boxed_payload(op)), needle_cstr) == 1) {
                 return 1;
             }
         }
@@ -92,8 +92,8 @@ fn _ops_has_write_path(ops, needle_cstr) {
     var i = 0;
     while (i < n) {
         var op = vec_get(ops, i);
-        if (tag(op) == OP_WRITE_FILE) {
-            if (str_contains_cstr(SystemOp_WriteFile_path(payload(op)), needle_cstr) == 1) {
+        if (boxed_tag(op) == OP_WRITE_FILE) {
+            if (str_contains_cstr(SystemOp_WriteFile_path(boxed_payload(op)), needle_cstr) == 1) {
                 return 1;
             }
         }
@@ -108,8 +108,8 @@ fn _ops_has_write_path_content(ops, path_needle, content_needle) {
     var i = 0;
     while (i < n) {
         var op = vec_get(ops, i);
-        if (tag(op) == OP_WRITE_FILE) {
-            var p = payload(op);
+        if (boxed_tag(op) == OP_WRITE_FILE) {
+            var p = boxed_payload(op);
             if (str_contains_cstr(SystemOp_WriteFile_path(p), path_needle) == 1) {
                 if (str_contains_cstr(SystemOp_WriteFile_content(p), content_needle) == 1) {
                     return 1;
@@ -126,7 +126,7 @@ fn _ops_has_unmount(ops) {
     var n = vec_len(ops);
     var i = 0;
     while (i < n) {
-        if (tag(vec_get(ops, i)) == OP_UNMOUNT) { return 1; }
+        if (boxed_tag(vec_get(ops, i)) == OP_UNMOUNT) { return 1; }
         i = i + 1;
     }
     return 0;
@@ -137,7 +137,7 @@ fn _ops_has_mount(ops) {
     var n = vec_len(ops);
     var i = 0;
     while (i < n) {
-        if (tag(vec_get(ops, i)) == OP_MOUNT) { return 1; }
+        if (boxed_tag(vec_get(ops, i)) == OP_MOUNT) { return 1; }
         i = i + 1;
     }
     return 0;
@@ -150,9 +150,9 @@ fn _find_write(ops, needle_cstr) {
     var i = 0;
     while (i < n) {
         var op = vec_get(ops, i);
-        if (tag(op) == OP_WRITE_FILE) {
-            if (str_contains_cstr(SystemOp_WriteFile_path(payload(op)), needle_cstr) == 1) {
-                return payload(op);
+        if (boxed_tag(op) == OP_WRITE_FILE) {
+            if (str_contains_cstr(SystemOp_WriteFile_path(boxed_payload(op)), needle_cstr) == 1) {
+                return boxed_payload(op);
             }
         }
         i = i + 1;
@@ -166,7 +166,7 @@ fn _find_mount(ops) {
     var i = 0;
     while (i < n) {
         var op = vec_get(ops, i);
-        if (tag(op) == OP_MOUNT) { return payload(op); }
+        if (boxed_tag(op) == OP_MOUNT) { return boxed_payload(op); }
         i = i + 1;
     }
     return 0;
@@ -178,7 +178,7 @@ fn _find_symlink(ops) {
     var i = 0;
     while (i < n) {
         var op = vec_get(ops, i);
-        if (tag(op) == OP_SYMLINK) { return payload(op); }
+        if (boxed_tag(op) == OP_SYMLINK) { return boxed_payload(op); }
         i = i + 1;
     }
     return 0;
@@ -378,8 +378,8 @@ fn t_package_selection_total_count() {
 # ============================================================
 fn t_validate_config_valid() {
     test_group("validate_config_valid");
-    var r = validate_config(_test_config());
-    assert(is_ok(r), "valid config");
+    var r_t, r = validate_config(_test_config());
+    assert(is_ok(r_t), "valid config");
     return 0;
 }
 
@@ -387,17 +387,19 @@ fn t_validate_config_missing_device() {
     test_group("validate_config_missing_device");
     var c = _test_config();
     DiskLayout_set_target_device(InstallConfig_disk(c), str_from(""));
-    var r = validate_config(c);
-    assert(is_err_result(r), "missing device fails");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "missing device fails");
     return 0;
 }
 
 fn t_validate_config_empty_username() {
-    test_group("validate_config_empty_username");
+    test_group("validate_config_no_username");
     var c = _test_config();
     UserConfig_set_username(InstallConfig_user(c), str_from(""));
-    var r = validate_config(c);
-    assert(is_err_result(r), "empty username fails");
+    var r_t, r = validate_config(c);
+    # AGNOS is single-owner and does no Unix login-by-default — a user-less install is the
+    # doctrine-clean default (identity = sigil keys, not /etc/passwd), so it must VALIDATE.
+    assert(is_ok(r_t), "empty username is VALID (single-owner no-login install)");
     return 0;
 }
 
@@ -405,8 +407,8 @@ fn t_validate_config_no_partitions() {
     test_group("validate_config_no_partitions");
     var c = _test_config();
     DiskLayout_set_partitions(InstallConfig_disk(c), vec_new());
-    var r = validate_config(c);
-    assert(is_err_result(r), "no partitions fails");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "no partitions fails");
     return 0;
 }
 
@@ -415,9 +417,9 @@ fn t_validate_config_warns_luks_mismatch() {
     var c = _test_config();
     SecurityConfig_set_enable_luks(InstallConfig_security(c), 1);
     DiskLayout_set_encrypt(InstallConfig_disk(c), 0);
-    var r = validate_config(c);
-    assert(is_ok(r), "still ok with warning");
-    var warns = payload(r);
+    var r_t, r = validate_config(c);
+    assert(is_ok(r_t), "still ok with warning");
+    var warns = r;
     assert(_vec_str_any_contains(warns, "enable_luks"), "warning mentions enable_luks");
     return 0;
 }
@@ -428,9 +430,9 @@ fn t_validate_rejects_dangerous_kernel_param_init() {
     var kp = vec_new();
     vec_push(kp, str_from("init=/bin/sh"));
     BootloaderConfig_set_kernel_params(InstallConfig_bootloader(c), kp);
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects init=");
-    assert(str_contains_cstr(payload(r), "dangerous kernel parameter"), "msg");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects init=");
+    assert(str_contains_cstr(r, "dangerous kernel parameter"), "msg");
     return 0;
 }
 
@@ -441,8 +443,8 @@ fn t_validate_accepts_safe_kernel_params() {
     vec_push(kp, str_from("quiet"));
     vec_push(kp, str_from("loglevel=3"));
     BootloaderConfig_set_kernel_params(InstallConfig_bootloader(c), kp);
-    var r = validate_config(c);
-    assert(is_ok(r), "accepts safe params");
+    var r_t, r = validate_config(c);
+    assert(is_ok(r_t), "accepts safe params");
     return 0;
 }
 
@@ -450,8 +452,8 @@ fn t_validate_rejects_device_path_with_dotdot() {
     test_group("validate_rejects_device_path_with_dotdot");
     var c = _test_config();
     DiskLayout_set_target_device(InstallConfig_disk(c), str_from("/dev/../etc/passwd"));
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects ..");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects ..");
     return 0;
 }
 
@@ -459,15 +461,15 @@ fn t_validate_rejects_device_path_with_semicolon() {
     test_group("validate_rejects_device_path_with_semicolon");
     var c = _test_config();
     DiskLayout_set_target_device(InstallConfig_disk(c), str_from("/dev/sda;rm -rf /"));
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects ;");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects ;");
     return 0;
 }
 
 fn t_validate_accepts_valid_device_path() {
     test_group("validate_accepts_valid_device_path");
-    var r = validate_config(_test_config());
-    assert(is_ok(r), "accepts /dev/sda");
+    var r_t, r = validate_config(_test_config());
+    assert(is_ok(r_t), "accepts /dev/sda");
     return 0;
 }
 
@@ -475,8 +477,8 @@ fn t_validate_rejects_hostname_with_spaces() {
     test_group("validate_rejects_hostname_with_spaces");
     var c = _test_config();
     NetworkConfig_set_hostname(InstallConfig_network(c), str_from("my host"));
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects space in hostname");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects space in hostname");
     return 0;
 }
 
@@ -484,8 +486,8 @@ fn t_validate_accepts_valid_hostname() {
     test_group("validate_accepts_valid_hostname");
     var c = _test_config();
     NetworkConfig_set_hostname(InstallConfig_network(c), str_from("my-server-01"));
-    var r = validate_config(c);
-    assert(is_ok(r), "accepts my-server-01");
+    var r_t, r = validate_config(c);
+    assert(is_ok(r_t), "accepts my-server-01");
     return 0;
 }
 
@@ -493,9 +495,9 @@ fn t_validate_rejects_username_root() {
     test_group("validate_rejects_username_root");
     var c = _test_config();
     UserConfig_set_username(InstallConfig_user(c), str_from("root"));
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects root");
-    assert(str_contains_cstr(payload(r), "root"), "msg mentions root");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects root");
+    assert(str_contains_cstr(r, "root"), "msg mentions root");
     return 0;
 }
 
@@ -503,8 +505,8 @@ fn t_validate_rejects_username_with_special_chars() {
     test_group("validate_rejects_username_with_special_chars");
     var c = _test_config();
     UserConfig_set_username(InstallConfig_user(c), str_from("user!name"));
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects !");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects !");
     return 0;
 }
 
@@ -513,9 +515,9 @@ fn t_validate_rejects_no_dhcp_without_static_ip() {
     var c = _test_config();
     NetworkConfig_set_use_dhcp(InstallConfig_network(c), 0);
     NetworkConfig_set_static_ip(InstallConfig_network(c), str_from(""));
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects no_dhcp + no static_ip");
-    assert(str_contains_cstr(payload(r), "static_ip"), "msg mentions static_ip");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects no_dhcp + no static_ip");
+    assert(str_contains_cstr(r, "static_ip"), "msg mentions static_ip");
     return 0;
 }
 
@@ -524,9 +526,9 @@ fn t_validate_rejects_partition_label_with_spaces() {
     var c = _test_config();
     var p0 = vec_get(DiskLayout_partitions(InstallConfig_disk(c)), 0);
     PartitionSpec_set_label(p0, str_from("my label"));
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects space");
-    assert(str_contains_cstr(payload(r), "invalid characters"), "msg");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects space");
+    assert(str_contains_cstr(r, "invalid characters"), "msg");
     return 0;
 }
 
@@ -535,8 +537,8 @@ fn t_validate_rejects_partition_label_with_shell_chars() {
     var c = _test_config();
     var p0 = vec_get(DiskLayout_partitions(InstallConfig_disk(c)), 0);
     PartitionSpec_set_label(p0, str_from("root;rm"));
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects ;");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects ;");
     return 0;
 }
 
@@ -545,9 +547,9 @@ fn t_validate_rejects_empty_partition_label() {
     var c = _test_config();
     var p0 = vec_get(DiskLayout_partitions(InstallConfig_disk(c)), 0);
     PartitionSpec_set_label(p0, str_from(""));
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects empty");
-    assert(str_contains_cstr(payload(r), "empty label"), "msg mentions empty label");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects empty");
+    assert(str_contains_cstr(r, "empty label"), "msg mentions empty label");
     return 0;
 }
 
@@ -562,9 +564,9 @@ fn t_validate_rejects_fill_remaining_not_last() {
     var extra = partition_spec_new(
     str_from("extra"), str_from("/data"), FS_EXT4, 1024, 1, vec_new());
     vec_push(DiskLayout_partitions(InstallConfig_disk(c)), extra);
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects fill-remaining-not-last");
-    assert(str_contains_cstr(payload(r), "non-last"), "msg mentions non-last");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects fill-remaining-not-last");
+    assert(str_contains_cstr(r, "non-last"), "msg mentions non-last");
     return 0;
 }
 
@@ -572,9 +574,9 @@ fn t_validate_rejects_full_name_with_colon() {
     test_group("validate_rejects_full_name_with_colon");
     var c = _test_config();
     UserConfig_set_full_name(InstallConfig_user(c), str_from("user:name"));
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects colon in full_name");
-    assert(str_contains_cstr(payload(r), "full_name"), "msg");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects colon in full_name");
+    assert(str_contains_cstr(r, "full_name"), "msg");
     return 0;
 }
 
@@ -585,15 +587,15 @@ fn t_validate_rejects_group_with_special_chars() {
     vec_push(groups, str_from("valid"));
     vec_push(groups, str_from("bad group!"));
     UserConfig_set_groups(InstallConfig_user(c), groups);
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects bad group name");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects bad group name");
     return 0;
 }
 
 fn t_validate_accepts_valid_partition_labels() {
     test_group("validate_accepts_valid_partition_labels");
-    var r = validate_config(_test_config());
-    assert(is_ok(r), "default labels valid");
+    var r_t, r = validate_config(_test_config());
+    assert(is_ok(r_t), "default labels valid");
     return 0;
 }
 
@@ -624,9 +626,9 @@ fn t_validate_rejects_mbr_with_more_than_four_partitions() {
         i = i + 1;
     }
     DiskLayout_set_partitions(disk, parts);
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects MBR > 4");
-    assert(str_contains_cstr(payload(r), "MBR"), "msg mentions MBR");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects MBR > 4");
+    assert(str_contains_cstr(r, "MBR"), "msg mentions MBR");
     return 0;
 }
 
@@ -657,8 +659,8 @@ fn t_validate_accepts_mbr_with_four_partitions() {
         i = i + 1;
     }
     DiskLayout_set_partitions(disk, parts);
-    var r = validate_config(c);
-    assert(is_ok(r), "accepts MBR with 4 partitions");
+    var r_t, r = validate_config(c);
+    assert(is_ok(r_t), "accepts MBR with 4 partitions");
     return 0;
 }
 
@@ -842,8 +844,11 @@ fn t_user_config_defaults() {
     test_group("user_config_defaults");
     var u = user_config_default();
     assert(str_eq_cstr(UserConfig_shell(u), "/usr/bin/agnoshi"), "shell");
-    assert_eq(UserConfig_enable_sudo(u), 1, "sudo enabled");
-    assert(_vec_str_any_eq(UserConfig_groups(u), "wheel"), "wheel group");
+    # Disarmed per the auth doctrine: no auto-sudo, no wheel group (privilege is per-action via
+    # kavach/t-ron, not a session-wide sudo group). The AGNOS-semantic `agents` group stays.
+    assert_eq(UserConfig_enable_sudo(u), 0, "sudo disabled by default");
+    assert(_vec_str_any_eq(UserConfig_groups(u), "wheel") == 0, "no wheel group by default");
+    assert(_vec_str_any_eq(UserConfig_groups(u), "agents"), "agents group kept");
     return 0;
 }
 
@@ -917,8 +922,8 @@ fn t_partition_ops_creates_gpt() {
     assert_eq(PhaseOps_phase(phase), PHASE_PARTITION_DISK, "phase tag");
     var ops = PhaseOps_operations(phase);
     var first = vec_get(ops, 0);
-    assert_eq(tag(first), OP_COMMAND, "first is Command");
-    var args = SystemOp_Command_args(payload(first));
+    assert_eq(boxed_tag(first), OP_COMMAND, "first is Command");
+    var args = SystemOp_Command_args(boxed_payload(first));
     assert(_vec_str_any_eq(args, "gpt"), "args contain gpt");
     return 0;
 }
@@ -969,8 +974,8 @@ fn t_format_ops_creates_filesystems() {
 fn t_format_ops_uses_correct_mkfs() {
     test_group("format_ops_uses_correct_mkfs");
     var ops = PhaseOps_operations(plan_format_ops(_test_config()));
-    assert(str_eq_cstr(SystemOp_Command_binary(payload(vec_get(ops, 0))), "mkfs.vfat"), "vfat first");
-    assert(str_eq_cstr(SystemOp_Command_binary(payload(vec_get(ops, 1))), "mkfs.ext4"), "ext4 second");
+    assert(str_eq_cstr(SystemOp_Command_binary(boxed_payload(vec_get(ops, 0))), "mkfs.vfat"), "vfat first");
+    assert(str_eq_cstr(SystemOp_Command_binary(boxed_payload(vec_get(ops, 1))), "mkfs.ext4"), "ext4 second");
     return 0;
 }
 
@@ -993,10 +998,10 @@ fn t_encryption_ops_luks_when_enabled() {
     assert_eq(vec_len(ops), 2, "2 cryptsetup ops");
     var op0 = vec_get(ops, 0);
     var op1 = vec_get(ops, 1);
-    assert(str_eq_cstr(SystemOp_Command_binary(payload(op0)), "cryptsetup"), "cryptsetup");
-    assert(_vec_str_any_eq(SystemOp_Command_args(payload(op0)), "luksFormat"), "luksFormat");
-    assert(str_eq_cstr(SystemOp_Command_binary(payload(op1)), "cryptsetup"), "cryptsetup");
-    assert(_vec_str_any_eq(SystemOp_Command_args(payload(op1)), "open"), "open");
+    assert(str_eq_cstr(SystemOp_Command_binary(boxed_payload(op0)), "cryptsetup"), "cryptsetup");
+    assert(_vec_str_any_eq(SystemOp_Command_args(boxed_payload(op0)), "luksFormat"), "luksFormat");
+    assert(str_eq_cstr(SystemOp_Command_binary(boxed_payload(op1)), "cryptsetup"), "cryptsetup");
+    assert(_vec_str_any_eq(SystemOp_Command_args(boxed_payload(op1)), "open"), "open");
     return 0;
 }
 
@@ -1018,16 +1023,16 @@ fn t_luks_format_uses_stdin_passphrase() {
     var ops = PhaseOps_operations(phase);
     assert(vec_len(ops) >= 2, "at least 2 ops");
     var fmt = vec_get(ops, 0);
-    assert(str_eq_cstr(SystemOp_Command_binary(payload(fmt)), "cryptsetup"), "fmt cryptsetup");
-    var args0 = SystemOp_Command_args(payload(fmt));
+    assert(str_eq_cstr(SystemOp_Command_binary(boxed_payload(fmt)), "cryptsetup"), "fmt cryptsetup");
+    var args0 = SystemOp_Command_args(boxed_payload(fmt));
     assert(_vec_str_any_eq(args0, "--batch-mode"), "--batch-mode");
     assert(_vec_str_any_eq(args0, "--key-file=-"), "--key-file=-");
-    assert(str_eq_cstr(SystemOp_Command_stdin(payload(fmt)), "hunter2"), "stdin = passphrase");
+    assert(str_eq_cstr(SystemOp_Command_stdin(boxed_payload(fmt)), "hunter2"), "stdin = passphrase");
     var open_op = vec_get(ops, 1);
-    var args1 = SystemOp_Command_args(payload(open_op));
+    var args1 = SystemOp_Command_args(boxed_payload(open_op));
     assert(_vec_str_any_eq(args1, "open"), "open");
     assert(_vec_str_any_eq(args1, "--key-file=-"), "open --key-file=-");
-    assert(str_eq_cstr(SystemOp_Command_stdin(payload(open_op)), "hunter2"), "open stdin");
+    assert(str_eq_cstr(SystemOp_Command_stdin(boxed_payload(open_op)), "hunter2"), "open stdin");
     return 0;
 }
 
@@ -1042,13 +1047,13 @@ fn t_bootloader_ops_grub() {
     assert_eq(PhaseOps_phase(phase), PHASE_INSTALL_BOOTLOADER, "phase tag");
     var ops = PhaseOps_operations(phase);
     assert_eq(vec_len(ops), 3, "3 ops (grub-install + mkdir + cfg)");
-    assert(str_eq_cstr(SystemOp_Command_binary(payload(vec_get(ops, 0))), "grub-install"),
+    assert(str_eq_cstr(SystemOp_Command_binary(boxed_payload(vec_get(ops, 0))), "grub-install"),
     "first is grub-install");
     var cfg_op = vec_get(ops, 2);
-    assert_eq(tag(cfg_op), OP_WRITE_FILE, "third is WriteFile");
-    assert(str_contains_cstr(SystemOp_WriteFile_path(payload(cfg_op)), "grub.cfg"), "path grub.cfg");
-    assert(str_contains_cstr(SystemOp_WriteFile_content(payload(cfg_op)), "AGNOS"), "content AGNOS");
-    assert(str_contains_cstr(SystemOp_WriteFile_content(payload(cfg_op)), "rescue"), "rescue entry");
+    assert_eq(boxed_tag(cfg_op), OP_WRITE_FILE, "third is WriteFile");
+    assert(str_contains_cstr(SystemOp_WriteFile_path(boxed_payload(cfg_op)), "grub.cfg"), "path grub.cfg");
+    assert(str_contains_cstr(SystemOp_WriteFile_content(boxed_payload(cfg_op)), "AGNOS"), "content AGNOS");
+    assert(str_contains_cstr(SystemOp_WriteFile_content(boxed_payload(cfg_op)), "rescue"), "rescue entry");
     return 0;
 }
 
@@ -1057,7 +1062,7 @@ fn t_bootloader_ops_systemd_boot() {
     var c = _test_config();
     BootloaderConfig_set_bootloader_type(InstallConfig_bootloader(c), BOOT_SYSTEMD);
     var ops = PhaseOps_operations(plan_bootloader_ops(c, str_from("/mnt")));
-    assert(str_eq_cstr(SystemOp_Command_binary(payload(vec_get(ops, 0))), "bootctl"), "bootctl");
+    assert(str_eq_cstr(SystemOp_Command_binary(boxed_payload(vec_get(ops, 0))), "bootctl"), "bootctl");
     return 0;
 }
 
@@ -1075,8 +1080,8 @@ fn t_bootloader_ops_gnoboot() {
     var ops = PhaseOps_operations(plan_bootloader_ops(c, str_from("/mnt")));
     # 2 ESP mkdirs + cp gnoboot -> BOOTX64.EFI + cp kernel -> /boot/agnos; no GRUB/bootctl.
     assert(vec_len(ops) >= 4, "gnoboot: >=4 ESP-staging ops");
-    assert_eq(tag(vec_get(ops, 2)), OP_COMMAND, "gnoboot: op2 is Command");
-    assert(str_eq_cstr(SystemOp_Command_binary(payload(vec_get(ops, 2))), "cp"), "gnoboot: stages EFI via cp");
+    assert_eq(boxed_tag(vec_get(ops, 2)), OP_COMMAND, "gnoboot: op2 is Command");
+    assert(str_eq_cstr(SystemOp_Command_binary(boxed_payload(vec_get(ops, 2))), "cp"), "gnoboot: stages EFI via cp");
     return 0;
 }
 
@@ -1086,8 +1091,8 @@ fn t_bootloader_grub_bios_mode() {
     BootloaderConfig_set_bootloader_type(InstallConfig_bootloader(c), BOOT_GRUB2);
     var ops = PhaseOps_operations(plan_bootloader_ops(c, str_from("/mnt")));
     var op0 = vec_get(ops, 0);
-    assert_eq(tag(op0), OP_COMMAND, "Command");
-    var args = SystemOp_Command_args(payload(op0));
+    assert_eq(boxed_tag(op0), OP_COMMAND, "Command");
+    var args = SystemOp_Command_args(boxed_payload(op0));
     var has_target = 0;
     var n = vec_len(args);
     var i = 0;
@@ -1138,8 +1143,8 @@ fn t_user_ops_creates_user() {
     assert_eq(PhaseOps_phase(phase), PHASE_CREATE_USER, "phase tag");
     var ops = PhaseOps_operations(phase);
     var op0 = vec_get(ops, 0);
-    assert(str_eq_cstr(SystemOp_Command_binary(payload(op0)), "useradd"), "useradd");
-    assert(_vec_str_any_eq(SystemOp_Command_args(payload(op0)), "testuser"), "username arg");
+    assert(str_eq_cstr(SystemOp_Command_binary(boxed_payload(op0)), "useradd"), "useradd");
+    assert(_vec_str_any_eq(SystemOp_Command_args(boxed_payload(op0)), "testuser"), "username arg");
     return 0;
 }
 
@@ -1360,9 +1365,9 @@ fn t_iso_config_defaults() {
 fn t_iso_build_command_uefi() {
     test_group("iso_build_command_uefi");
     var op = iso_build_command(iso_config_default());
-    assert_eq(tag(op), OP_COMMAND, "Command");
-    assert(str_eq_cstr(SystemOp_Command_binary(payload(op)), "xorriso"), "xorriso");
-    var args = SystemOp_Command_args(payload(op));
+    assert_eq(boxed_tag(op), OP_COMMAND, "Command");
+    assert(str_eq_cstr(SystemOp_Command_binary(boxed_payload(op)), "xorriso"), "xorriso");
+    var args = SystemOp_Command_args(boxed_payload(op));
     assert(_vec_str_any_eq(args, "-no-emul-boot"), "-no-emul-boot");
     assert(_vec_str_any_contains(args, "efi"), "efi-related arg");
     return 0;
@@ -1374,7 +1379,7 @@ fn t_iso_build_command_bios() {
     IsoConfig_set_uefi(iso, 0);
     IsoConfig_set_bios(iso, 1);
     var op = iso_build_command(iso);
-    var args = SystemOp_Command_args(payload(op));
+    var args = SystemOp_Command_args(boxed_payload(op));
     assert(_vec_str_any_contains(args, "bios"), "bios-related arg");
     return 0;
 }
@@ -1388,35 +1393,35 @@ fn t_system_op_descriptors() {
     vec_push(args, str_from("-s"));
     vec_push(args, str_from("/dev/sda"));
     var c = op_command(str_from("parted"), args, str_from("partition disk"), 1, str_from(""));
-    assert_eq(tag(c), OP_COMMAND, "Command tag");
-    assert(str_eq_cstr(SystemOp_Command_binary(payload(c)), "parted"), "binary");
-    assert(str_eq_cstr(SystemOp_Command_description(payload(c)), "partition disk"), "desc");
+    assert_eq(boxed_tag(c), OP_COMMAND, "Command tag");
+    assert(str_eq_cstr(SystemOp_Command_binary(boxed_payload(c)), "parted"), "binary");
+    assert(str_eq_cstr(SystemOp_Command_description(boxed_payload(c)), "partition disk"), "desc");
     # Display: "{description}: {binary} {args joined by ' '}"
     assert(str_eq_cstr(system_op_display(c), "partition disk: parted -s /dev/sda"), "display command");
 
     var w = op_write_file(str_from("/etc/hostname"), str_from("agnos\n"), 420, str_from(""));
-    assert_eq(tag(w), OP_WRITE_FILE, "WriteFile tag");
-    assert(str_eq_cstr(SystemOp_WriteFile_path(payload(w)), "/etc/hostname"), "wf path");
+    assert_eq(boxed_tag(w), OP_WRITE_FILE, "WriteFile tag");
+    assert(str_eq_cstr(SystemOp_WriteFile_path(boxed_payload(w)), "/etc/hostname"), "wf path");
     assert(str_eq_cstr(system_op_display(w), "write /etc/hostname"), "display write");
 
     var s = op_symlink(str_from("/usr/share/zoneinfo/UTC"), str_from("/etc/localtime"));
-    assert_eq(tag(s), OP_SYMLINK, "Symlink tag");
-    assert(str_eq_cstr(SystemOp_Symlink_link(payload(s)), "/etc/localtime"), "sl link");
+    assert_eq(boxed_tag(s), OP_SYMLINK, "Symlink tag");
+    assert(str_eq_cstr(SystemOp_Symlink_link(boxed_payload(s)), "/etc/localtime"), "sl link");
     assert(str_eq_cstr(system_op_display(s), "symlink /etc/localtime -> /usr/share/zoneinfo/UTC"), "display symlink");
 
     var u = op_unmount(str_from("/mnt"));
-    assert_eq(tag(u), OP_UNMOUNT, "Unmount tag");
+    assert_eq(boxed_tag(u), OP_UNMOUNT, "Unmount tag");
     assert(str_eq_cstr(system_op_display(u), "umount /mnt"), "display umount");
 
     var md = op_make_dir(str_from("/mnt/etc"), 493, 1);
-    assert_eq(tag(md), OP_MAKE_DIR, "MakeDir tag");
-    assert_eq(SystemOp_MakeDir_parents(payload(md)), 1, "parents");
+    assert_eq(boxed_tag(md), OP_MAKE_DIR, "MakeDir tag");
+    assert_eq(SystemOp_MakeDir_parents(boxed_payload(md)), 1, "parents");
     assert(str_eq_cstr(system_op_display(md), "mkdir /mnt/etc"), "display mkdir");
 
     var opts = vec_new();
     vec_push(opts, str_from("defaults"));
     var mn = op_mount(str_from("/dev/sda1"), str_from("/mnt"), str_from("ext4"), opts);
-    assert_eq(tag(mn), OP_MOUNT, "Mount tag");
+    assert_eq(boxed_tag(mn), OP_MOUNT, "Mount tag");
     assert(str_eq_cstr(system_op_display(mn), "mount /dev/sda1 on /mnt"), "display mount");
     return 0;
 }
@@ -1443,9 +1448,9 @@ fn t_validate_rejects_device_without_dev_prefix() {
     test_group("validate_rejects_device_without_dev_prefix");
     var c = _test_config();
     DiskLayout_set_target_device(InstallConfig_disk(c), str_from("sda"));
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects missing /dev/ prefix");
-    assert(str_contains_cstr(payload(r), "/dev/"), "msg mentions /dev/");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects missing /dev/ prefix");
+    assert(str_contains_cstr(r, "/dev/"), "msg mentions /dev/");
     return 0;
 }
 
@@ -1455,9 +1460,9 @@ fn t_validate_rejects_device_suffix_bad_char() {
     # '#' is not a shell-dangerous char, so it passes check 3 and trips
     # the suffix allowlist (check 4) specifically.
     DiskLayout_set_target_device(InstallConfig_disk(c), str_from("/dev/sda#"));
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects bad suffix char");
-    assert(str_contains_cstr(payload(r), "after /dev/"), "msg mentions suffix");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects bad suffix char");
+    assert(str_contains_cstr(r, "after /dev/"), "msg mentions suffix");
     return 0;
 }
 
@@ -1467,9 +1472,9 @@ fn t_validate_rejects_kernel_param_dangerous_char() {
     var kp = vec_new();
     vec_push(kp, str_from("foo|bar"));
     BootloaderConfig_set_kernel_params(InstallConfig_bootloader(c), kp);
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects dangerous char in kernel param");
-    assert(str_contains_cstr(payload(r), "dangerous character"), "msg mentions dangerous character");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects dangerous char in kernel param");
+    assert(str_contains_cstr(r, "dangerous character"), "msg mentions dangerous character");
     return 0;
 }
 
@@ -1477,9 +1482,9 @@ fn t_validate_rejects_empty_hostname() {
     test_group("validate_rejects_empty_hostname");
     var c = _test_config();
     NetworkConfig_set_hostname(InstallConfig_network(c), str_from(""));
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects empty hostname");
-    assert(str_contains_cstr(payload(r), "hostname"), "msg mentions hostname");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects empty hostname");
+    assert(str_contains_cstr(r, "hostname"), "msg mentions hostname");
     return 0;
 }
 
@@ -1487,9 +1492,9 @@ fn t_validate_rejects_hostname_too_long() {
     test_group("validate_rejects_hostname_too_long");
     var c = _test_config();
     NetworkConfig_set_hostname(InstallConfig_network(c), _lower_repeat(64));
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects 64-char hostname");
-    assert(str_contains_cstr(payload(r), "1-63"), "msg mentions 1-63");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects 64-char hostname");
+    assert(str_contains_cstr(r, "1-63"), "msg mentions 1-63");
     return 0;
 }
 
@@ -1497,9 +1502,9 @@ fn t_validate_rejects_username_too_long() {
     test_group("validate_rejects_username_too_long");
     var c = _test_config();
     UserConfig_set_username(InstallConfig_user(c), _lower_repeat(33));
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects 33-char username");
-    assert(str_contains_cstr(payload(r), "1-32"), "msg mentions 1-32");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects 33-char username");
+    assert(str_contains_cstr(r, "1-32"), "msg mentions 1-32");
     return 0;
 }
 
@@ -1509,9 +1514,9 @@ fn t_validate_rejects_no_root_partition() {
     var parts = DiskLayout_partitions(InstallConfig_disk(c));
     # default layout: idx 0 = ESP (/boot/efi), idx 1 = root ("/"). Move root off "/".
     PartitionSpec_set_mount_point(vec_get(parts, 1), str_from("/data"));
-    var r = validate_config(c);
-    assert(is_err_result(r), "rejects missing root partition");
-    assert(str_contains_cstr(payload(r), "root partition"), "msg mentions root partition");
+    var r_t, r = validate_config(c);
+    assert(is_err_result(r_t), "rejects missing root partition");
+    assert(str_contains_cstr(r, "root partition"), "msg mentions root partition");
     return 0;
 }
 
@@ -1519,9 +1524,9 @@ fn t_validate_warns_permissive_trust() {
     test_group("validate_warns_permissive_trust");
     var c = _test_config();
     SecurityConfig_set_trust_enforcement(InstallConfig_security(c), TRUST_PERMISSIVE);
-    var r = validate_config(c);
-    assert(is_ok(r), "ok with permissive-trust warning");
-    assert(_vec_str_any_contains(payload(r), "permissive"), "warns permissive");
+    var r_t, r = validate_config(c);
+    assert(is_ok(r_t), "ok with permissive-trust warning");
+    assert(_vec_str_any_contains(r, "permissive"), "warns permissive");
     return 0;
 }
 
@@ -1529,9 +1534,9 @@ fn t_validate_warns_firewall_allow() {
     test_group("validate_warns_firewall_allow");
     var c = _test_config();
     SecurityConfig_set_firewall_default(InstallConfig_security(c), FW_ALLOW);
-    var r = validate_config(c);
-    assert(is_ok(r), "ok with firewall-allow warning");
-    assert(_vec_str_any_contains(payload(r), "firewall"), "warns firewall allow");
+    var r_t, r = validate_config(c);
+    assert(is_ok(r_t), "ok with firewall-allow warning");
+    assert(_vec_str_any_contains(r, "firewall"), "warns firewall allow");
     return 0;
 }
 
@@ -1576,7 +1581,7 @@ fn t_partition_ops_mbr_mklabel() {
     DiskLayout_set_use_gpt(InstallConfig_disk(c), 0);
     var ops = PhaseOps_operations(plan_partition_ops(c));
     var first = vec_get(ops, 0);
-    var args = SystemOp_Command_args(payload(first));
+    var args = SystemOp_Command_args(boxed_payload(first));
     assert(_vec_str_any_eq(args, "msdos"), "mklabel msdos for MBR");
     return 0;
 }
@@ -1726,20 +1731,20 @@ fn t_disk_ops_structured() {
     assert_eq(OP_STAGE_FILE, 8, "stage tag = 8");
 
     var pop = op_partition_disk(12345);
-    assert_eq(tag(pop), OP_PARTITION_DISK, "partition op tag");
-    assert_eq(SystemOp_PartitionDisk_layout(payload(pop)), 12345, "partition layout round-trips");
+    assert_eq(boxed_tag(pop), OP_PARTITION_DISK, "partition op tag");
+    assert_eq(SystemOp_PartitionDisk_layout(boxed_payload(pop)), 12345, "partition layout round-trips");
 
     var fop = op_format_fs(1, 999, str_from("/dev/sda1"));
-    assert_eq(tag(fop), OP_FORMAT_FS, "format op tag");
-    assert_eq(SystemOp_FormatFs_part_index(payload(fop)), 1, "format part_index round-trips");
-    assert_eq(SystemOp_FormatFs_spec(payload(fop)), 999, "format spec round-trips");
-    assert_eq(str_eq_cstr(SystemOp_FormatFs_device(payload(fop)), "/dev/sda1"), 1, "format device round-trips");
+    assert_eq(boxed_tag(fop), OP_FORMAT_FS, "format op tag");
+    assert_eq(SystemOp_FormatFs_part_index(boxed_payload(fop)), 1, "format part_index round-trips");
+    assert_eq(SystemOp_FormatFs_spec(boxed_payload(fop)), 999, "format spec round-trips");
+    assert_eq(str_eq_cstr(SystemOp_FormatFs_device(boxed_payload(fop)), "/dev/sda1"), 1, "format device round-trips");
 
     var sop = op_stage_file(str_from("/usr/lib/gnoboot/BOOTX64.EFI"), str_from("/EFI/BOOT/BOOTX64.EFI"), 0);
-    assert_eq(tag(sop), OP_STAGE_FILE, "stage op tag");
-    assert_eq(str_eq_cstr(SystemOp_StageFile_src_path(payload(sop)), "/usr/lib/gnoboot/BOOTX64.EFI"), 1, "stage src round-trips");
-    assert_eq(str_eq_cstr(SystemOp_StageFile_dst_fat_path(payload(sop)), "/EFI/BOOT/BOOTX64.EFI"), 1, "stage dst round-trips");
-    assert_eq(SystemOp_StageFile_target_fs(payload(sop)), 0, "stage target_fs round-trips");
+    assert_eq(boxed_tag(sop), OP_STAGE_FILE, "stage op tag");
+    assert_eq(str_eq_cstr(SystemOp_StageFile_src_path(boxed_payload(sop)), "/usr/lib/gnoboot/BOOTX64.EFI"), 1, "stage src round-trips");
+    assert_eq(str_eq_cstr(SystemOp_StageFile_dst_fat_path(boxed_payload(sop)), "/EFI/BOOT/BOOTX64.EFI"), 1, "stage dst round-trips");
+    assert_eq(SystemOp_StageFile_target_fs(boxed_payload(sop)), 0, "stage target_fs round-trips");
 
     # system_op_display renders each (non-blank), unlike the pre-port fall-through.
     assert_eq(str_len(system_op_display(pop)) > 0, 1, "partition display non-empty");

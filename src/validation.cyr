@@ -2,12 +2,13 @@
 #
 # Ported from rust-old/src/validation.rs
 #
-# Returns a tagged Result:
+# Returns a value-form Result (tag + payload register pair):
 #   Ok(warnings_vec)  — vec<Str> of non-fatal warnings (may be empty)
 #   Err(message_str) — first hard validation failure as a Str
 #
-# Caller checks tag(result) == OK; on Ok, payload is a vec ptr; on Err,
-# payload is a Str ptr. Mirrors Rust's `Result<Vec<String>>`.
+# Caller binds both halves (`var v_t, v = validate_config(cfg);`) and checks
+# is_ok(v_t); on Ok, v is a vec ptr; on Err, v is a Str ptr. Mirrors Rust's
+# `Result<Vec<String>>`.
 
 # ---- Internal: char-class predicates ----
 
@@ -216,34 +217,35 @@ fn validate_config(cfg) {
         return Err(str_from("no partitions defined"));
     }
 
-    # 6. Username required
+    # 6. Username is OPTIONAL. AGNOS is single-owner and does NOT do Unix login-by-default —
+    #    identity is the owner's sigil keys, not an /etc/passwd row (see the auth doctrine). A
+    #    user-less install is the doctrine-clean default; a username merely OPTS IN to a POSIX
+    #    compat account (fenced in the shell plan). When given, it must be well-formed.
     var user = InstallConfig_user(cfg);
     var uname = UserConfig_username(user);
     var ulen = str_len(uname);
-    if (ulen == 0) {
-        return Err(str_from("username is empty"));
-    }
+    if (ulen > 0) {
+        # 7. Username cannot be 'root'
+        if (str_eq_cstr(uname, "root") == 1) {
+            return Err(str_from("username cannot be 'root'"));
+        }
 
-    # 7. Username cannot be 'root'
-    if (str_eq_cstr(uname, "root") == 1) {
-        return Err(str_from("username cannot be 'root'"));
-    }
+        # 8. Length 1..=32
+        if (ulen > 32) {
+            return Err(str_from("username must be 1-32 characters"));
+        }
 
-    # 8. Length 1..=32
-    if (ulen > 32) {
-        return Err(str_from("username must be 1-32 characters"));
-    }
+        # 9. Must start with a-z
+        var udata = str_data(uname);
+        var first = load8(udata);
+        if (_is_lower(first) == 0) {
+            return Err(str_from("username must start with a lowercase letter"));
+        }
 
-    # 9. Must start with a-z
-    var udata = str_data(uname);
-    var first = load8(udata);
-    if (_is_lower(first) == 0) {
-        return Err(str_from("username must start with a lowercase letter"));
-    }
-
-    # 10. Chars must be in [a-z0-9_-]
-    if (_all_lname_chars(uname) == 0) {
-        return Err(str_from("username contains invalid characters (allowed: a-z, 0-9, _, -)"));
+        # 10. Chars must be in [a-z0-9_-]
+        if (_all_lname_chars(uname) == 0) {
+            return Err(str_from("username contains invalid characters (allowed: a-z, 0-9, _, -)"));
+        }
     }
 
     # 11. Hostname required

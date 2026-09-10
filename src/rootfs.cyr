@@ -1048,7 +1048,13 @@ fn full_execution_plan(cfg, target_root, luks_passphrase) {
     vec_push(plans, plan_install_base_ops(cfg, target_root));
     vec_push(plans, plan_install_packages_ops(cfg, target_root));
     vec_push(plans, plan_bootloader_ops(cfg, target_root));
-    vec_push(plans, plan_user_ops(cfg, target_root));
+    # POSIX account creation (useradd/usermod → /etc/passwd,/shadow,/group) is the Unix
+    # login-by-default empire pattern the auth doctrine rejects. It is FENCED behind an explicit
+    # username: a user-less install (the doctrine-clean single-owner default) plans no user phase.
+    # Providing --user opts into the compat account for Linux-host / self-host installs.
+    if (str_len(UserConfig_username(InstallConfig_user(cfg))) > 0) {
+        vec_push(plans, plan_user_ops(cfg, target_root));
+    }
     vec_push(plans, plan_network_ops(cfg, target_root));
     vec_push(plans, plan_locale_ops(cfg, target_root));
     vec_push(plans, plan_security_ops(cfg, target_root));

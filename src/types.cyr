@@ -166,8 +166,8 @@ fn phase_next(p) {
 # SystemOp — tagged union over 6 system action variants
 # ============================================================
 # Layout: tagged_new(tag, &variant_payload_struct).
-# Read with tag(op) + payload(op); use the auto-generated
-# accessor fns (e.g., SystemOp_Command_binary(payload(op))).
+# Read with boxed_tag(op) + boxed_payload(op); use the auto-generated
+# accessor fns (e.g., SystemOp_Command_binary(boxed_payload(op))).
 
 enum SystemOpTag {
     OP_COMMAND = 0;
@@ -346,8 +346,8 @@ fn op_untar_ext2(src_path) {
 # byte-for-byte. The CLI's --verbose dump uses its own multi-line format
 # (cli.cyr::_print_op); this is the compact single-line form for logs.
 fn system_op_display(op) {
-    var t = tag(op);
-    var p = payload(op);
+    var t = boxed_tag(op);
+    var p = boxed_payload(op);
     var sb = str_builder_new();
     if (t == OP_COMMAND) {
         # "{description}: {binary} {args joined by ' '}"
@@ -562,9 +562,12 @@ fn user_config_new(username, full_name, shell, groups, ssh_keys, enable_sudo) {
     return p;
 }
 
+# Default compat-account shape (only materialized when --user is given). Disarmed per the auth
+# doctrine: NO `wheel` group and enable_sudo=0 — session-wide root escalation is the empire pattern;
+# AGNOS gates privilege per-action (kavach/t-ron), not by a sudo group. `agents` (AGNOS-semantic,
+# non-privileged) stays. A future --sudo flag can opt back into wheel for a Linux-host compat install.
 fn user_config_default() {
     var groups = vec_new();
-    vec_push(groups, str_from("wheel"));
     vec_push(groups, str_from("agents"));
     return user_config_new(
     str_from(""),
@@ -572,7 +575,7 @@ fn user_config_default() {
     str_from("/usr/bin/agnoshi"),
     groups,
     vec_new(),
-    1
+    0
     );
 }
 

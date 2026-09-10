@@ -2,7 +2,7 @@
 
 > The guided OS installer for [AGNOS](https://github.com/MacCracken/agnosticos).
 
-`agnova` partitions disks, optionally encrypts the root volume with LUKS, deploys the AGNOS base system, installs mode-specific packages, lays down the sovereign bootloader (gnoboot by default; systemd-boot / GRUB 2 optional), creates the initial user, configures network/locale/security, and prepares first-boot — all from a single command.
+`agnova` partitions disks, optionally encrypts the root volume with LUKS, deploys the AGNOS base system, installs mode-specific packages, lays down the sovereign bootloader (gnoboot by default; systemd-boot / GRUB 2 optional), optionally creates a POSIX compat user (AGNOS is single-owner and does no Unix login by default), configures network/locale/security, and prepares first-boot — all from a single command.
 
 The installer is **plan-first**: every action is materialized as a `SystemOp` descriptor and the orchestrator can dump the entire plan before touching disk. Destructive execution is gated behind an explicit `--i-mean-it` flag.
 
@@ -33,7 +33,9 @@ COMMANDS:
 
 OPTIONS:
   -d, --device DEV         Target block device (e.g. /dev/sda)
-  -u, --user NAME          Username for the new user account
+  -u, --user NAME          Username — OPTIONAL; opts into a POSIX compat account.
+                           AGNOS is single-owner and does no Unix login by default
+                           (identity = sigil keys), so a user-less install is the norm.
   -m, --mode MODE          server|desktop|minimal|custom (default: desktop)
       --hostname NAME      Hostname (default: agnos)
   -t, --target ROOT        Target root mount point (default: /mnt)

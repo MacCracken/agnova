@@ -227,8 +227,8 @@ fn _exec_unmount(p) {
 # Top-level dispatch on op tag. The shell/file/mount ops exist only on the Linux build; on
 # agnos only the structured native disk ops are dispatched (the rest are compiled out above).
 fn execute_op(op) {
-    var t = tag(op);
-    var p = payload(op);
+    var t = boxed_tag(op);
+    var p = boxed_payload(op);
     # On a native backend the config file/dir/symlink ops write into the ext2 IMAGE (no mount, no
     # host fs), so they route to the native ext2 sink on BOTH targets — this branch precedes (and on
     # agnos replaces) the Linux shell-out handlers below. The native plan emits root-relative paths.
@@ -257,7 +257,7 @@ fn execute_op(op) {
 # write, symlink) are always considered fatal because skipping them
 # would leave the rootfs in an inconsistent state.
 fn op_is_fatal(op) {
-    if (tag(op) == OP_COMMAND) { return SystemOp_Command_fatal(payload(op)); }
+    if (boxed_tag(op) == OP_COMMAND) { return SystemOp_Command_fatal(boxed_payload(op)); }
     return 1;
 }
 
@@ -278,8 +278,8 @@ fn execute_phase(inst, phase_ops) {
                 str_builder_add_cstr(msg, "op failed (rc=");
                 str_builder_add_int(msg, rc);
                 str_builder_add_cstr(msg, "): ");
-                if (tag(op) == OP_COMMAND) {
-                    str_builder_add(msg, SystemOp_Command_description(payload(op)));
+                if (boxed_tag(op) == OP_COMMAND) {
+                    str_builder_add(msg, SystemOp_Command_description(boxed_payload(op)));
                 }
                 agnova_fail_phase(inst, str_builder_build(msg));
                 return 0 - 1;

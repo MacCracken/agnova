@@ -173,7 +173,7 @@ fn _print_help() {
     println("");
     println("OPTIONS:");
     println("    -d, --device DEV         Target block device (required for plan/execute)");
-    println("    -u, --user NAME          Username (required for execute)");
+    println("    -u, --user NAME          Username (optional; opts into a POSIX compat account)");
     println("    -m, --mode MODE          server|desktop|minimal|custom (default: desktop)");
     println("        --hostname NAME      Hostname (default: agnos)");
     println("    -t, --target ROOT        Target root mount point (default: /mnt)");
@@ -200,7 +200,7 @@ fn _print_version() {
 }
 
 fn _op_kind_str(op) {
-    var t = tag(op);
+    var t = boxed_tag(op);
     if (t == OP_COMMAND) { return "Command"; }
     if (t == OP_WRITE_FILE) { return "Write"; }
     if (t == OP_MAKE_DIR) { return "Mkdir"; }
@@ -223,8 +223,8 @@ fn _print_op(idx, total, op) {
     print(_op_kind_str(op), strlen(_op_kind_str(op)));
     print(" ", 1);
 
-    var t = tag(op);
-    var p = payload(op);
+    var t = boxed_tag(op);
+    var p = boxed_payload(op);
     if (t == OP_COMMAND) {
         str_print(SystemOp_Command_binary(p));
         var args = SystemOp_Command_args(p);
@@ -321,13 +321,13 @@ fn _cmd_plan(h) {
     println("");
 
     # Validation
-    var v = validate_config(cfg);
-    if (is_ok(v) == 0) {
+    var v_t, v = validate_config(cfg);
+    if (is_ok(v_t) == 0) {
         print("validation: FAILED — ", 21);
-        str_println(payload(v));
+        str_println(v);
         return 1;
     }
-    var warns = payload(v);
+    var warns = v;
     var wn = vec_len(warns);
     if (wn == 0) {
         println("validation: OK");
@@ -399,13 +399,13 @@ fn _cmd_validate(h) {
         println("error: --device is required for validate");
         return 2;
     }
-    var v = validate_config(cfg);
-    if (is_ok(v) == 0) {
+    var v_t, v = validate_config(cfg);
+    if (is_ok(v_t) == 0) {
         print("FAILED: ", 8);
-        str_println(payload(v));
+        str_println(v);
         return 1;
     }
-    var warns = payload(v);
+    var warns = v;
     var n = vec_len(warns);
     print("OK with ", 8);
     fmt_int(n);
@@ -438,10 +438,9 @@ fn _cmd_execute(h) {
         println("error: --device is required for execute");
         return 2;
     }
-    if (str_len(UserConfig_username(InstallConfig_user(cfg))) == 0) {
-        println("error: --user is required for execute");
-        return 2;
-    }
+    # --user is OPTIONAL: a user-less install is the doctrine-clean single-owner default
+    # (AGNOS does not do Unix login; identity = sigil keys, not /etc/passwd). A username opts
+    # into a POSIX compat account. No hard requirement here.
     var passphrase = str_from("");
     var pass_cstr = flags_get_str(h, FLAG_PASSPHRASE);
     if (pass_cstr != 0) { passphrase = str_from(pass_cstr); }
@@ -452,10 +451,10 @@ fn _cmd_execute(h) {
         }
     }
 
-    var v = validate_config(cfg);
-    if (is_ok(v) == 0) {
+    var v_t, v = validate_config(cfg);
+    if (is_ok(v_t) == 0) {
         print("validation FAILED: ", 19);
-        str_println(payload(v));
+        str_println(v);
         return 1;
     }
 
